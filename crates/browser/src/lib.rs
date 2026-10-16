@@ -30,6 +30,20 @@ pub use input::{KeyInput, Modifiers, MouseButton, MouseInput};
 
 use std::{path::PathBuf, rc::Rc};
 
+/// Entry point of Chromium's helper processes (the `Cockpit Helper*.app`
+/// executables). Only meaningful inside the macOS app bundle.
+pub fn run_helper() -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        cef::run_helper()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("the Chromium helper only runs on macOS");
+        1
+    }
+}
+
 /// Settings for the browser runtime.
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeOptions {

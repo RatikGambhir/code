@@ -63,6 +63,8 @@ pub struct AppState {
     pub settings: Settings,
     /// Profile directory Chromium uses for cookies and storage.
     pub browser_profile: PathBuf,
+    /// The profile's row, for history.
+    pub browser_profile_id: Option<i64>,
 }
 
 impl Global for AppState {}

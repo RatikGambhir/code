@@ -183,6 +183,9 @@ impl BrowserTab for CefTab {
 
     fn close(&self) {
         self.shared.fail_pending_scripts("the tab was closed");
+        if super::SHUT_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         if let Some(browser) = self.shared.take_browser() {
             if let Some(host) = browser.host() {
                 host.close_browser(1);

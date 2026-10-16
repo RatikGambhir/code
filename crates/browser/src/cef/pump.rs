@@ -93,6 +93,9 @@ extern "C" fn on_tick(_timer: CFRunLoopTimerRef, info: *mut c_void) {
     if state.ticking.replace(true) {
         return;
     }
+    if super::SHUT_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
 
     cef::do_message_loop_work();
 

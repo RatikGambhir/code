@@ -79,7 +79,7 @@ impl LspManager {
             .map(|(key, slot)| match slot {
                 Slot::Starting(_) => format!("{key}: starting"),
                 Slot::Ready(client) => client.name().to_string(),
-                Slot::Failed(_) => format!("{key}: failed"),
+                Slot::Failed(err) => format!("{key}: failed ({})", cockpit_common::truncate_chars(err, 60)),
             })
             .collect();
         parts.sort();

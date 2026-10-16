@@ -69,6 +69,12 @@ pub struct BrowserView {
 
 impl EventEmitter<BrowserEvent> for BrowserView {}
 
+impl Drop for BrowserView {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl Focusable for BrowserView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -141,6 +147,13 @@ impl BrowserView {
 
     pub fn tab(&self) -> Option<&Rc<dyn BrowserTab>> {
         self.tab.as_ref()
+    }
+
+    /// Closes the page. The view stays empty afterwards.
+    pub fn close(&mut self) {
+        if let Some(tab) = self.tab.take() {
+            tab.close();
+        }
     }
 
     pub fn title(&self) -> SharedString {

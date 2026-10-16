@@ -1,0 +1,9 @@
+[alias]
+# `cargo xtask bundle --open` builds Cockpit.app (see xtask/src/main.rs).
+xtask = "run --quiet --package xtask --"
+
+[env]
+# Where cef-dll-sys keeps the Chromium Embedded Framework distribution it
+# downloads on the first macOS build (~500 MB, once per CEF version). An
+# explicitly exported CEF_PATH takes precedence.
+CEF_PATH = { value = ".cef", relative = true }

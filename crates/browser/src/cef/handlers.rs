@@ -328,6 +328,14 @@ wrap_life_span_handler! {
     }
 
     impl LifeSpanHandler {
+        fn on_after_created(&self, _browser: Option<&mut Browser>) {
+            super::LIVE_BROWSERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn on_before_close(&self, _browser: Option<&mut Browser>) {
+            super::LIVE_BROWSERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
         /// `target=_blank` and `window.open` become IDE tabs instead of
         /// native windows.
         fn on_before_popup(

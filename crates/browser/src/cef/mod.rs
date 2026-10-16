@@ -32,7 +32,8 @@ mod tab;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -46,6 +47,14 @@ use crate::{
 /// Where the framework must be, relative to `Contents/MacOS/<exe>`.
 const FRAMEWORK_BINARY: &str =
     "../Frameworks/Chromium Embedded Framework.framework/Chromium Embedded Framework";
+
+/// Browsers created and not yet closed (they close asynchronously).
+pub(crate) static LIVE_BROWSERS: AtomicUsize = AtomicUsize::new(0);
+/// Set once `cef_shutdown` ran; the pump must not call into Chromium after.
+pub(crate) static SHUT_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// How long quitting waits for pages to close (and flush cookies).
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct CefRuntime {
     inner: Rc<Inner>,
@@ -146,10 +155,50 @@ impl CefRuntime {
         }))
     }
 
+    /// Shuts Chromium down at quit. Engines may still be referenced (the UI
+    /// is being torn down around us), so this does not wait for them to drop;
+    /// it waits for the open pages to finish closing, then shuts down.
     pub fn shutdown(self) {
-        // `cef_shutdown` runs when the last handle (held by engines) drops.
-        drop(self);
+        if !self.inner.started.get() {
+            return;
+        }
+        let deadline = Instant::now() + CLOSE_TIMEOUT;
+        while LIVE_BROWSERS.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            cef::do_message_loop_work();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let open = LIVE_BROWSERS.load(Ordering::SeqCst);
+        if open > 0 {
+            tracing::warn!("shutting Chromium down with {open} page(s) still open");
+        }
+        SHUT_DOWN.store(true, Ordering::SeqCst);
+        self.inner.started.set(false);
+        cef::shutdown();
     }
+}
+
+/// The body of the `<App> Helper*.app` executables: Chromium launches them
+/// for its renderer, GPU and utility processes. Returns the exit code.
+pub fn run_helper() -> i32 {
+    let args = Args::new();
+    // Helpers enter the sandbox before loading anything else. With
+    // `--no-sandbox` (COCKPIT_CEF_NO_SANDBOX) there is nothing to enter.
+    let _sandbox = (!std::env::args().any(|arg| arg == "--no-sandbox")).then(|| {
+        let mut sandbox = cef::sandbox::Sandbox::new();
+        sandbox.initialize(args.as_main_args());
+        sandbox
+    });
+    let Ok(exe) = std::env::current_exe() else { return 1 };
+    let loader = LibraryLoader::new(&exe, true);
+    if !loader.load() {
+        eprintln!("{}: loading the Chromium Embedded Framework failed", exe.display());
+        return 1;
+    }
+    let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
+    let mut app = handlers::CockpitApp::new(handlers::AppConfig {
+        remote_debugging_port: None,
+    });
+    cef::execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut())
 }
 
 impl Drop for Inner {
