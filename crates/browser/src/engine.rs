@@ -69,6 +69,18 @@ pub struct PageRect {
     pub height: f32,
 }
 
+/// Editing commands, sent to the focused frame. Off-screen Chromium does not
+/// turn ⌘C/⌘V into these by itself, so the UI binds them explicitly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EditCommand {
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
 #[derive(Clone, Debug)]
 pub struct TabOptions {
     pub url: String,
@@ -99,6 +111,7 @@ pub trait BrowserTab {
     fn go_back(&self);
     fn go_forward(&self);
     fn set_zoom_level(&self, level: f64);
+    fn edit(&self, command: EditCommand);
     fn show_devtools(&self);
     fn close(&self);
 

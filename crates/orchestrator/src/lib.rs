@@ -29,6 +29,18 @@ use cockpit_persistence::{BudgetRecord, UsageFilter};
 pub use approvals::{ApprovalRules, AutoDecision};
 pub use browser_tools::{BrowserToolPolicy, ToolDecision};
 pub use budget::{Admission, TurnContext};
+
+/// Budget admission for a prompt of `text`. Run it wherever usage can be
+/// read (the database thread); `usage` returns total tokens for a filter.
+pub fn admit_turn(
+    text: &str,
+    ctx: TurnContext<'_>,
+    budgets: &[BudgetRecord],
+    now: DateTime<Local>,
+    usage: impl FnMut(&UsageFilter) -> Result<i64>,
+) -> Result<Admission> {
+    budget::admit(budgets, &ctx, budget::estimate_tokens(text), now, usage)
+}
 pub use policy::{AgentPolicy, PermissionPreset, PromptCheck};
 use scheduler::{Scheduled, Scheduler};
 
@@ -104,31 +116,33 @@ impl Orchestrator {
         }
     }
 
-    /// Runs a prompt through policy, budgets and the scheduler.
-    pub fn submit(
-        &mut self,
-        prompt: QueuedPrompt,
-        ctx: TurnContext<'_>,
-        budgets: &[BudgetRecord],
-        now: DateTime<Local>,
-        usage: impl FnMut(&UsageFilter) -> Result<i64>,
-    ) -> Result<Dispatch> {
-        let mut warnings = match self.policy.check_prompt(&prompt.text) {
-            PromptCheck::Deny(reason) => return Ok(Dispatch::Rejected { reason }),
-            PromptCheck::Warn(warnings) => warnings,
-            PromptCheck::Allow => Vec::new(),
+    /// Policy check for a prompt: `Err` with the reason it is refused, or
+    /// the warnings to show alongside it.
+    pub fn check_prompt(&self, text: &str) -> Result<Vec<String>, String> {
+        match self.policy.check_prompt(text) {
+            PromptCheck::Deny(reason) => Err(reason),
+            PromptCheck::Warn(warnings) => Ok(warnings),
+            PromptCheck::Allow => Ok(Vec::new()),
+        }
+    }
+
+    /// Runs a prompt through policy, the budget `admission` (computed with
+    /// [`admit_turn`] where the usage data lives) and the scheduler.
+    pub fn submit(&mut self, prompt: QueuedPrompt, admission: Admission) -> Dispatch {
+        let mut warnings = match self.check_prompt(&prompt.text) {
+            Err(reason) => return Dispatch::Rejected { reason },
+            Ok(warnings) => warnings,
         };
-        let estimate = budget::estimate_tokens(&prompt.text);
-        match budget::admit(budgets, &ctx, estimate, now, usage)? {
-            Admission::Deny(reason) => return Ok(Dispatch::Rejected { reason }),
+        match admission {
+            Admission::Deny(reason) => return Dispatch::Rejected { reason },
             Admission::Warn(more) => warnings.extend(more),
             Admission::Allowed => {}
         }
         let thread_id = prompt.thread_id.clone();
-        Ok(match self.scheduler.submit(&thread_id, prompt) {
+        match self.scheduler.submit(&thread_id, prompt) {
             Scheduled::Start(prompt) => Dispatch::Start { prompt, warnings },
             Scheduled::Queued { position } => Dispatch::Queued { position, warnings },
-        })
+        }
     }
 
     /// A turn ended (completed, failed or interrupted). Returns the next
@@ -182,7 +196,8 @@ mod tests {
     }
 
     fn submit(o: &mut Orchestrator, p: QueuedPrompt, budgets: &[BudgetRecord], used: i64) -> Dispatch {
-        o.submit(p, TurnContext::default(), budgets, Local::now(), |_| Ok(used)).unwrap()
+        let admission = admit_turn(&p.text, TurnContext::default(), budgets, Local::now(), |_| Ok(used)).unwrap();
+        o.submit(p, admission)
     }
 
     #[test]

@@ -1,6 +1,30 @@
 [package]
 name = "cockpit-ui"
+description = "The GPUI interface: workspace shell, editor, browser, terminal and Codex panels"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+chrono.workspace = true
+cockpit-agents.workspace = true
+cockpit-browser.workspace = true
+cockpit-common.workspace = true
+cockpit-editor.workspace = true
+cockpit-git.workspace = true
+cockpit-orchestrator.workspace = true
+cockpit-persistence.workspace = true
+cockpit-terminal.workspace = true
+futures.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+image.workspace = true
+lsp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+tracing.workspace = true

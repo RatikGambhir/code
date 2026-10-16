@@ -22,7 +22,7 @@ pub mod cef;
 pub use address::{is_local_url, origin_of, parse_address, resolve_address, AddressInput};
 pub use automation::{BrowserAction, ConsoleEntry, ConsoleLevel};
 pub use engine::{
-    BrowserEngine, BrowserTab, CursorKind, PageRect, TabOptions, TabState, UnavailableEngine,
+    BrowserEngine, BrowserTab, CursorKind, EditCommand, PageRect, TabOptions, TabState, UnavailableEngine,
     ViewGeometry,
 };
 pub use frame::Frame;

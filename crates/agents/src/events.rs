@@ -196,6 +196,76 @@ impl AgentEvent {
         }
     }
 
+    /// A compact JSON summary for the append-only event log: identifiers,
+    /// statuses and sizes rather than full message text.
+    pub fn log_payload(&self) -> Value {
+        use serde_json::json;
+        match self {
+            AgentEvent::ThreadStarted(thread) => json!({"thread": thread.id, "model": thread.model}),
+            AgentEvent::ThreadNameUpdated { name, .. } => json!({"name": name}),
+            AgentEvent::TurnStarted { turn, .. } => json!({"turn": turn.id}),
+            AgentEvent::TurnCompleted { turn, .. } => json!({
+                "turn": turn.id,
+                "status": turn.status,
+                "error": turn.error.as_ref().map(|e| e.message.clone()),
+                "durationMs": turn.duration_ms,
+            }),
+            AgentEvent::ItemStarted { item, .. } | AgentEvent::ItemCompleted { item, .. } => {
+                let mut payload = json!({"item": item.id()});
+                match item {
+                    ThreadItem::CommandExecution { command, status, exit_code, .. } => {
+                        payload["type"] = json!("commandExecution");
+                        payload["command"] = json!(command);
+                        payload["status"] = json!(status);
+                        payload["exitCode"] = json!(exit_code);
+                    }
+                    ThreadItem::FileChange { changes, status, .. } => {
+                        payload["type"] = json!("fileChange");
+                        payload["paths"] = json!(changes.iter().map(|c| c.path.clone()).collect::<Vec<_>>());
+                        payload["status"] = json!(status);
+                    }
+                    ThreadItem::AgentMessage { text, .. } => {
+                        payload["type"] = json!("agentMessage");
+                        payload["chars"] = json!(text.chars().count());
+                    }
+                    ThreadItem::DynamicToolCall { tool, success, .. } => {
+                        payload["type"] = json!("dynamicToolCall");
+                        payload["tool"] = json!(tool);
+                        payload["success"] = json!(success);
+                    }
+                    other => payload["type"] = json!(format!("{other:?}").split([' ', '{', '(']).next().unwrap_or("item").to_string()),
+                }
+                payload
+            }
+            AgentEvent::PlanUpdated { steps, .. } => json!({"steps": steps.len()}),
+            AgentEvent::DiffUpdated { diff, .. } => json!({"diffBytes": diff.len()}),
+            AgentEvent::TokenUsage { usage, .. } => json!(usage),
+            AgentEvent::ApprovalRequested(approval) => json!({
+                "request": approval.request_id,
+                "item": approval.item_id,
+                "kind": match &approval.kind {
+                    ApprovalKind::Command { command, .. } => json!({"command": command}),
+                    ApprovalKind::FileChange { grant_root, .. } => json!({"fileChange": grant_root}),
+                },
+            }),
+            AgentEvent::ApprovalResolved { request_id, .. } => json!({"request": request_id}),
+            AgentEvent::ToolCallRequested(call) => json!({
+                "request": call.request_id,
+                "tool": call.params.tool,
+                "namespace": call.params.namespace,
+            }),
+            AgentEvent::Error { message, will_retry, .. } => json!({"message": message, "willRetry": will_retry}),
+            AgentEvent::Warning { message, .. } => json!({"message": message}),
+            AgentEvent::LoginCompleted { success, error } => json!({"success": success, "error": error}),
+            AgentEvent::Disconnected { reason } => json!({"reason": reason}),
+            AgentEvent::AgentMessageDelta { .. }
+            | AgentEvent::ReasoningDelta { .. }
+            | AgentEvent::CommandOutputDelta { .. }
+            | AgentEvent::AccountChanged
+            | AgentEvent::Unhandled { .. } => json!({}),
+        }
+    }
+
     /// Interprets a server notification. Malformed payloads for known methods
     /// are logged and reported as `Unhandled` rather than dropped silently.
     pub fn from_notification(method: &str, params: Value) -> Self {
