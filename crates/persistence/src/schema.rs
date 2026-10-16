@@ -1,11 +1,18 @@
-//! Schema migrations, applied in order and tracked with `PRAGMA user_version`.
+//! The database schema: DDL migrations, plus one column enum per table for
+//! the query builder.
 //!
 //! The database stores *application* state. It deliberately does not mirror
 //! Codex's own session files or Chromium's profile: cookies, logins and Codex
 //! credentials stay in the stores that own them (the browser profile directory
 //! and the macOS Keychain).
+//!
+//! When a migration adds or renames a column, update the matching enum below;
+//! `every_table_enum_matches_the_schema` fails until they agree.
 
-/// Each entry upgrades the schema from version `index` to `index + 1`.
+use crate::{sql_enum, table};
+
+/// Each entry upgrades the schema from version `index` to `index + 1`, inside
+/// its own transaction.
 pub(crate) const MIGRATIONS: &[&str] = &[
     // 1: initial schema
     r#"
@@ -86,9 +93,9 @@ pub(crate) const MIGRATIONS: &[&str] = &[
 
     CREATE TABLE budgets (
         id                 INTEGER PRIMARY KEY,
-        scope              TEXT    NOT NULL,
+        scope              TEXT    NOT NULL CHECK (scope IN ('global', 'workspace', 'thread', 'model')),
         scope_key          TEXT    NOT NULL DEFAULT '',
-        period             TEXT    NOT NULL,
+        period             TEXT    NOT NULL CHECK (period IN ('day', 'week', 'month', 'total')),
         soft_limit_tokens  INTEGER,
         hard_limit_tokens  INTEGER,
         UNIQUE (scope, scope_key, period)
@@ -106,3 +113,203 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     );
     "#,
 ];
+
+table! {
+    /// Projects the user has opened.
+    pub enum Workspaces = "workspaces" {
+        Id = "id",
+        Path = "path",
+        Name = "name",
+        LastOpened = "last_opened",
+        LayoutJson = "layout_json",
+    }
+}
+
+table! {
+    /// Editor and browser tabs to restore, per workspace and pane.
+    pub enum Tabs = "tabs" {
+        Id = "id",
+        WorkspaceId = "workspace_id",
+        Pane = "pane",
+        Kind = "kind",
+        Resource = "resource",
+        Position = "position",
+        Active = "active",
+    }
+}
+
+table! {
+    /// Named browser profiles. Chromium keeps the actual cookies and storage
+    /// in `storage_dir`.
+    pub enum BrowserProfiles = "browser_profiles" {
+        Id = "id",
+        Name = "name",
+        StorageDir = "storage_dir",
+        CreatedAt = "created_at",
+    }
+}
+
+table! {
+    pub enum BrowserHistory = "browser_history" {
+        Id = "id",
+        ProfileId = "profile_id",
+        Url = "url",
+        Title = "title",
+        VisitedAt = "visited_at",
+    }
+}
+
+table! {
+    /// Codex threads the IDE knows about, so they can be resumed.
+    pub enum AgentThreads = "agent_threads" {
+        ThreadId = "thread_id",
+        WorkspaceId = "workspace_id",
+        Title = "title",
+        Model = "model",
+        Cwd = "cwd",
+        CreatedAt = "created_at",
+        UpdatedAt = "updated_at",
+        Archived = "archived",
+    }
+}
+
+table! {
+    pub enum AgentEvents = "agent_events" {
+        Id = "id",
+        ThreadId = "thread_id",
+        TurnId = "turn_id",
+        EventType = "event_type",
+        Payload = "payload",
+        CreatedAt = "created_at",
+    }
+}
+
+table! {
+    pub enum TokenUsage = "token_usage" {
+        Id = "id",
+        ThreadId = "thread_id",
+        TurnId = "turn_id",
+        WorkspaceId = "workspace_id",
+        Model = "model",
+        InputTokens = "input_tokens",
+        CachedInputTokens = "cached_input_tokens",
+        OutputTokens = "output_tokens",
+        ReasoningOutputTokens = "reasoning_output_tokens",
+        TotalTokens = "total_tokens",
+        RecordedAt = "recorded_at",
+    }
+}
+
+table! {
+    pub enum Budgets = "budgets" {
+        Id = "id",
+        Scope = "scope",
+        ScopeKey = "scope_key",
+        Period = "period",
+        SoftLimitTokens = "soft_limit_tokens",
+        HardLimitTokens = "hard_limit_tokens",
+    }
+}
+
+table! {
+    pub enum AgentPolicies = "agent_policies" {
+        ScopeKey = "scope_key",
+        PolicyJson = "policy_json",
+        UpdatedAt = "updated_at",
+    }
+}
+
+table! {
+    pub enum Settings = "settings" {
+        Key = "key",
+        Value = "value",
+    }
+}
+
+sql_enum! {
+    /// What a restored tab shows.
+    pub enum TabKind {
+        File = "file",
+        Browser = "browser",
+        Diff = "diff",
+    }
+}
+
+sql_enum! {
+    /// What a token budget is counted over.
+    pub enum BudgetScope {
+        /// Everything the app spends.
+        Global = "global",
+        /// One workspace; the scope key is its id.
+        Workspace = "workspace",
+        /// One agent thread; the scope key is the thread id.
+        Thread = "thread",
+        /// One model; the scope key is the model id.
+        Model = "model",
+    }
+}
+
+sql_enum! {
+    /// The window a budget resets over.
+    pub enum BudgetPeriod {
+        Day = "day",
+        Week = "week",
+        Month = "month",
+        /// Never resets.
+        Total = "total",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::Column;
+    use std::collections::BTreeSet;
+
+    fn schema_columns(conn: &rusqlite::Connection, table: &str) -> BTreeSet<String> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn enum_columns<C: Column>() -> (&'static str, BTreeSet<String>) {
+        (C::TABLE, C::ALL.iter().map(|c| c.name().to_string()).collect())
+    }
+
+    #[test]
+    fn every_table_enum_matches_the_schema() {
+        let db = crate::Database::open_in_memory().unwrap();
+        let tables = [
+            enum_columns::<Workspaces>(),
+            enum_columns::<Tabs>(),
+            enum_columns::<BrowserProfiles>(),
+            enum_columns::<BrowserHistory>(),
+            enum_columns::<AgentThreads>(),
+            enum_columns::<AgentEvents>(),
+            enum_columns::<TokenUsage>(),
+            enum_columns::<Budgets>(),
+            enum_columns::<AgentPolicies>(),
+            enum_columns::<Settings>(),
+        ];
+        for (table, columns) in tables {
+            assert_eq!(schema_columns(db.connection(), table), columns, "table {table}");
+        }
+    }
+
+    #[test]
+    fn check_constraints_match_the_value_enums() {
+        // The CHECK lists in the DDL must accept every enum value.
+        let ddl = MIGRATIONS.concat();
+        for kind in TabKind::ALL {
+            assert!(ddl.contains(&format!("'{kind}'")), "{kind}");
+        }
+        for scope in BudgetScope::ALL {
+            assert!(ddl.contains(&format!("'{scope}'")), "{scope}");
+        }
+        for period in BudgetPeriod::ALL {
+            assert!(ddl.contains(&format!("'{period}'")), "{period}");
+        }
+    }
+}

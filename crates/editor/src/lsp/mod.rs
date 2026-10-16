@@ -52,7 +52,9 @@ pub struct ResponseError {
     pub message: String,
 }
 
-type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, ResponseError>>>>>;
+/// Requests awaiting a response; `None` once the server is gone, so later
+/// requests fail immediately rather than waiting forever.
+type Pending = Arc<Mutex<Option<HashMap<i64, oneshot::Sender<Result<Value, ResponseError>>>>>>;
 
 pub struct LspClient {
     name: String,
@@ -96,7 +98,7 @@ impl LspClient {
         let client = Arc::new(Self {
             name: name.into(),
             writer: Mutex::new(Box::new(writer)),
-            pending: Arc::default(),
+            pending: Arc::new(Mutex::new(Some(HashMap::new()))),
             next_id: AtomicI64::new(1),
             capabilities: OnceLock::new(),
             child: Mutex::new(None),
@@ -111,7 +113,7 @@ impl LspClient {
                     dispatch(message, &pending, &events_tx, &weak);
                 }
                 // Fail whatever was still waiting rather than hanging it.
-                for (_, waiter) in pending.lock().drain() {
+                for (_, waiter) in pending.lock().take().into_iter().flatten() {
                     let _ = waiter.send(Err(ResponseError {
                         code: -32099,
                         message: "language server exited".into(),
@@ -158,7 +160,10 @@ impl LspClient {
     ) -> Result<oneshot::Receiver<Result<Value, ResponseError>>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(id, tx);
+        match self.pending.lock().as_mut() {
+            Some(map) => map.insert(id, tx),
+            None => return Err(anyhow!("{} has exited", self.name)),
+        };
         let sent = self.send(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -166,7 +171,9 @@ impl LspClient {
             "params": params?,
         }));
         if let Err(err) = sent {
-            self.pending.lock().remove(&id);
+            if let Some(map) = self.pending.lock().as_mut() {
+                map.remove(&id);
+            }
             return Err(err);
         }
         Ok(rx)
@@ -342,7 +349,7 @@ fn dispatch(
         // A response to one of our requests.
         (Some(id), None) => {
             let Some(id) = id.as_i64() else { return };
-            let Some(waiter) = pending.lock().remove(&id) else {
+            let Some(waiter) = pending.lock().as_mut().and_then(|map| map.remove(&id)) else {
                 return;
             };
             let result = match message.get("error") {
@@ -542,6 +549,9 @@ mod tests {
         drop(server_writer);
         let result = futures::executor::block_on(request);
         assert!(result.unwrap_err().to_string().contains("exited"));
+        // And requests made afterwards fail at once instead of hanging.
+        let later = client.hover(Path::new("/tmp/x.rs"), lsp_types::Position::new(0, 0));
+        assert!(futures::executor::block_on(later).is_err());
     }
 
     #[test]
