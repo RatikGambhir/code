@@ -1,0 +1,15 @@
+[package]
+name = "cockpit-git"
+description = "Git status, diffs, commits and worktrees via the git CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

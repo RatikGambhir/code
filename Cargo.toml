@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/persistence",
+    "crates/git",
+    "crates/terminal",
+    "crates/editor",
+    "crates/agents",
+    "crates/orchestrator",
+    "crates/browser",
+    "crates/ui",
+    "crates/app",
+    "xtask",
+]
+default-members = ["crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+cockpit-common = { path = "crates/common" }
+cockpit-persistence = { path = "crates/persistence" }
+cockpit-git = { path = "crates/git" }
+cockpit-terminal = { path = "crates/terminal" }
+cockpit-editor = { path = "crates/editor" }
+cockpit-agents = { path = "crates/agents" }
+cockpit-orchestrator = { path = "crates/orchestrator" }
+cockpit-browser = { path = "crates/browser" }
+cockpit-ui = { path = "crates/ui" }
+
+# GPUI from crates.io, pinned. gpui-component 0.5.x is the release line built
+# against gpui 0.2.2, so the two have to move together.
+gpui = "=0.2.2"
+gpui-component = { version = "=0.5.1", features = ["tree-sitter-languages"] }
+gpui-component-assets = "=0.5.1"
+
+# Chromium Embedded Framework. Only used on macOS; the build script downloads
+# the matching CEF distribution (~500MB) into $CEF_PATH on first build.
+cef = { version = "154.5.0", default-features = false, features = ["sandbox"] }
+
+anyhow = "1"
+async-channel = "2.5"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+futures = "0.3"
+ignore = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+lsp-types = "0.97"
+notify = "8"
+parking_lot = "0.12"
+portable-pty = "0.9"
+regex = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smallvec = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+vt100 = "0.16"
+
+[profile.dev]
+# Keep incremental builds of the app itself fast, but optimize dependencies:
+# GPUI, tree-sitter and the CEF frame copy are noticeably sluggish at -O0.
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 16

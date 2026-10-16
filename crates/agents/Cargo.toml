@@ -1,0 +1,6 @@
+[package]
+name = "cockpit-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
