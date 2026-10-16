@@ -53,9 +53,13 @@ shows the welcome window.
 scripts/check.sh
 ```
 
-runs the unit and integration tests of every non-UI crate, type-checks the
-UI and app, and type-checks the Chromium backend for `aarch64-apple-darwin`
-without downloading CEF (`--features cef-typecheck`). The live Codex test is
+runs the tests of every crate (the UI's included), type-checks the app, and
+type-checks the Chromium backend for `aarch64-apple-darwin` without
+downloading CEF (`--features cef-typecheck`).
+
+The UI itself also runs on Linux, minus the browser, which is handy for
+testing it headless: `cargo run -- <folder>` under `xvfb-run` with a Vulkan
+driver (Mesa's lavapipe works). The live Codex test is
 opt-in: `COCKPIT_CODEX_BIN=$(which codex) cargo test -p cockpit-agents --test
 live_codex` (add `COCKPIT_CODEX_LIVE_TURN=1` to run a real turn).
 
@@ -138,8 +142,8 @@ No secrets are stored there. `COCKPIT_DATA_DIR` moves it.
 
 ## Known limitations (v0.1)
 
-- macOS only. The non-UI crates build and test anywhere; the window and the
-  browser need macOS.
+- The product targets macOS. Everything but the browser also runs on Linux
+  (for development); the browser needs macOS and the app bundle.
 - Budgets, prompt patterns, approval rules and the browser-tool allowlist are
   enforced but have no settings screen yet; they live in the `budgets` and
   `agent_policies` tables (the permission preset and model are set from the
