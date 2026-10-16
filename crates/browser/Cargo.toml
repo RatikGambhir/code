@@ -1,0 +1,29 @@
+[package]
+name = "cockpit-browser"
+description = "Embedded browser: engine abstraction, Chromium (CEF) off-screen backend for macOS, automation API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# Type-check the CEF backend without downloading the CEF distribution
+# (uses cef-dll-sys's docs.rs mode). The result does not link; it exists so
+# CI and non-mac hosts can `cargo check --target aarch64-apple-darwin`.
+cef-typecheck = ["cef/dox"]
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+cockpit-common.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cef.workspace = true
+core-foundation = "0.10"
+objc2 = "0.6"

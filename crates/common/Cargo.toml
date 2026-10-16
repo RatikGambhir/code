@@ -1,0 +1,16 @@
+[package]
+name = "cockpit-common"
+description = "Shared identifiers, paths and process environment helpers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

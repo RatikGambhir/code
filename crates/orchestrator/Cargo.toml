@@ -1,0 +1,23 @@
+[package]
+name = "cockpit-orchestrator"
+description = "Agent orchestration: prompt policy, budgets, scheduling, approval rules and browser-tool policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+cockpit-agents.workspace = true
+cockpit-browser.workspace = true
+cockpit-git.workspace = true
+cockpit-persistence.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
