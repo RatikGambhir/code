@@ -526,6 +526,19 @@ pub struct TokenCounts {
 }
 
 impl TokenCounts {
+    /// Component-wise `self - earlier`, never negative (a counter that went
+    /// backwards, e.g. after a thread was compacted, contributes nothing).
+    pub fn saturating_sub(&self, earlier: &TokenCounts) -> TokenCounts {
+        TokenCounts {
+            input_tokens: (self.input_tokens - earlier.input_tokens).max(0),
+            cached_input_tokens: (self.cached_input_tokens - earlier.cached_input_tokens).max(0),
+            output_tokens: (self.output_tokens - earlier.output_tokens).max(0),
+            reasoning_output_tokens: (self.reasoning_output_tokens - earlier.reasoning_output_tokens)
+                .max(0),
+            total_tokens: (self.total_tokens - earlier.total_tokens).max(0),
+        }
+    }
+
     pub fn add(&mut self, other: &TokenCounts) {
         self.input_tokens += other.input_tokens;
         self.cached_input_tokens += other.cached_input_tokens;
@@ -614,6 +627,58 @@ impl Reader<'_> {
 }
 
 impl Writer<'_> {
+    /// Records the usage implied by a new cumulative total for a thread.
+    ///
+    /// Codex reports running totals per thread. This compares `total` with
+    /// the baseline stored for the thread, records the difference as one
+    /// usage row and moves the baseline forward — in the caller's
+    /// transaction, so the row and the baseline can never disagree. Returns
+    /// the recorded delta (all zeros when nothing new was used).
+    pub fn record_thread_usage_total(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        workspace_id: Option<i64>,
+        model: &str,
+        total: TokenCounts,
+    ) -> Result<TokenCounts> {
+        let stored: Option<Option<String>> = AgentThreads::select([AgentThreads::UsageBaseline])
+            .filter(AgentThreads::ThreadId.equals(thread_id))
+            .fetch_optional(self, |row| row.col(AgentThreads::UsageBaseline))?;
+        if stored.is_none() {
+            let now = now_ts();
+            self.upsert_agent_thread(&AgentThreadRecord {
+                thread_id: thread_id.into(),
+                workspace_id,
+                title: None,
+                model: Some(model.into()),
+                cwd: None,
+                created_at: now,
+                updated_at: now,
+            })?;
+        }
+        let baseline: TokenCounts = stored
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+
+        let delta = total.saturating_sub(&baseline);
+        if delta.total_tokens > 0 || delta.input_tokens > 0 || delta.output_tokens > 0 {
+            self.record_usage(&UsageRecord {
+                thread_id: Some(thread_id.into()),
+                turn_id: turn_id.map(str::to_string),
+                workspace_id,
+                model: model.into(),
+                counts: delta,
+            })?;
+        }
+        AgentThreads::update()
+            .set(AgentThreads::UsageBaseline, serde_json::to_string(&total)?)
+            .filter(AgentThreads::ThreadId.equals(thread_id))
+            .execute(self)?;
+        Ok(delta)
+    }
+
     pub fn record_usage(&self, usage: &UsageRecord) -> Result<()> {
         let counts = &usage.counts;
         TokenUsage::insert()
@@ -963,6 +1028,34 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn cumulative_totals_become_deltas_without_double_counting() {
+        let mut db = db();
+        let total = |n: i64| TokenCounts {
+            input_tokens: n * 3,
+            output_tokens: n,
+            total_tokens: n * 4,
+            ..Default::default()
+        };
+        let ws = db.write(|w| w.touch_workspace("/src/a", "a")).unwrap().id;
+        db.write(|w| {
+            // First report for an unknown thread creates it.
+            assert_eq!(w.record_thread_usage_total("t1", Some("u1"), Some(ws), "m", total(10))?.total_tokens, 40);
+            assert_eq!(w.record_thread_usage_total("t1", Some("u2"), Some(ws), "m", total(15))?.total_tokens, 20);
+            // A repeated total (e.g. re-sent after resume) records nothing.
+            assert_eq!(w.record_thread_usage_total("t1", Some("u2"), Some(ws), "m", total(15))?, TokenCounts::default());
+            Ok(())
+        })
+        .unwrap();
+        let recorded = db
+            .read(|r| r.usage_total(&UsageFilter { thread_id: Some("t1".into()), ..Default::default() }))
+            .unwrap();
+        assert_eq!(recorded.total_tokens, 60);
+        assert_eq!(recorded.input_tokens, 45);
+        // The thread row the first report created is a normal thread.
+        assert_eq!(db.read(|r| r.agent_threads(ws, false)).unwrap().len(), 1);
     }
 
     #[test]

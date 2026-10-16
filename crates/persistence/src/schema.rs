@@ -112,6 +112,11 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         value         TEXT    NOT NULL
     );
     "#,
+    // 2: the last cumulative token total Codex reported for each thread, so
+    // usage can be recorded as deltas without double counting after a resume.
+    r#"
+    ALTER TABLE agent_threads ADD COLUMN usage_baseline TEXT;
+    "#,
 ];
 
 table! {
@@ -170,6 +175,8 @@ table! {
         CreatedAt = "created_at",
         UpdatedAt = "updated_at",
         Archived = "archived",
+        /// JSON `TokenCounts`: the thread's cumulative usage last recorded.
+        UsageBaseline = "usage_baseline",
     }
 }
 
