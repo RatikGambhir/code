@@ -73,6 +73,7 @@ fn handshake_models_and_thread_against_a_real_server() {
         model: None,
         effort: None,
         approval_policy: None,
+        sandbox_policy: None,
     }))
     .expect("turn/start");
 

@@ -124,7 +124,7 @@ pub fn format_console(entries: &[ConsoleEntry], max_entries: usize) -> String {
     }
     let mut ordered: Vec<&ConsoleEntry> = entries.iter().collect();
     // Stable sort keeps chronological order within each level.
-    ordered.sort_by(|a, b| b.level.cmp(&a.level));
+    ordered.sort_by_key(|entry| std::cmp::Reverse(entry.level));
     ordered.truncate(max_entries.max(1));
     ordered
         .iter()

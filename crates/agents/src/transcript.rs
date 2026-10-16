@@ -322,17 +322,30 @@ impl Transcript {
                     });
                 }
             }
-            AgentEvent::Error { message, will_retry, turn_id, .. } => {
-                let message = if *will_retry {
-                    format!("{message} (retrying)")
-                } else {
-                    message.clone()
-                };
+            // Transient failures (reconnect attempts) are one line per turn
+            // showing the latest attempt, not an error each.
+            AgentEvent::Error { message, will_retry: true, turn_id, .. } => {
+                let id = format!("retry-{turn_id}");
+                let kind = EntryKind::Notice { text: message.clone() };
+                match self.index.get(&id).copied() {
+                    Some(ix) => {
+                        self.entries[ix].kind = kind;
+                        self.revision += 1;
+                    }
+                    None => self.push_entry(Entry {
+                        id,
+                        turn_id: Some(turn_id.clone()),
+                        kind,
+                        streaming: false,
+                    }),
+                }
+            }
+            AgentEvent::Error { message, turn_id, .. } => {
                 self.next_local += 1;
                 self.push_entry(Entry {
                     id: format!("error-event-{}", self.next_local),
                     turn_id: Some(turn_id.clone()),
-                    kind: EntryKind::Error { message },
+                    kind: EntryKind::Error { message: message.clone() },
                     streaming: false,
                 });
             }
@@ -602,6 +615,25 @@ mod tests {
         t.apply(&AgentEvent::TurnCompleted { thread_id: "t".into(), turn: turn("u", TurnStatus::Completed) });
         assert!(!t.is_running());
         assert_eq!(t.last_status(), Some(TurnStatus::Completed));
+    }
+
+    #[test]
+    fn retries_collapse_into_one_notice_and_final_errors_stand_out() {
+        let mut t = Transcript::new();
+        let error = |message: &str, will_retry| AgentEvent::Error {
+            thread_id: "t".into(),
+            turn_id: "u".into(),
+            message: message.into(),
+            will_retry,
+        };
+        t.apply(&error("Reconnecting... 1/5", true));
+        t.apply(&error("Reconnecting... 2/5", true));
+        assert_eq!(t.entries().len(), 1);
+        assert_eq!(t.entries()[0].kind, EntryKind::Notice { text: "Reconnecting... 2/5".into() });
+
+        t.apply(&error("stream disconnected", false));
+        assert_eq!(t.entries().len(), 2);
+        assert!(matches!(t.entries()[1].kind, EntryKind::Error { .. }));
     }
 
     #[test]

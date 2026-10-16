@@ -113,10 +113,6 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Stop", actions::InterruptAgent),
             ],
         },
-        Menu {
-            name: "Window".into(),
-            items: vec![MenuItem::os_submenu("Window", SystemMenuType::Services)],
-        },
     ]
 }
 

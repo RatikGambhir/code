@@ -78,6 +78,16 @@ pub enum SandboxMode {
     DangerFullAccess,
 }
 
+/// The sandbox as `turn/start` takes it; it applies to that turn and the
+/// ones after it, so a permission change reaches running threads.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum SandboxPolicy {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
 // ---------------------------------------------------------------------------
 // Threads and turns
 // ---------------------------------------------------------------------------
@@ -151,6 +161,8 @@ pub struct TurnStartParams {
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<AskForApproval>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_policy: Option<SandboxPolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -758,6 +770,27 @@ pub enum LoginResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_overrides_serialize_like_the_schema() {
+        let params = TurnStartParams {
+            thread_id: "t".into(),
+            input: vec![UserInput::text("hi")],
+            cwd: None,
+            approval_policy: Some(AskForApproval::OnRequest),
+            sandbox_policy: Some(SandboxPolicy::WorkspaceWrite),
+            model: None,
+            effort: None,
+        };
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["sandboxPolicy"], json!({"type": "workspaceWrite"}));
+        assert_eq!(json["approvalPolicy"], json!("on-request"));
+        assert!(json.get("model").is_none());
+        assert_eq!(
+            serde_json::to_value(SandboxPolicy::DangerFullAccess).unwrap(),
+            json!({"type": "dangerFullAccess"})
+        );
+    }
     use serde_json::json;
 
     #[test]

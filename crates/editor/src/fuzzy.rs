@@ -59,7 +59,7 @@ pub fn rank<'a, T>(
         .into_iter()
         .filter_map(|(text, item)| score(query, text).map(|s| (item, s)))
         .collect();
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
     scored.truncate(limit);
     scored
 }

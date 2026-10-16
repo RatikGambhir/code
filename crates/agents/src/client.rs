@@ -462,6 +462,7 @@ mod tests {
                 input: vec![UserInput::text("run the tests")],
                 cwd: None,
                 approval_policy: None,
+                sandbox_policy: None,
                 model: None,
                 effort: None,
             })

@@ -116,7 +116,7 @@ impl Render for Welcome {
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child("Tip: run `cockpit <folder>` from a terminal to open a folder directly."),
+                            .child("Tip: drop a folder on the Dock icon, or run `open -a Cockpit <folder>`."),
                     ),
             )
             .child(div().absolute().bottom_2().text_xs().text_color(muted).child(format!(

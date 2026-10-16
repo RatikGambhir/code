@@ -34,6 +34,7 @@ pub struct Prompt {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub approval_policy: Option<AskForApproval>,
+    pub sandbox_policy: Option<SandboxPolicy>,
 }
 
 pub trait AgentBackend: Send + Sync + 'static {
@@ -85,6 +86,7 @@ impl AgentBackend for CodexClient {
             input: prompt.input,
             cwd: None,
             approval_policy: prompt.approval_policy,
+            sandbox_policy: prompt.sandbox_policy,
             model: prompt.model,
             effort: prompt.effort,
         });

@@ -56,7 +56,7 @@ impl AgentPanel {
         let composer = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(2, 12)
-                .placeholder("Ask Codex to change code… (Enter to send, Shift-Enter for a newline)")
+                .placeholder("Ask Codex…  (↩ send, ⇧↩ newline)")
         });
         let api_key = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("sk-…"));
         let subscriptions = vec![
@@ -366,7 +366,9 @@ impl AgentPanel {
         let thread_id = thread.id.clone();
         let loading = thread.loading;
         let running = thread.transcript.is_running();
-        let entries: Vec<Entry> = thread.transcript.entries().to_vec();
+        // Rendering runs on every frame that changes anything (a cursor
+        // blink included), so copy only what can be shown.
+        let entries: Vec<Entry> = thread.transcript.entries().iter().map(displayed_part).collect();
         let cwd = controller.cwd().to_path_buf();
 
         let mut list = v_flex().p_3().gap_3();
@@ -1018,7 +1020,11 @@ impl Render for AgentPanel {
             .child(self.render_header(cx))
             .children(connection)
             .children(login)
-            .when_some(body, |el, body| el.child(body))
+            .map(|el| match body {
+                Some(body) => el.child(body),
+                // Keep the composer at the bottom under a status card.
+                None => el.child(div().flex_1()),
+            })
             .children(self.render_pending(cx))
             .child(self.render_composer(cx))
     }
@@ -1098,6 +1104,38 @@ fn diff_stats(diff: &str) -> (usize, usize) {
         }
     }
     (added, removed)
+}
+
+/// An entry with long command output and diffs cut to what is displayed.
+fn displayed_part(entry: &Entry) -> Entry {
+    let kind = match &entry.kind {
+        EntryKind::Command { command, cwd, output, status, exit_code, duration_ms } => EntryKind::Command {
+            command: command.clone(),
+            cwd: cwd.clone(),
+            output: tail_chars(output, MAX_OUTPUT_CHARS).to_string(),
+            status: *status,
+            exit_code: *exit_code,
+            duration_ms: *duration_ms,
+        },
+        EntryKind::FileChange { files, status } => EntryKind::FileChange {
+            files: files
+                .iter()
+                .map(|file| ChangedFile {
+                    path: file.path.clone(),
+                    change: file.change.clone(),
+                    diff: tail_chars(&file.diff, MAX_OUTPUT_CHARS).to_string(),
+                })
+                .collect(),
+            status: *status,
+        },
+        other => other.clone(),
+    };
+    Entry {
+        id: entry.id.clone(),
+        turn_id: entry.turn_id.clone(),
+        kind,
+        streaming: entry.streaming,
+    }
 }
 
 /// The last `max` bytes of `text`, cut at a character boundary.

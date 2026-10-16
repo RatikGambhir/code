@@ -2,6 +2,7 @@
 //! title and status bars. It owns the wiring between them.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -26,7 +27,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     notification::Notification,
-    resizable::{h_resizable, resizable_panel, v_resizable},
+    resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
     v_flex, ActiveTheme as _, IconName, Root, Selectable as _, Sizable as _, TitleBar, WindowExt as _,
 };
 use serde::{Deserialize, Serialize};
@@ -104,6 +105,7 @@ pub struct Workspace {
     /// The browser tab Codex drives.
     agent_browser: Option<WeakEntity<BrowserView>>,
 
+    panel_sizes: HashMap<&'static str, Entity<ResizableState>>,
     palette: Option<Entity<Palette>>,
     /// Where focus was before the palette opened.
     palette_return: Option<FocusHandle>,
@@ -245,6 +247,7 @@ impl Workspace {
             agent,
             agent_panel,
             agent_browser: None,
+            panel_sizes: HashMap::new(),
             palette: None,
             palette_return: None,
             save_tabs: None,
@@ -553,7 +556,7 @@ impl Workspace {
                 self.source_control.update(cx, |scm, cx| scm.refresh(cx));
             }
             AgentControllerEvent::RunBrowserAction { call, action } => {
-                self.run_browser_action(call.clone(), action.clone(), window, cx);
+                self.run_browser_action((**call).clone(), action.clone(), window, cx);
             }
         }
     }
@@ -906,7 +909,8 @@ impl Workspace {
             "Version {}\nA native IDE with an embedded Chromium browser and the Codex agent.",
             cockpit_common::APP_VERSION
         );
-        let _ = window.prompt(PromptLevel::Info, cockpit_common::APP_NAME, Some(&detail), &["OK"], cx);
+        // Nothing to do with the answer; dropping the receiver keeps the alert.
+        drop(window.prompt(PromptLevel::Info, cockpit_common::APP_NAME, Some(&detail), &["OK"], cx));
     }
 
     fn open_palette(&mut self, files: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1079,17 +1083,100 @@ impl Workspace {
         }
     }
 
-    fn render_center(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Panel sizes for one arrangement of panels. Each arrangement keeps its
+    /// own, so hiding the sidebar and showing it again restores its width.
+    /// (Panels are left out rather than hidden: a group sizes a panel that
+    /// starts hidden badly once it appears.)
+    fn panel_sizes(&mut self, key: &'static str, cx: &mut Context<Self>) -> Entity<ResizableState> {
+        self.panel_sizes
+            .entry(key)
+            .or_insert_with(|| cx.new(|_| ResizableState::default()))
+            .clone()
+    }
+
+    fn render_center(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if !self.layout.split {
+            return self.panes[0].clone().into_any_element();
+        }
+        let sizes = self.panel_sizes("panes", cx);
         let border = cx.theme().border;
         let pane = |ix: usize| {
             div()
                 .size_full()
-                .when(self.layout.split && ix == self.active_pane, |el| el.border_t_1().border_color(border))
+                .when(ix == self.active_pane, |el| el.border_t_1().border_color(border))
                 .child(self.panes[ix].clone())
         };
         h_resizable("workspace-panes")
+            .with_state(&sizes)
             .child(resizable_panel().child(pane(0)))
-            .child(resizable_panel().visible(self.layout.split).child(pane(1)))
+            .child(resizable_panel().child(pane(1)))
+            .into_any_element()
+    }
+
+    /// The editor area, with the terminal under it when shown.
+    fn render_middle(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let center = self.render_center(cx);
+        let Some(terminal) = self.terminal.clone().filter(|_| self.layout.terminal_visible) else {
+            return center;
+        };
+        let sizes = self.panel_sizes("rows", cx);
+        v_resizable("workspace-rows")
+            .with_state(&sizes)
+            .child(resizable_panel().child(center))
+            .child(
+                resizable_panel()
+                    .size(px(280.))
+                    .size_range(px(80.)..px(1600.))
+                    .child(
+                        div()
+                            .size_full()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .child(terminal),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_columns(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let middle = self.render_middle(cx);
+        let (sidebar, agent) = (self.layout.sidebar_visible, self.layout.agent_visible);
+        if !sidebar && !agent {
+            return middle;
+        }
+        let key = match (sidebar, agent) {
+            (true, true) => "columns",
+            (true, false) => "columns-sidebar",
+            _ => "columns-agent",
+        };
+        let sizes = self.panel_sizes(key, cx);
+        let sidebar_bg = cx.theme().sidebar;
+        let border = cx.theme().border;
+        h_resizable(key)
+            .with_state(&sizes)
+            .when(sidebar, |group| {
+                group.child(
+                    resizable_panel()
+                        .size(px(260.))
+                        .size_range(px(160.)..px(640.))
+                        .child(div().size_full().bg(sidebar_bg).child(self.render_sidebar())),
+                )
+            })
+            .child(resizable_panel().child(middle))
+            .when(agent, |group| {
+                group.child(
+                    resizable_panel()
+                        .size(px(420.))
+                        .size_range(px(300.)..px(1000.))
+                        .child(
+                            div()
+                                .size_full()
+                                .border_l_1()
+                                .border_color(border)
+                                .child(self.agent_panel.clone()),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -1175,9 +1262,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dialogs = Root::render_dialog_layer(window, cx);
         let notifications = Root::render_notification_layer(window, cx);
-        let terminal = self.terminal.clone();
-        let sidebar = self.render_sidebar();
-        let center = self.render_center(cx);
+        let columns = self.render_columns(cx);
 
         v_flex()
             .id("workspace")
@@ -1240,50 +1325,7 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .child(self.render_activity_bar(cx))
-                    .child(
-                        div().flex_1().min_w_0().h_full().child(
-                            h_resizable("workspace-columns")
-                                .child(
-                                    resizable_panel()
-                                        .size(px(260.))
-                                        .size_range(px(160.)..px(640.))
-                                        .visible(self.layout.sidebar_visible)
-                                        .child(div().size_full().bg(cx.theme().sidebar).child(sidebar)),
-                                )
-                                .child(
-                                    resizable_panel().child(
-                                        v_resizable("workspace-rows")
-                                            .child(resizable_panel().child(center))
-                                            .child(
-                                                resizable_panel()
-                                                    .size(px(260.))
-                                                    .size_range(px(80.)..px(1200.))
-                                                    .visible(self.layout.terminal_visible && terminal.is_some())
-                                                    .child(
-                                                        div()
-                                                            .size_full()
-                                                            .border_t_1()
-                                                            .border_color(cx.theme().border)
-                                                            .children(terminal),
-                                                    ),
-                                            ),
-                                    ),
-                                )
-                                .child(
-                                    resizable_panel()
-                                        .size(px(420.))
-                                        .size_range(px(300.)..px(1000.))
-                                        .visible(self.layout.agent_visible)
-                                        .child(
-                                            div()
-                                                .size_full()
-                                                .border_l_1()
-                                                .border_color(cx.theme().border)
-                                                .child(self.agent_panel.clone()),
-                                        ),
-                                ),
-                        ),
-                    ),
+                    .child(div().flex_1().min_w_0().h_full().child(columns)),
             )
             .child(self.render_status_bar(cx))
             .when_some(self.palette.clone(), |el, palette| {

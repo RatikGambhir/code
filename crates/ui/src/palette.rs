@@ -98,16 +98,7 @@ impl Palette {
     pub fn files(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let listing = cx.background_spawn({
             let root = root.clone();
-            async move {
-                fs_tree::list_files(&root, MAX_FILES)
-                    .into_iter()
-                    .filter_map(|path| {
-                        path.strip_prefix(&root)
-                            .ok()
-                            .map(|p| p.to_string_lossy().into_owned())
-                    })
-                    .collect::<Vec<_>>()
-            }
+            async move { workspace_files(&root) }
         });
         cx.spawn(async move |this, cx| {
             let paths = listing.await;
@@ -212,6 +203,7 @@ impl Palette {
                         let command = &commands[ix];
                         h_flex()
                             .flex_1()
+                            .gap_4()
                             .child(div().flex_1().child(command.label))
                             .when_some(command.keys.clone(), |el, keys| {
                                 el.child(keys.appearance(false).text_xs().text_color(muted))
@@ -234,6 +226,7 @@ impl Palette {
                 };
                 h_flex()
                     .id(("palette-row", row))
+                    .w_full()
                     .h(px(28.))
                     .px_3()
                     .text_sm()
@@ -245,6 +238,14 @@ impl Palette {
             })
             .collect()
     }
+}
+
+/// Files for quick open, relative to `root`.
+fn workspace_files(root: &std::path::Path) -> Vec<String> {
+    fs_tree::list_files(root, MAX_FILES)
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
 }
 
 impl Render for Palette {
@@ -293,12 +294,34 @@ impl Render for Palette {
                     )
                 } else {
                     el.child(
-                        uniform_list("palette-rows", self.matches.len(), cx.processor(Self::render_rows))
-                            .track_scroll(self.scroll.clone())
-                            .h(px(28. * self.matches.len().min(12) as f32))
-                            .py_1(),
+                        div().py_1().child(
+                            uniform_list("palette-rows", self.matches.len(), cx.processor(Self::render_rows))
+                                .track_scroll(self.scroll.clone())
+                                .w_full()
+                                .h(px(28. * self.matches.len().min(12) as f32)),
+                        ),
                     )
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quick_open_lists_relative_paths_and_finds_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("README.md"), "").unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+
+        let mut files = workspace_files(dir.path());
+        files.sort();
+        assert_eq!(files, vec!["README.md".to_string(), "src/main.rs".to_string()]);
+
+        let best = fuzzy::rank("readme", files.iter().map(|f| (f.as_str(), f.clone())), 5);
+        assert_eq!(best.first().map(|(f, _)| f.as_str()), Some("README.md"));
     }
 }

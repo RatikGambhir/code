@@ -63,7 +63,11 @@ pub const BROWSER_CONTEXT: &str = "BrowserView";
 pub const TERMINAL_CONTEXT: &str = "Terminal";
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
+    cx.bind_keys(key_bindings());
+}
+
+fn key_bindings() -> Vec<KeyBinding> {
+    vec![
         KeyBinding::new("cmd-o", OpenFolder, None),
         KeyBinding::new("cmd-s", Save, None),
         KeyBinding::new("cmd-w", CloseTab, None),
@@ -84,12 +88,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-n", NewAgentThread, None),
         KeyBinding::new("ctrl-c", InterruptAgent, Some("AgentComposer")),
         KeyBinding::new("cmd-q", Quit, None),
-        // Shift-Enter makes a newline in multi-line inputs (the agent
-        // composer sends on Enter).
+        // The agent composer sends on Enter, so Shift-Enter is its newline.
         KeyBinding::new(
             "shift-enter",
             gpui_component::input::Enter { secondary: true },
-            Some("Input"),
+            Some("AgentComposer > Input"),
         ),
         // Browser
         KeyBinding::new("cmd-l", FocusAddressBar, Some(BROWSER_CONTEXT)),
@@ -116,5 +119,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-v", TerminalPaste, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-k", TerminalClear, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-shift-c", TerminalCopyScreen, Some(TERMINAL_CONTEXT)),
-    ]);
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_binding_parses() {
+        // GPUI panics on a malformed keystroke or context; catch it here
+        // rather than at launch.
+        assert!(super::key_bindings().len() > 40);
+    }
 }

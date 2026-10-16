@@ -5,7 +5,7 @@
 
 use std::sync::OnceLock;
 
-use cockpit_agents::protocol::{AskForApproval, SandboxMode};
+use cockpit_agents::protocol::{AskForApproval, SandboxMode, SandboxPolicy};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +45,15 @@ impl PermissionPreset {
             PermissionPreset::ReadOnly => SandboxMode::ReadOnly,
             PermissionPreset::Auto => SandboxMode::WorkspaceWrite,
             PermissionPreset::FullAccess => SandboxMode::DangerFullAccess,
+        }
+    }
+
+    /// The same sandbox in `turn/start`'s form.
+    pub fn sandbox_policy(self) -> SandboxPolicy {
+        match self {
+            PermissionPreset::ReadOnly => SandboxPolicy::ReadOnly,
+            PermissionPreset::Auto => SandboxPolicy::WorkspaceWrite,
+            PermissionPreset::FullAccess => SandboxPolicy::DangerFullAccess,
         }
     }
 

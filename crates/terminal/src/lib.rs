@@ -110,12 +110,10 @@ impl Terminal {
                 command.args(args);
                 command
             }
-            None => {
-                let mut command = CommandBuilder::new_default_prog();
-                // A login shell picks up the user's profile, as Terminal.app does.
-                command.arg("-l");
-                command
-            }
+            // The user's shell ($SHELL, else the passwd entry), started as a
+            // login shell (argv[0] = "-zsh") so it reads the profile the way
+            // Terminal.app does. The builder must not be given arguments.
+            None => CommandBuilder::new_default_prog(),
         };
         command.cwd(&options.cwd);
         command.env("TERM", "xterm-256color");
@@ -426,6 +424,16 @@ mod tests {
         .unwrap();
         let name = dir.path().file_name().unwrap().to_string_lossy().to_string();
         assert!(wait_until(|| terminal.contents().contains(&name)));
+    }
+
+    #[test]
+    fn default_shell_starts_and_runs_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = TerminalOptions::shell(dir.path());
+        options.env.push(("SHELL".into(), "/bin/sh".into()));
+        let (terminal, _events) = Terminal::spawn(options).unwrap();
+        terminal.write(b"echo marker-$((40 + 2))\n");
+        assert!(wait_until(|| terminal.contents().contains("marker-42")));
     }
 
     #[test]

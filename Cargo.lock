@@ -1027,6 +1027,7 @@ name = "cockpit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "cockpit-agents",
  "cockpit-browser",
  "cockpit-common",
@@ -1035,6 +1036,7 @@ dependencies = [
  "gpui",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -1183,6 +1185,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "tempfile",
  "tracing",
 ]
 

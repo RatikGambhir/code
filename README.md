@@ -42,8 +42,10 @@ Chromium only works from the app bundle — it locates its framework and the
 `cargo run` starts the IDE with the browser disabled and a note explaining
 why, which is handy when working on non-browser UI.
 
-Pass a folder to open it: `cargo xtask bundle --run -- ~/src/project`.
-Otherwise Cockpit reopens the last folder, or shows the welcome window.
+Pass a folder to open it: `cargo xtask bundle --run -- ~/src/project`; an
+installed app also opens folders dropped on its Dock icon or given to
+`open -a Cockpit <folder>`. Otherwise Cockpit reopens the last folder, or
+shows the welcome window.
 
 ### Verification on any host
 

@@ -67,9 +67,18 @@ fn run() -> Result<()> {
         .map(PathBuf::from)
         .collect();
 
+    // Folders dropped on the Dock icon or opened with `open -a Cockpit <dir>`
+    // arrive as file URLs, possibly before the UI is up; queue them.
+    let (open_tx, open_rx) = async_channel::unbounded::<PathBuf>();
+
     let browser = Rc::new(RefCell::new(Some(browser)));
     let app = Application::new().with_assets(Assets);
     app.on_reopen(cockpit_ui::reopen);
+    app.on_open_urls(move |urls| {
+        for path in urls.iter().filter_map(|url| folder_for_url(url)) {
+            let _ = open_tx.try_send(path);
+        }
+    });
     app.run(move |cx| {
         let engine = browser
             .borrow()
@@ -101,8 +110,27 @@ fn run() -> Result<()> {
         .detach();
 
         cockpit_ui::launch(folders, cx);
+        cx.spawn(async move |cx| {
+            while let Ok(path) = open_rx.recv().await {
+                if cx.update(|cx| cockpit_ui::open_folder(path, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     });
     Ok(())
+}
+
+/// The folder to open for a `file://` URL: the folder itself, or a file's
+/// parent.
+fn folder_for_url(url: &str) -> Option<PathBuf> {
+    let path = url::Url::parse(url).ok()?.to_file_path().ok()?;
+    if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent().map(PathBuf::from)
+    }
 }
 
 /// Logs to stderr and `<data dir>/logs/cockpit.log`. `COCKPIT_LOG` takes an

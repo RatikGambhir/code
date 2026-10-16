@@ -314,6 +314,7 @@ fn run_command(command: &mut Command, what: &str) -> Result<()> {
 enum Value<'a> {
     Str(&'a str),
     Bool(bool),
+    Array(Vec<Value<'a>>),
     Dict(Vec<(&'a str, Value<'a>)>),
 }
 
@@ -327,6 +328,13 @@ fn plist(entries: Vec<(&str, Value)>) -> String {
             Value::Str(text) => out.push_str(&format!("{pad}<string>{}</string>\n", escape(text))),
             Value::Bool(true) => out.push_str(&format!("{pad}<true/>\n")),
             Value::Bool(false) => out.push_str(&format!("{pad}<false/>\n")),
+            Value::Array(items) => {
+                out.push_str(&format!("{pad}<array>\n"));
+                for item in items {
+                    write(out, item, indent + 1);
+                }
+                out.push_str(&format!("{pad}</array>\n"));
+            }
             Value::Dict(entries) => {
                 out.push_str(&format!("{pad}<dict>\n"));
                 for (key, value) in entries {
@@ -375,6 +383,17 @@ fn main_info_plist(has_icon: bool) -> String {
             "NSMicrophoneUsageDescription",
             Value::Str("A web page in Cockpit's browser wants to use the microphone."),
         ),
+        // Folders can be dropped on the Dock icon or opened with
+        // `open -a Cockpit <folder>`.
+        (
+            "CFBundleDocumentTypes",
+            Value::Array(vec![Value::Dict(vec![
+                ("CFBundleTypeName", Value::Str("Folder")),
+                ("CFBundleTypeRole", Value::Str("Editor")),
+                ("LSHandlerRank", Value::Str("Alternate")),
+                ("LSItemContentTypes", Value::Array(vec![Value::Str("public.folder")])),
+            ])]),
+        ),
     ]);
     if has_icon {
         keys.push(("CFBundleIconFile", Value::Str(APP_NAME)));
@@ -400,6 +419,8 @@ mod tests {
         assert!(main.contains("<key>CFBundleExecutable</key>\n\t<string>Cockpit</string>"));
         assert!(!main.contains("CFBundleIconFile"));
         assert_eq!(main.matches("<dict>").count(), main.matches("</dict>").count());
+        assert!(main.contains("<array>\n\t\t<dict>"));
+        assert!(main.contains("<string>public.folder</string>"));
 
         let helper = helper_info_plist("Cockpit Helper (GPU)", "helper.gpu");
         assert!(helper.contains("<string>dev.cockpit.ide.helper.gpu</string>"));

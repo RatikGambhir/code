@@ -235,13 +235,13 @@ impl Pane {
                     0 => {
                         if let PaneItem::Editor(editor) = &item {
                             if let Err(err) = editor.update(cx, |editor, cx| editor.save(cx)) {
-                                let _ = window.prompt(
+                                drop(window.prompt(
                                     PromptLevel::Critical,
                                     &format!("Could not save {title}"),
                                     Some(&format!("{err:#}")),
                                     &["OK"],
                                     cx,
-                                );
+                                ));
                                 return;
                             }
                         }

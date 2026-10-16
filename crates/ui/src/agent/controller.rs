@@ -55,7 +55,7 @@ pub enum AgentControllerEvent {
     /// Something to show the user outside the panel.
     Notify(SharedString),
     /// Run a browser action for Codex and answer with `respond_tool_call`.
-    RunBrowserAction { call: ToolCall, action: BrowserAction },
+    RunBrowserAction { call: Box<ToolCall>, action: BrowserAction },
     /// Codex edited these files.
     FilesChanged(Vec<PathBuf>),
 }
@@ -635,12 +635,16 @@ impl AgentController {
     fn start_turn(&mut self, prompt: QueuedPrompt, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else { return };
         let thread_id = prompt.thread_id.clone();
+        // The current preset applies to every turn, so changing it in the
+        // panel also changes threads that started under another one.
+        let permissions = self.orchestrator.policy().permissions;
         let request = backend.submit_prompt(Prompt {
             thread_id: prompt.thread_id,
             input: vec![UserInput::text(prompt.text)],
             model: prompt.model,
             effort: prompt.effort,
-            approval_policy: None,
+            approval_policy: Some(permissions.approval_policy()),
+            sandbox_policy: Some(permissions.sandbox_policy()),
         });
         cx.spawn(async move |this, cx| {
             let result = request.await;
@@ -712,7 +716,7 @@ impl AgentController {
         match self.orchestrator.browser_call(&call.params, self.agent_browser_url.as_deref()) {
             Err(message) => self.respond_tool_call(&call, DynamicToolCallResponse::text(message, false)),
             Ok((action, ToolDecision::Allow)) => {
-                cx.emit(AgentControllerEvent::RunBrowserAction { call, action });
+                cx.emit(AgentControllerEvent::RunBrowserAction { call: Box::new(call), action });
             }
             Ok((_, ToolDecision::Deny(reason))) => {
                 self.respond_tool_call(&call, DynamicToolCallResponse::text(reason, false));
@@ -732,7 +736,7 @@ impl AgentController {
         let pending = self.pending_tools.remove(index);
         if approved {
             cx.emit(AgentControllerEvent::RunBrowserAction {
-                call: pending.call,
+                call: Box::new(pending.call),
                 action: pending.action,
             });
         } else {

@@ -15,7 +15,9 @@ cargo test --quiet \
   -p xtask
 
 echo "==> UI and app (host)"
-cargo check --quiet -p cockpit-ui -p cockpit --all-targets
+# Linking GPUI's tests on Linux needs the X11/Wayland development libraries.
+cargo test --quiet -p cockpit-ui --lib
+cargo check --quiet -p cockpit --all-targets
 
 echo "==> Chromium backend (macOS, type-check only)"
 rustup target add aarch64-apple-darwin >/dev/null 2>&1 || true
