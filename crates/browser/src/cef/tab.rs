@@ -6,7 +6,7 @@ use cef::*;
 use cockpit_common::BrowserTabId;
 
 use super::{
-    handlers::{CockpitClient, TextVisitor},
+    handlers::{HangarClient, TextVisitor},
     pump,
     shared::TabShared,
 };
@@ -37,7 +37,7 @@ impl CefTab {
             background_color: 0xFF_FF_FF_FF,
             ..Default::default()
         };
-        let mut client = CockpitClient::build(shared.clone());
+        let mut client = HangarClient::build(shared.clone());
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
             Some(&mut client),

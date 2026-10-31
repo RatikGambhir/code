@@ -1,5 +1,5 @@
 [alias]
-# `cargo xtask bundle --open` builds Cockpit.app (see xtask/src/main.rs).
+# `cargo xtask bundle --open` builds Hangar.app (see xtask/src/main.rs).
 xtask = "run --quiet --package xtask --"
 
 [env]

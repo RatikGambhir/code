@@ -1,4 +1,4 @@
-//! Pieces every Cockpit subsystem shares: identifiers, on-disk locations and
+//! Pieces every Hangar subsystem shares: identifiers, on-disk locations and
 //! the process environment a GUI app has to reconstruct on macOS.
 
 pub mod ids;
@@ -9,10 +9,10 @@ pub use ids::*;
 pub use paths::AppPaths;
 
 /// Product name, used for the window title, bundle and data directory.
-pub const APP_NAME: &str = "Cockpit";
+pub const APP_NAME: &str = "Hangar";
 
 /// Reverse-DNS identifier used for the macOS bundle and Keychain items.
-pub const APP_IDENTIFIER: &str = "dev.cockpit.ide";
+pub const APP_IDENTIFIER: &str = "dev.hangar.ide";
 
 /// Version reported to Codex and shown in the UI.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");

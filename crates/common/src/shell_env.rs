@@ -14,7 +14,7 @@ use std::{
 
 /// Marker that brackets the value in the shell's output, so anything rc files
 /// print (banners, `nvm` chatter) is ignored.
-const MARKER: &str = "__COCKPIT_PATH__";
+const MARKER: &str = "__HANGAR_PATH__";
 
 /// Runs the user's login shell and returns the `PATH` it reports, if any.
 pub fn login_shell_path() -> Option<String> {
@@ -68,7 +68,7 @@ pub fn merge_paths(shell_path: &str, current: &str) -> String {
 /// Adopts the login shell's `PATH` for this process. Call it at the very top
 /// of `main`, before any thread is spawned (`set_var` is not thread safe).
 pub fn adopt_login_shell_path() {
-    if std::env::var_os("COCKPIT_SKIP_SHELL_ENV").is_some() {
+    if std::env::var_os("HANGAR_SKIP_SHELL_ENV").is_some() {
         return;
     }
     let Some(shell_path) = login_shell_path() else {

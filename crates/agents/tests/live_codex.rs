@@ -1,12 +1,12 @@
 //! End-to-end checks against a real `codex app-server`.
 //!
-//! Skipped unless `COCKPIT_CODEX_BIN` points at a `codex` executable:
+//! Skipped unless `HANGAR_CODEX_BIN` points at a `codex` executable:
 //!
 //! ```sh
-//! COCKPIT_CODEX_BIN=$(which codex) cargo test -p cockpit-agents --test live_codex
+//! HANGAR_CODEX_BIN=$(which codex) cargo test -p cockpit-agents --test live_codex
 //! ```
 //!
-//! Set `COCKPIT_CODEX_LIVE_TURN=1` as well to send a real prompt (this uses
+//! Set `HANGAR_CODEX_LIVE_TURN=1` as well to send a real prompt (this uses
 //! the account Codex is logged into).
 
 use std::time::Duration;
@@ -17,7 +17,7 @@ use cockpit_agents::{
 };
 
 fn launch() -> Option<CodexLaunch> {
-    let bin = std::env::var_os("COCKPIT_CODEX_BIN")?;
+    let bin = std::env::var_os("HANGAR_CODEX_BIN")?;
     let mut launch = CodexLaunch::new(bin);
     if let Some(home) = std::env::var_os("CODEX_HOME") {
         launch.env.push(("CODEX_HOME".into(), home.to_string_lossy().into_owned()));
@@ -28,7 +28,7 @@ fn launch() -> Option<CodexLaunch> {
 #[test]
 fn handshake_models_and_thread_against_a_real_server() {
     let Some(launch) = launch() else {
-        eprintln!("COCKPIT_CODEX_BIN not set; skipping");
+        eprintln!("HANGAR_CODEX_BIN not set; skipping");
         return;
     };
     let runtime = AgentRuntime::new().unwrap();
@@ -62,7 +62,7 @@ fn handshake_models_and_thread_against_a_real_server() {
     .expect("thread/start with dynamic tools");
     assert!(!thread.thread.id.is_empty());
 
-    if std::env::var_os("COCKPIT_CODEX_LIVE_TURN").is_none() {
+    if std::env::var_os("HANGAR_CODEX_LIVE_TURN").is_none() {
         connection.backend.shutdown();
         return;
     }

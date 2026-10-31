@@ -144,7 +144,7 @@ impl Render for Welcome {
                             .text_size(TEXT_SMALL)
                             .text_color(t.frame_muted)
                             .child(SharedString::from(format!(
-                                "Version {} · drop a folder on the Dock icon, or run `open -a Cockpit <folder>`",
+                                "Version {} · drop a folder on the Dock icon, or run `open -a Hangar <folder>`",
                                 cockpit_common::APP_VERSION
                             ))),
                     ),

@@ -1,0 +1,24 @@
+[package]
+name = "cockpit-notebook"
+description = "Code notebooks: call a function from the workspace with arguments you write and see what it returns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+cockpit-debugger.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+cockpit-common.workspace = true
+cockpit-editor.workspace = true
+futures = { workspace = true, features = ["executor"] }
+lsp-types.workspace = true
+tempfile.workspace = true

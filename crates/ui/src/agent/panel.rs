@@ -22,13 +22,14 @@ use gpui_component::{
     spinner::Spinner,
     switch::Switch,
     text::TextView,
-    v_flex, Disableable as _, IconName, Sizable as _, StyledExt as _,
+    v_flex, Disableable as _, IconName, Selectable as _, Sizable as _, StyledExt as _,
 };
 
 use super::{AgentController, ConnectionState};
 use crate::{
     actions,
     assets::icon,
+    chat::diff::{chat_changes, count_changes, DiffSummary},
     chrome::{self, caps_label, key_chip},
     theme::{tokens, Tokens, RADIUS, RADIUS_LG, TEXT_BODY, TEXT_MONO, TEXT_SMALL, TEXT_TITLE},
 };
@@ -37,9 +38,13 @@ use crate::{
 const COLLAPSED_OUTPUT_LINES: usize = 6;
 /// Output kept on screen for an expanded command (the tail).
 const MAX_OUTPUT_CHARS: usize = 20_000;
+/// The reading width of the conversation when it fills the window.
+const CHAT_COLUMN_WIDTH: f32 = 780.;
 
 pub enum AgentPanelEvent {
     OpenFile(PathBuf),
+    /// The diff button in chat mode was pressed.
+    ToggleDiff,
 }
 
 pub struct AgentPanel {
@@ -53,6 +58,12 @@ pub struct AgentPanel {
     seen: (Option<String>, u64),
     /// The provider the composer's placeholder names.
     placeholder_for: Option<Provider>,
+    /// Shown full width in the center (chat mode) rather than docked.
+    full: bool,
+    /// The diff panel beside the chat is open (for the toggle's state).
+    diff_open: bool,
+    /// Changed-file totals of the active thread, keyed by (thread, revision).
+    diff_summary: ((Option<String>, u64), DiffSummary),
     _subscriptions: Vec<Subscription>,
 }
 
@@ -82,12 +93,52 @@ impl AgentPanel {
             expanded: HashSet::new(),
             seen: (None, 0),
             placeholder_for: None,
+            full: false,
+            diff_open: false,
+            diff_summary: ((None, 0), DiffSummary::default()),
             _subscriptions: subscriptions,
         }
     }
 
     pub fn controller(&self) -> &Entity<AgentController> {
         &self.controller
+    }
+
+    /// Switches between the docked panel and the full-width chat, and tells
+    /// the chat whether its diff panel is open.
+    pub fn set_chat_mode(&mut self, full: bool, diff_open: bool, cx: &mut Context<Self>) {
+        if (self.full, self.diff_open) != (full, diff_open) {
+            self.full = full;
+            self.diff_open = diff_open;
+            cx.notify();
+        }
+    }
+
+    /// Totals of what the active thread changed, recomputed only when the
+    /// transcript changes.
+    fn refresh_diff_summary(&mut self, cx: &App) {
+        let controller = self.controller.read(cx);
+        let key = controller
+            .active_thread()
+            .map(|t| (Some(t.id.clone()), t.transcript.revision()))
+            .unwrap_or((None, 0));
+        if key == self.diff_summary.0 {
+            return;
+        }
+        let summary = controller
+            .active_thread()
+            .map(|t| DiffSummary::of(&chat_changes(t.transcript.entries())))
+            .unwrap_or_default();
+        self.diff_summary = (key, summary);
+    }
+
+    /// Centers `el` in a reading-width column when the chat fills the window.
+    fn column<E: Styled>(&self, el: E) -> E {
+        if self.full {
+            el.w_full().max_w(px(CHAT_COLUMN_WIDTH)).mx_auto()
+        } else {
+            el
+        }
     }
 
     /// Puts text in the composer (e.g. "explain this selection") and focuses it.
@@ -181,6 +232,25 @@ impl AgentPanel {
             ConnectionState::NotInstalled | ConnectionState::Failed(_) => ("Offline".into(), t.danger),
         };
 
+        let full = self.full;
+        let summary = self.diff_summary.1;
+        let title_label = div()
+            .flex_shrink()
+            .min_w_0()
+            .pl(px(6.))
+            .truncate()
+            .text_size(TEXT_TITLE)
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .child(title.clone());
+        let diff_button = Button::new("chat-diff-toggle")
+            .icon(icon("file-diff"))
+            .ghost()
+            .small()
+            .selected(self.diff_open)
+            .tooltip(if self.diff_open { "Hide changes (⇧⌘D)" } else { "Show changes (⇧⌘D)" })
+            .when(summary.files > 0, |b| b.label(format!("+{} −{}", summary.added, summary.removed)))
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(AgentPanelEvent::ToggleDiff)));
+
         h_flex()
             .id("agent-header")
             .h(px(40.))
@@ -190,7 +260,8 @@ impl AgentPanel {
             .gap(px(4.))
             .border_b_1()
             .border_color(t.border)
-            .child(
+            .when(full, |el| el.child(title_label))
+            .when(!full, |el| el.child(
                 Button::new("thread-picker")
                     .label(title)
                     .ghost()
@@ -225,7 +296,7 @@ impl AgentPanel {
                         }
                         menu.max_h(px(420.)).scrollable(true)
                     }),
-            )
+            ))
             .child(div().flex_1())
             .child(provider_menu(self.controller.clone(), provider))
             .child(
@@ -239,7 +310,7 @@ impl AgentPanel {
                     .child(chrome::status_dot(label_color))
                     .child(label),
             )
-            .child(
+            .when(!full, |el| el.child(
                 Button::new("new-thread")
                     .icon(icon("plus"))
                     .ghost()
@@ -249,7 +320,8 @@ impl AgentPanel {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.controller.update(cx, |c, cx| c.new_thread(cx));
                     })),
-            )
+            ))
+            .when(full, |el| el.child(diff_button))
     }
 
     // --- connection states ---------------------------------------------------
@@ -296,7 +368,7 @@ impl AgentPanel {
                 .child(
                     div()
                         .text_color(muted)
-                        .child("Install it, then press Retry. Cockpit looks on your login shell's PATH and in the usual install locations, or you can set its path in settings."),
+                        .child("Install it, then press Retry. Hangar looks on your login shell's PATH and in the usual install locations, or you can set its path in settings."),
                 )
                 .child(
                     div()
@@ -341,7 +413,7 @@ impl AgentPanel {
             .child(
                 div()
                     .text_color(muted)
-                    .child("Use your ChatGPT plan or an OpenAI API key. Credentials stay with Codex; Cockpit never stores them."),
+                    .child("Use your ChatGPT plan or an OpenAI API key. Credentials stay with Codex; Hangar never stores them."),
             );
         match waiting {
             Some(LoginResponse::Chatgpt { auth_url, .. }) => {
@@ -397,7 +469,7 @@ impl AgentPanel {
         Some(card.into_any_element())
     }
 
-    /// Claude Code signs in through its own interactive flow, so Cockpit
+    /// Claude Code signs in through its own interactive flow, so Hangar
     /// runs `claude auth login` in a terminal tab and never handles the
     /// credentials.
     fn render_claude_login(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -406,7 +478,7 @@ impl AgentPanel {
         let mut card = notice_card(tokens(cx))
             .child(div().text_size(TEXT_TITLE).font_semibold().child("Sign in to Claude"))
             .child(div().text_color(muted).child(
-                "Use your Claude plan, or an Anthropic Console account billed by API use. Claude Code signs in and keeps the credentials; Cockpit never sees them.",
+                "Use your Claude plan, or an Anthropic Console account billed by API use. Claude Code signs in and keeps the credentials; Hangar never sees them.",
             ));
         if waiting {
             card = card
@@ -493,7 +565,8 @@ impl AgentPanel {
         let entries: Vec<Entry> = thread.transcript.entries().iter().map(displayed_part).collect();
         let cwd = controller.cwd().to_path_buf();
 
-        let mut list = v_flex().px(px(14.)).py(px(14.)).gap(px(12.)).text_size(TEXT_BODY);
+        let mut list = self.column(v_flex().px(px(14.)).py(px(14.)).gap(px(12.)).text_size(TEXT_BODY))
+            .when(self.full, |el| el.px(px(24.)).py(px(24.)).gap(px(16.)));
         if loading {
             list = list.child(
                 h_flex()
@@ -563,7 +636,7 @@ impl AgentPanel {
                     .text_color(t.fg)
                     .child(format!("Ask {} about this workspace", self.controller.read(cx).agent_name())),
             )
-            .child(div().max_w(px(300.)).child(match self.controller.read(cx).provider() {
+            .child(div().max_w(px(if self.full { 420. } else { 300. })).child(match self.controller.read(cx).provider() {
                 Provider::OpenAi => {
                     "It reads and edits files, runs commands in its sandbox and, with Browser on, looks at pages in the built-in browser."
                 }
@@ -749,7 +822,7 @@ impl AgentPanel {
         let key = format!("{entry_id}/{ix}");
         let expanded = self.expanded.contains(&key);
         let path = cwd.join(&file.path);
-        let (added, removed) = diff_stats(&file.diff);
+        let (added, removed) = count_changes(&file.diff);
         let toggle_key = key.clone();
         let has_diff = !file.diff.is_empty();
         activity_card(&t)
@@ -897,7 +970,8 @@ impl AgentPanel {
         if pending.is_empty() && plan.is_empty() {
             return None;
         }
-        let mut column = v_flex().px(px(14.)).pt(px(12.)).pb(px(4.)).gap(px(10.)).border_t_1().border_color(t.border);
+        let mut column = v_flex().px(px(14.)).pt(px(12.)).pb(px(4.)).gap(px(10.));
+        column = if self.full { self.column(column) } else { column.border_t_1().border_color(t.border) };
         if !plan.is_empty() {
             let mut steps = v_flex().gap(px(7.)).child(caps_label("Plan", cx));
             for (step, status) in plan {
@@ -1089,12 +1163,13 @@ impl AgentPanel {
                 .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
         };
 
-        v_flex()
+        self.column(v_flex())
             .flex_none()
             .px(px(12.))
             .pt(px(8.))
             .pb(px(10.))
             .gap(px(6.))
+            .when(self.full, |el| el.px(px(20.)).pb(px(16.)))
             .child(
                 v_flex()
                     .rounded(RADIUS_LG)
@@ -1170,8 +1245,15 @@ impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_output(cx);
         self.sync_placeholder(window, cx);
-        let connection = self.render_connection(cx);
-        let login = if connection.is_none() { self.render_login(cx) } else { None };
+        if self.full {
+            self.refresh_diff_summary(cx);
+        }
+        let connection = self.render_connection(cx).map(|el| self.column(div()).child(el).into_any_element());
+        let login = if connection.is_none() {
+            self.render_login(cx).map(|el| self.column(div()).child(el).into_any_element())
+        } else {
+            None
+        };
         let body = if connection.is_some() || login.is_some() {
             None
         } else {
@@ -1315,22 +1397,6 @@ fn render_diff(diff: &str, cx: &App) -> AnyElement {
     lines.into_any_element()
 }
 
-fn diff_stats(diff: &str) -> (usize, usize) {
-    let mut added = 0;
-    let mut removed = 0;
-    for line in diff.lines() {
-        if line.starts_with("+++") || line.starts_with("---") {
-            continue;
-        }
-        if line.starts_with('+') {
-            added += 1;
-        } else if line.starts_with('-') {
-            removed += 1;
-        }
-    }
-    (added, removed)
-}
-
 /// An entry with long command output and diffs cut to what is displayed.
 fn displayed_part(entry: &Entry) -> Entry {
     let kind = match &entry.kind {
@@ -1419,12 +1485,6 @@ fn format_tokens(tokens: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn diff_stats_skip_headers() {
-        let diff = "--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n+more\n same\n";
-        assert_eq!(diff_stats(diff), (2, 1));
-    }
 
     #[test]
     fn tail_respects_char_boundaries() {

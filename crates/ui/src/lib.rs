@@ -1,14 +1,17 @@
-//! Cockpit's user interface, built with GPUI and gpui-component.
+//! Hangar's user interface, built with GPUI and gpui-component.
 
 pub mod actions;
 pub mod agent;
 mod appearance;
 mod assets;
 pub mod browser_view;
+pub mod chat;
 mod chrome;
+pub mod debug;
 pub mod editor_view;
 pub mod explorer;
 pub mod lsp;
+pub mod notebook;
 pub mod palette;
 pub mod pane;
 pub mod search_panel;
@@ -56,11 +59,11 @@ fn menus() -> Vec<Menu> {
         Menu {
             name: cockpit_common::APP_NAME.into(),
             items: vec![
-                MenuItem::action("About Cockpit", actions::About),
+                MenuItem::action("About Hangar", actions::About),
                 MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
-                MenuItem::action("Quit Cockpit", actions::Quit),
+                MenuItem::action("Quit Hangar", actions::Quit),
             ],
         },
         Menu {
@@ -98,14 +101,39 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Explorer", actions::ShowExplorer),
                 MenuItem::action("Source Control", actions::ShowSourceControl),
                 MenuItem::action("Search", actions::ShowSearch),
+                MenuItem::action("Chat", actions::ShowChat),
                 MenuItem::separator(),
                 MenuItem::action("Toggle Sidebar", actions::ToggleSidebar),
                 MenuItem::action("Toggle Terminal", actions::ToggleTerminal),
                 MenuItem::action("Toggle Codex", actions::ToggleAgentPanel),
+                MenuItem::action("Toggle Chat Changes", actions::ToggleDiffPanel),
                 MenuItem::action("Split Editor", actions::SplitPane),
                 MenuItem::separator(),
                 MenuItem::action("Customize Theme…", actions::CustomizeTheme),
                 MenuItem::action("Toggle Light/Dark", actions::ToggleTheme),
+            ],
+        },
+        Menu {
+            name: "Run".into(),
+            items: vec![
+                MenuItem::action("Run", actions::RunSelected),
+                MenuItem::action("Debug", actions::DebugSelected),
+                MenuItem::action("Run at Cursor", actions::RunAtCursor),
+                MenuItem::action("Debug at Cursor", actions::DebugAtCursor),
+                MenuItem::action("Stop", actions::StopRun),
+                MenuItem::action("Rerun Debugging", actions::RestartDebugging),
+                MenuItem::separator(),
+                MenuItem::action("Resume", actions::Resume),
+                MenuItem::action("Pause", actions::Pause),
+                MenuItem::action("Step Over", actions::StepOver),
+                MenuItem::action("Step Into", actions::StepInto),
+                MenuItem::action("Step Out", actions::StepOut),
+                MenuItem::action("Run to Cursor", actions::RunToCursor),
+                MenuItem::action("Evaluate Expression…", actions::EvaluateExpression),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Breakpoint", actions::ToggleBreakpoint),
+                MenuItem::action("View Breakpoints", actions::ViewBreakpoints),
+                MenuItem::action("Show Debug Panel", actions::ShowDebugPanel),
             ],
         },
         Menu {

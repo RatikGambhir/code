@@ -3,20 +3,22 @@
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc};
 
 use anyhow::Result;
+use cockpit_debugger::Runnable;
 use cockpit_editor::{lsp::LspClient, Document};
 use gpui::{
     div, prelude::*, px, App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton,
-    MouseDownEvent, MouseMoveEvent, SharedString, Subscription, Window,
+    MouseDownEvent, MouseMoveEvent, SharedString, Subscription, WeakEntity, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{self, Input, InputEvent, InputState, Position, RopeExt as _},
+    input::{self, EditorDecorations, GutterEvent, HoverProvider, Input, InputEvent, InputState, Position, Rope, RopeExt as _},
     v_flex, ActiveTheme as _, Sizable as _,
 };
 
 use crate::{
     actions::{self, CODE_EDITOR_CONTEXT},
+    debug::{editor::DebugHover, Debugger},
     lsp::{self, LspDocument, LspManager, Target},
 };
 
@@ -40,6 +42,10 @@ pub enum EditorEvent {
     },
     /// Something to tell the user ("No definition found").
     Notify(String),
+    /// A press in the gutter (breakpoints, run icons).
+    Gutter(GutterEvent),
+    /// The text changed; `old` is the text before.
+    Edited { old: Rope },
 }
 
 pub struct EditorView {
@@ -52,6 +58,12 @@ pub struct EditorView {
     lsp: Option<Rc<LspDocument>>,
     /// The file's diagnostics, shared with the code action provider.
     diagnostics: Rc<RefCell<Vec<lsp_types::Diagnostic>>>,
+    /// The text as of the last `Edited`, to tell what an edit changed.
+    last_text: Rope,
+    /// Lines with a run icon, and what they run.
+    runnables: Vec<Runnable>,
+    /// Hover shows values from this debugger while it is paused.
+    debugger: Option<WeakEntity<Debugger>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -105,6 +117,7 @@ impl EditorView {
     fn with_document(document: Document, read_only: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let language = document.language();
         let text = document.saved_text().to_string();
+        let text_for_last = text.clone();
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor(language)
@@ -113,7 +126,7 @@ impl EditorView {
                 .soft_wrap(false)
                 .default_value(text)
         });
-        let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _window, cx| {
+        let subscription = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, _window, cx| {
             if let InputEvent::Change = event {
                 if !this.read_only {
                     if !this.dirty {
@@ -121,7 +134,23 @@ impl EditorView {
                         cx.emit(EditorEvent::Changed);
                     }
                     this.sync_lsp(cx);
+                    let new = input.read(cx).text().clone();
+                    let old = std::mem::replace(&mut this.last_text, new);
+                    cx.emit(EditorEvent::Edited { old });
                 }
+            }
+        });
+        if !read_only {
+            if let Some(language) = cockpit_notebook::language_for(document.path()) {
+                let label = SharedString::from(format!("Open {} Notebook", language.name()));
+                input.update(cx, |input, _| {
+                    input.set_context_menu_extras(vec![(label, Box::new(actions::OpenNotebook))]);
+                });
+            }
+        }
+        let gutter = cx.subscribe(&input, |this, _, event: &GutterEvent, cx| {
+            if !this.read_only {
+                cx.emit(EditorEvent::Gutter(event.clone()));
             }
         });
         Self {
@@ -132,7 +161,10 @@ impl EditorView {
             read_only,
             lsp: None,
             diagnostics: Rc::default(),
-            _subscriptions: vec![subscription],
+            last_text: Rope::from(text_for_last.as_str()),
+            runnables: Vec::new(),
+            debugger: None,
+            _subscriptions: vec![subscription, gutter],
         }
     }
 
@@ -254,12 +286,46 @@ impl EditorView {
         };
         self.input.update(cx, |input, _| lsp::install_providers(&doc, input));
         self.lsp = Some(doc);
+        self.install_debug_hover(cx);
     }
 
     /// Disconnects from the language server (it is restarting).
     pub fn detach_lsp(&mut self, cx: &mut Context<Self>) {
         self.detach();
         self.input.update(cx, |input, _| lsp::remove_providers(input));
+        self.install_debug_hover(cx);
+    }
+
+    // --- debugger ----------------------------------------------------------
+
+    /// Shows values from `debugger` on hover while it is paused.
+    pub fn set_debugger(&mut self, debugger: WeakEntity<Debugger>, cx: &mut Context<Self>) {
+        self.debugger = Some(debugger);
+        self.install_debug_hover(cx);
+    }
+
+    /// Wraps the current hover provider (the language server's, if any) in
+    /// one that shows debugger values first.
+    fn install_debug_hover(&mut self, cx: &mut Context<Self>) {
+        let Some(debugger) = self.debugger.clone() else { return };
+        self.input.update(cx, |input, _| {
+            let inner = input.lsp.hover_provider.take();
+            input.lsp.hover_provider = Some(Rc::new(DebugHover { debugger, inner }) as Rc<dyn HoverProvider>);
+        });
+    }
+
+    pub fn set_decorations(&mut self, decorations: EditorDecorations, runnables: Vec<Runnable>, cx: &mut Context<Self>) {
+        self.runnables = runnables;
+        self.input.update(cx, |input, cx| input.set_decorations(decorations, cx));
+    }
+
+    pub fn runnables(&self) -> &[Runnable] {
+        &self.runnables
+    }
+
+    /// The buffer's text (cheap: ropes share structure).
+    pub fn rope(&self, cx: &App) -> Rope {
+        self.input.read(cx).text().clone()
     }
 
     fn sync_lsp(&mut self, cx: &mut Context<Self>) {

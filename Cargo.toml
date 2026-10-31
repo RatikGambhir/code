@@ -8,12 +8,16 @@ members = [
     "crates/editor",
     "crates/agents",
     "crates/orchestrator",
+    "crates/debugger",
+    "crates/notebook",
     "crates/browser",
     "crates/ui",
     "crates/app",
     "xtask",
 ]
 default-members = ["crates/app"]
+# Vendored crates are patched dependencies, not members.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -29,6 +33,8 @@ cockpit-terminal = { path = "crates/terminal" }
 cockpit-editor = { path = "crates/editor" }
 cockpit-agents = { path = "crates/agents" }
 cockpit-orchestrator = { path = "crates/orchestrator" }
+cockpit-debugger = { path = "crates/debugger" }
+cockpit-notebook = { path = "crates/notebook" }
 cockpit-browser = { path = "crates/browser" }
 cockpit-ui = { path = "crates/ui" }
 
@@ -62,6 +68,8 @@ serde_json = "1"
 smallvec = "1"
 tempfile = "3"
 thiserror = "2"
+# Matches the toml already in Cargo.lock (via cargo tooling deps).
+toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -79,3 +87,9 @@ opt-level = 2
 [profile.release]
 lto = "thin"
 codegen-units = 16
+
+# gpui-component with a small patch for code editor gutter and line decorations
+# (breakpoints, run icons, the paused line, inline values). See
+# vendor/gpui-component/COCKPIT_PATCHES.md.
+[patch.crates-io]
+gpui-component = { path = "vendor/gpui-component" }

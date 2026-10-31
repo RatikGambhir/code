@@ -1,20 +1,20 @@
 [package]
-name = "cockpit"
-description = "Cockpit: a native IDE with an embedded Chromium browser and the Codex agent"
+name = "hangar"
+description = "Hangar: a native IDE with an embedded Chromium browser and the Codex agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-default-run = "cockpit"
+default-run = "hangar"
 
 [[bin]]
-name = "cockpit"
+name = "hangar"
 path = "src/main.rs"
 
 # Chromium's renderer/GPU/utility processes. `cargo xtask bundle` copies it
-# into the `Cockpit Helper*.app` bundles.
+# into the `Hangar Helper*.app` bundles.
 [[bin]]
-name = "cockpit-helper"
+name = "hangar-helper"
 path = "src/bin/helper.rs"
 
 [features]

@@ -16,6 +16,7 @@ use crate::{
     browser_view::{BrowserEvent, BrowserView},
     chrome::{self, key_chip},
     editor_view::{EditorEvent, EditorView},
+    notebook::{NotebookEvent, NotebookView},
     theme::{tokens, TEXT_BODY, TEXT_MONO},
 };
 
@@ -23,6 +24,7 @@ use crate::{
 pub enum PaneItem {
     Editor(Entity<EditorView>),
     Browser(Entity<BrowserView>),
+    Notebook(Entity<NotebookView>),
 }
 
 impl PaneItem {
@@ -30,6 +32,7 @@ impl PaneItem {
         match self {
             PaneItem::Editor(editor) => editor.entity_id(),
             PaneItem::Browser(browser) => browser.entity_id(),
+            PaneItem::Notebook(notebook) => notebook.entity_id(),
         }
     }
 
@@ -37,13 +40,14 @@ impl PaneItem {
         match self {
             PaneItem::Editor(editor) => editor.read(cx).title(),
             PaneItem::Browser(browser) => browser.read(cx).title(),
+            PaneItem::Notebook(notebook) => notebook.read(cx).title(),
         }
     }
 
     pub fn is_dirty(&self, cx: &App) -> bool {
         match self {
             PaneItem::Editor(editor) => editor.read(cx).is_dirty(),
-            PaneItem::Browser(_) => false,
+            PaneItem::Browser(_) | PaneItem::Notebook(_) => false,
         }
     }
 
@@ -51,6 +55,7 @@ impl PaneItem {
         match self {
             PaneItem::Editor(editor) => editor.read(cx).path().to_string_lossy().into_owned().into(),
             PaneItem::Browser(browser) => browser.read(cx).url().to_string().into(),
+            PaneItem::Notebook(notebook) => format!("Notebook for {}", notebook.read(cx).subject()).into(),
         }
     }
 
@@ -60,6 +65,7 @@ impl PaneItem {
             PaneItem::Editor(editor) if editor.read(cx).is_read_only() => Some(icon("git-compare")),
             PaneItem::Editor(_) => None,
             PaneItem::Browser(_) => Some(Icon::new(IconName::Globe)),
+            PaneItem::Notebook(_) => Some(icon("notebook-pen")),
         }
     }
 
@@ -67,6 +73,7 @@ impl PaneItem {
         match self {
             PaneItem::Editor(editor) => editor.clone().into(),
             PaneItem::Browser(browser) => browser.clone().into(),
+            PaneItem::Notebook(notebook) => notebook.clone().into(),
         }
     }
 
@@ -74,6 +81,7 @@ impl PaneItem {
         match self {
             PaneItem::Editor(editor) => editor.update(cx, |editor, cx| editor.focus(window, cx)),
             PaneItem::Browser(browser) => window.focus(&browser.focus_handle(cx)),
+            PaneItem::Notebook(notebook) => notebook.update(cx, |notebook, cx| notebook.focus(window, cx)),
         }
     }
 }
@@ -102,6 +110,7 @@ impl Focusable for Pane {
         match self.active_item() {
             Some(PaneItem::Editor(editor)) => editor.focus_handle(cx),
             Some(PaneItem::Browser(browser)) => browser.focus_handle(cx),
+            Some(PaneItem::Notebook(notebook)) => notebook.focus_handle(cx),
             None => self.focus_handle.clone(),
         }
     }
@@ -132,28 +141,28 @@ impl Pane {
     pub fn active_editor(&self) -> Option<&Entity<EditorView>> {
         match self.active_item()? {
             PaneItem::Editor(editor) => Some(editor),
-            PaneItem::Browser(_) => None,
+            PaneItem::Browser(_) | PaneItem::Notebook(_) => None,
         }
     }
 
     pub fn active_browser(&self) -> Option<&Entity<BrowserView>> {
         match self.active_item()? {
             PaneItem::Browser(browser) => Some(browser),
-            PaneItem::Editor(_) => None,
+            PaneItem::Editor(_) | PaneItem::Notebook(_) => None,
         }
     }
 
     pub fn editors(&self) -> impl Iterator<Item = &Entity<EditorView>> {
         self.items.iter().filter_map(|item| match item {
             PaneItem::Editor(editor) => Some(editor),
-            PaneItem::Browser(_) => None,
+            PaneItem::Browser(_) | PaneItem::Notebook(_) => None,
         })
     }
 
     pub fn browsers(&self) -> impl Iterator<Item = &Entity<BrowserView>> {
         self.items.iter().filter_map(|item| match item {
             PaneItem::Browser(browser) => Some(browser),
-            PaneItem::Editor(_) => None,
+            PaneItem::Editor(_) | PaneItem::Notebook(_) => None,
         })
     }
 
@@ -164,7 +173,7 @@ impl Pane {
                 let editor = editor.read(cx);
                 !editor.is_read_only() && editor.path() == path
             }
-            PaneItem::Browser(_) => false,
+            PaneItem::Browser(_) | PaneItem::Notebook(_) => false,
         })
     }
 
@@ -177,10 +186,18 @@ impl Pane {
         let subscription = match &item {
             PaneItem::Editor(editor) => cx.subscribe(editor, |_, _, event: &EditorEvent, cx| match event {
                 EditorEvent::Changed | EditorEvent::Saved(_) => cx.notify(),
-                EditorEvent::Locations { .. } | EditorEvent::Notify(_) => {}
+                EditorEvent::Locations { .. }
+                | EditorEvent::Notify(_)
+                | EditorEvent::Gutter(_)
+                | EditorEvent::Edited { .. } => {}
             }),
             PaneItem::Browser(browser) => cx.subscribe(browser, |_, _, event: &BrowserEvent, cx| {
                 if matches!(event, BrowserEvent::Changed | BrowserEvent::Navigated { .. }) {
+                    cx.notify();
+                }
+            }),
+            PaneItem::Notebook(notebook) => cx.subscribe(notebook, |_, _, event: &NotebookEvent, cx| {
+                if matches!(event, NotebookEvent::Changed) {
                     cx.notify();
                 }
             }),

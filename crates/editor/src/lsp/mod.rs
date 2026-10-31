@@ -224,7 +224,7 @@ impl LspClient {
             capabilities: client_capabilities(),
             initialization_options: self.settings.get().cloned(),
             client_info: Some(lsp_types::ClientInfo {
-                name: "Cockpit".into(),
+                name: "Hangar".into(),
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             }),
             ..Default::default()
@@ -396,12 +396,20 @@ impl LspClient {
     }
 }
 
-impl Drop for LspClient {
-    fn drop(&mut self) {
+impl LspClient {
+    /// Stops the server process now, without the shutdown handshake (its
+    /// owner is going away and needs it gone first).
+    pub fn kill(&self) {
         if let Some(mut child) = self.child.lock().take() {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 

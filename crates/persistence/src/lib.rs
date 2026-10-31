@@ -1,4 +1,4 @@
-//! Cockpit's application database.
+//! Hangar's application database.
 //!
 //! [`Database`] owns one SQLite connection in WAL mode. All access goes
 //! through two entry points:

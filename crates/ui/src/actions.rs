@@ -19,6 +19,8 @@ actions!(
         ShowExplorer,
         ShowSourceControl,
         ShowSearch,
+        ShowChat,
+        ToggleDiffPanel,
         CommandPalette,
         QuickOpen,
         FocusAgent,
@@ -59,6 +61,30 @@ actions!(
 actions!(editor, [GoToDefinition, FindReferences]);
 
 actions!(
+    debug,
+    [
+        RunSelected,
+        DebugSelected,
+        RunAtCursor,
+        DebugAtCursor,
+        StopRun,
+        RestartDebugging,
+        Resume,
+        Pause,
+        StepOver,
+        StepInto,
+        StepOut,
+        RunToCursor,
+        ToggleBreakpoint,
+        ViewBreakpoints,
+        EvaluateExpression,
+        ShowDebugPanel,
+    ]
+);
+
+actions!(notebook, [OpenNotebook, RunCell, AddCell, FormatCell]);
+
+actions!(
     terminal,
     [TerminalPaste, TerminalClear, TerminalCopyScreen, TerminalTab, TerminalBackTab]
 );
@@ -69,6 +95,10 @@ pub const BROWSER_CONTEXT: &str = "BrowserView";
 pub const TERMINAL_CONTEXT: &str = "Terminal";
 /// Key context of a code editor tab.
 pub const CODE_EDITOR_CONTEXT: &str = "CodeEditor";
+/// Key context of a notebook cell.
+pub const NOTEBOOK_CELL_CONTEXT: &str = "NotebookCell";
+/// Key context of the debug panel.
+pub const DEBUG_PANEL_CONTEXT: &str = "DebugPanel";
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys(key_bindings());
@@ -90,6 +120,8 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-e", ShowExplorer, None),
         KeyBinding::new("cmd-shift-g", ShowSourceControl, None),
         KeyBinding::new("cmd-shift-f", ShowSearch, None),
+        KeyBinding::new("cmd-shift-a", ShowChat, None),
+        KeyBinding::new("cmd-shift-d", ToggleDiffPanel, None),
         KeyBinding::new("cmd-shift-p", CommandPalette, None),
         KeyBinding::new("cmd-p", QuickOpen, None),
         KeyBinding::new("cmd-l", FocusAgent, None),
@@ -101,6 +133,31 @@ fn key_bindings() -> Vec<KeyBinding> {
         // Code editor (⌘-click and ⌘. come from the editor itself)
         KeyBinding::new("f12", GoToDefinition, Some(CODE_EDITOR_CONTEXT)),
         KeyBinding::new("shift-f12", FindReferences, Some(CODE_EDITOR_CONTEXT)),
+        // Run and debug, with RustRover's macOS keys. ⌃R and ⌃D mean
+        // something to shells and text fields, so they apply in the editor
+        // and the debug panel only.
+        KeyBinding::new("ctrl-r", RunSelected, Some(CODE_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-d", DebugSelected, Some(CODE_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-shift-r", RunAtCursor, Some(CODE_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-shift-d", DebugAtCursor, Some(CODE_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-r", RunSelected, Some(DEBUG_PANEL_CONTEXT)),
+        KeyBinding::new("ctrl-d", DebugSelected, Some(DEBUG_PANEL_CONTEXT)),
+        KeyBinding::new("cmd-f2", StopRun, None),
+        KeyBinding::new("cmd-f5", RestartDebugging, None),
+        KeyBinding::new("cmd-alt-r", Resume, None),
+        KeyBinding::new("f9", Resume, None),
+        KeyBinding::new("f8", StepOver, None),
+        KeyBinding::new("f7", StepInto, None),
+        KeyBinding::new("shift-f8", StepOut, None),
+        KeyBinding::new("alt-f9", RunToCursor, None),
+        KeyBinding::new("cmd-f8", ToggleBreakpoint, None),
+        KeyBinding::new("cmd-shift-f8", ViewBreakpoints, None),
+        KeyBinding::new("alt-f8", EvaluateExpression, None),
+        KeyBinding::new("cmd-5", ShowDebugPanel, None),
+        // Notebooks. The cell's editor has its own ⌘↵, so bind inside it.
+        KeyBinding::new("cmd-enter", RunCell, Some("NotebookCell > Input")),
+        KeyBinding::new("cmd-shift-enter", AddCell, Some("NotebookCell > Input")),
+        KeyBinding::new("alt-shift-f", FormatCell, Some("NotebookCell > Input")),
         // The agent composer sends on Enter, so Shift-Enter is its newline.
         KeyBinding::new(
             "shift-enter",

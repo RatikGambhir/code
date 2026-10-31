@@ -67,10 +67,10 @@ impl CodexLaunch {
         }
     }
 
-    /// Locates `codex`: `$COCKPIT_CODEX_BIN`, then `PATH`, then the usual
+    /// Locates `codex`: `$HANGAR_CODEX_BIN`, then `PATH`, then the usual
     /// install locations.
     pub fn discover() -> Option<Self> {
-        if let Some(path) = std::env::var_os("COCKPIT_CODEX_BIN") {
+        if let Some(path) = std::env::var_os("HANGAR_CODEX_BIN") {
             return Some(Self::new(path));
         }
         let mut dirs = cockpit_common::shell_env::common_tool_dirs();
@@ -282,7 +282,7 @@ impl CodexClient {
                 "initialize",
                 InitializeParams {
                     client_info: ClientInfo {
-                        name: "cockpit".into(),
+                        name: "hangar".into(),
                         title: Some(cockpit_common::APP_NAME.into()),
                         version: cockpit_common::APP_VERSION.into(),
                     },

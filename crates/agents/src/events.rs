@@ -413,7 +413,7 @@ impl AgentEvent {
         })
     }
 
-    /// Interprets a request the server makes of the client. Requests Cockpit
+    /// Interprets a request the server makes of the client. Requests Hangar
     /// cannot service come back as `Err`, carrying the error to reply with.
     pub fn from_request(id: RequestId, method: &str, params: Value) -> Result<Self, RpcError> {
         let invalid = |err: serde_json::Error| RpcError {

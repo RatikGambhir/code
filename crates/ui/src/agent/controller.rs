@@ -40,6 +40,8 @@ pub struct ThreadSession {
     pub title: SharedString,
     pub model: Option<String>,
     pub transcript: Transcript,
+    /// Last activity, in seconds since the epoch, for ordering and labels.
+    pub updated_at: i64,
     /// The transcript reflects the server's history (started here or resumed).
     pub loaded: bool,
     pub loading: bool,
@@ -174,6 +176,7 @@ impl AgentController {
                                 id: record.thread_id,
                                 model: record.model,
                                 transcript: Transcript::new(),
+                                updated_at: record.updated_at,
                                 loaded: false,
                                 loading: false,
                             });
@@ -613,6 +616,7 @@ impl AgentController {
                             title: "New thread".into(),
                             model: Some(response.model.clone()),
                             transcript: Transcript::new(),
+                            updated_at: now_ts(),
                             loaded: true,
                             loading: false,
                         },
@@ -652,6 +656,14 @@ impl AgentController {
             })
         })
         .detach();
+    }
+
+    /// Clears the active thread so the next prompt starts a new one. Unlike
+    /// [`Self::new_thread`], nothing is created until the user sends.
+    pub fn start_draft(&mut self, cx: &mut Context<Self>) {
+        self.active = None;
+        self.first_prompt = None;
+        cx.notify();
     }
 
     pub fn select_thread(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -741,6 +753,12 @@ impl AgentController {
             return;
         }
 
+        // Most recent first, as the chat history lists them.
+        if let Some(ix) = self.threads.iter().position(|t| t.id == thread_id) {
+            let mut thread = self.threads.remove(ix);
+            thread.updated_at = now_ts();
+            self.threads.insert(0, thread);
+        }
         if let Some(thread) = self.thread_mut(&thread_id) {
             if thread.title.as_ref() == "New thread" || thread.title.as_ref() == "Untitled thread" {
                 thread.title = cockpit_common::truncate_chars(text.lines().next().unwrap_or(""), 60).into();

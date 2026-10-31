@@ -1,13 +1,13 @@
 //! Claude integration: Claude Code driven as a headless agent.
 //!
-//! Cockpit runs the Claude Code CLI the way the Claude Agent SDK does:
+//! Hangar runs the Claude Code CLI the way the Claude Agent SDK does:
 //! `claude -p --input-format stream-json --output-format stream-json`, one
 //! process per thread, prompts written to stdin and messages read from
 //! stdout. Permission prompts arrive as `can_use_tool` control requests
-//! (`--permission-prompt-tool stdio`) and become ordinary Cockpit
-//! approvals; Cockpit's dynamic tools are served to Claude as an in-process
+//! (`--permission-prompt-tool stdio`) and become ordinary Hangar
+//! approvals; Hangar's dynamic tools are served to Claude as an in-process
 //! MCP server. Claude Code owns sign-in (claude.ai, Console, API key or a
-//! cloud provider) and its credentials; Cockpit never sees them.
+//! cloud provider) and its credentials; Hangar never sees them.
 //!
 //! [`mapper`] turns Claude Code's messages into [`AgentEvent`]s, so the
 //! transcript, orchestrator and UI work for Claude exactly as for Codex.
@@ -57,11 +57,11 @@ impl ClaudeLaunch {
         Self { program: program.into(), env: Vec::new() }
     }
 
-    /// Locates `claude`: `$COCKPIT_CLAUDE_BIN`, then `PATH`, then the usual
+    /// Locates `claude`: `$HANGAR_CLAUDE_BIN`, then `PATH`, then the usual
     /// install locations (the native installer's `~/.local/bin`, the older
     /// `~/.claude/local`, Homebrew and npm).
     pub fn discover() -> Option<Self> {
-        if let Some(path) = std::env::var_os("COCKPIT_CLAUDE_BIN") {
+        if let Some(path) = std::env::var_os("HANGAR_CLAUDE_BIN") {
             return Some(Self::new(path));
         }
         let mut dirs = cockpit_common::shell_env::common_tool_dirs();
@@ -76,14 +76,14 @@ impl ClaudeLaunch {
         command
             .current_dir(cwd)
             .envs(self.env.iter().cloned())
-            // Set when Cockpit itself was started from a Claude Code shell.
+            // Set when Hangar itself was started from a Claude Code shell.
             .env_remove("CLAUDECODE")
             .kill_on_drop(true);
         command
     }
 }
 
-/// Claude Code's permission modes, from Cockpit's permission presets.
+/// Claude Code's permission modes, from Hangar's permission presets.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PermissionMode {
     /// Asks before edits and commands.
@@ -169,7 +169,7 @@ pub fn process_args(settings: &SessionSettings, session_id: &str, resume: bool) 
             .map(|s| (s.name.clone(), json!({"type": "sdk", "name": s.name})))
             .collect();
         args.extend(["--mcp-config".into(), json!({"mcpServers": servers}).to_string()]);
-        // Cockpit's tool policy vets these calls; Claude need not ask too.
+        // Hangar's tool policy vets these calls; Claude need not ask too.
         args.push("--allowedTools".into());
         args.extend(settings.mcp_servers.iter().map(|s| format!("mcp__{}", s.name)));
     }
@@ -704,7 +704,7 @@ impl AgentBackend for ClaudeClient {
 
     fn login(&self, _params: LoginParams) -> BoxFuture<'static, Result<LoginResponse>> {
         Box::pin(async {
-            Err(anyhow!("sign in to Claude with `claude auth login`; Cockpit runs it in a terminal"))
+            Err(anyhow!("sign in to Claude with `claude auth login`; Hangar runs it in a terminal"))
         })
     }
 

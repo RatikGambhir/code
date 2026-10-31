@@ -1,4 +1,4 @@
-//! Cockpit: a native IDE (GPUI) with an embedded Chromium browser and the
+//! Hangar: a native IDE (GPUI) with an embedded Chromium browser and the
 //! Codex agent.
 //!
 //! Start-up order matters (see `cockpit_browser::cef`): the login shell's
@@ -20,7 +20,7 @@ const BROWSER_PROFILE: &str = "default";
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("cockpit: {err:#}");
+        eprintln!("hangar: {err:#}");
         std::process::exit(1);
     }
 }
@@ -38,7 +38,7 @@ fn run() -> Result<()> {
     let browser = BrowserRuntime::load(RuntimeOptions {
         profile_dir: Some(profile_dir.clone()),
         log_file: Some(paths.logs_dir().join("chromium.log")),
-        remote_debugging_port: std::env::var("COCKPIT_REMOTE_DEBUGGING_PORT")
+        remote_debugging_port: std::env::var("HANGAR_REMOTE_DEBUGGING_PORT")
             .ok()
             .and_then(|port| port.parse().ok()),
     });
@@ -67,7 +67,7 @@ fn run() -> Result<()> {
         .map(PathBuf::from)
         .collect();
 
-    // Folders dropped on the Dock icon or opened with `open -a Cockpit <dir>`
+    // Folders dropped on the Dock icon or opened with `open -a Hangar <dir>`
     // arrive as file URLs, possibly before the UI is up; queue them.
     let (open_tx, open_rx) = async_channel::unbounded::<PathBuf>();
 
@@ -133,17 +133,17 @@ fn folder_for_url(url: &str) -> Option<PathBuf> {
     }
 }
 
-/// Logs to stderr and `<data dir>/logs/cockpit.log`. `COCKPIT_LOG` takes an
+/// Logs to stderr and `<data dir>/logs/hangar.log`. `HANGAR_LOG` takes an
 /// `EnvFilter` directive (`debug`, `cockpit_agents=trace`, …).
 fn init_logging(paths: &AppPaths) {
-    let filter = EnvFilter::try_from_env("COCKPIT_LOG")
+    let filter = EnvFilter::try_from_env("HANGAR_LOG")
         .unwrap_or_else(|_| EnvFilter::new("info,wgpu=warn,naga=warn,blade_graphics=warn"));
     let file = std::fs::create_dir_all(paths.logs_dir())
         .and_then(|_| {
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(paths.logs_dir().join("cockpit.log"))
+                .open(paths.logs_dir().join("hangar.log"))
         })
         .ok();
     let builder = tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false);

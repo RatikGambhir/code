@@ -19,14 +19,17 @@ use cockpit_editor::watcher::{FsChange, WorkspaceWatcher};
 use cockpit_persistence::{TabKind, TabRecord, WorkspaceRecord};
 use futures::channel::oneshot;
 use cockpit_agents::protocol::PlanStepStatus;
+use cockpit_debugger::{LineBreakpoint, RunConfig};
 use gpui::{
-    deferred, div, prelude::*, px, AnyElement, App, AsyncWindowContext, Context, Entity,
-    FocusHandle, Focusable, FontWeight, Hsla, PathPromptOptions, PromptLevel, SharedString,
-    Subscription, Task, WeakEntity, Window,
+    anchored, deferred, div, point, prelude::*, px, AnyElement, App, AsyncWindowContext, Context, Corner,
+    Entity, FocusHandle, Focusable, FontWeight, Hsla, MouseButton, PathPromptOptions, Pixels, Point,
+    PromptLevel, SharedString, Subscription, Task, WeakEntity, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
+    checkbox::Checkbox,
     h_flex,
+    input::{GutterEvent, Input, InputEvent, InputState},
     notification::Notification,
     resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
     v_flex, ActiveTheme as _, IconName, Root, Sizable as _, TitleBar, WindowExt as _,
@@ -38,18 +41,25 @@ use crate::{
     agent::{AgentController, AgentControllerEvent, AgentPanel, AgentPanelEvent, ConnectionState},
     appearance::{AppearanceEvent, AppearancePanel},
     assets::icon,
+    chat::{ChatHistory, ChatHistoryEvent, DiffPanel, DiffPanelEvent},
     chrome,
     browser_view::{BrowserEvent, BrowserView},
+    debug::{
+        self, editor as debug_editor,
+        panel::{DebugPanel, DebugPanelEvent, PanelTab},
+        Debugger, DebuggerEvent, Phase,
+    },
     editor_view::{EditorEvent, EditorView, LocationKind},
     explorer::{Explorer, ExplorerEvent},
     lsp::{LspEvent, LspManager, Target},
+    notebook::{NotebookEvent, NotebookView},
     palette::{LocationItem, Palette, PaletteEvent},
     pane::{Pane, PaneEvent, PaneItem},
     search_panel::{SearchPanel, SearchPanelEvent},
     source_control::{SourceControl, SourceControlEvent},
     state::{AppState, ThemePreference},
     terminal_view::{TerminalPanel, TerminalPanelEvent},
-    theme::{self, RADIUS_LG, TEXT_BODY, TEXT_CAPTION, TEXT_SMALL},
+    theme::{self, RADIUS, RADIUS_LG, TEXT_BODY, TEXT_CAPTION, TEXT_SMALL},
 };
 
 /// How long a page may take to load before an agent action returns anyway.
@@ -66,6 +76,18 @@ enum SidebarView {
     Explorer,
     SourceControl,
     Search,
+    /// Chat mode: the conversation fills the center and the sidebar lists
+    /// past chats.
+    Chats,
+}
+
+/// What the bottom dock shows.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BottomTool {
+    #[default]
+    Terminal,
+    Debug,
 }
 
 /// What survives a restart, besides tabs.
@@ -74,9 +96,13 @@ enum SidebarView {
 struct Layout {
     sidebar: SidebarView,
     sidebar_visible: bool,
+    /// The bottom dock (terminal or debug panel) is shown.
     terminal_visible: bool,
+    bottom: BottomTool,
     agent_visible: bool,
     split: bool,
+    /// Chat mode's diff panel is out.
+    diff_visible: bool,
 }
 
 impl Default for Layout {
@@ -85,8 +111,10 @@ impl Default for Layout {
             sidebar: SidebarView::Explorer,
             sidebar_visible: true,
             terminal_visible: false,
+            bottom: BottomTool::Terminal,
             agent_visible: true,
             split: false,
+            diff_visible: false,
         }
     }
 }
@@ -107,8 +135,19 @@ pub struct Workspace {
     terminal: Option<Entity<TerminalPanel>>,
     agent: Entity<AgentController>,
     agent_panel: Entity<AgentPanel>,
+    chat_history: Entity<ChatHistory>,
+    diff_panel: Entity<DiffPanel>,
     /// The browser tab Codex drives.
     agent_browser: Option<WeakEntity<BrowserView>>,
+    debugger: Entity<Debugger>,
+    debug_panel: Entity<DebugPanel>,
+    /// A menu or breakpoint editor opened from the gutter.
+    gutter_popup: Option<GutterPopup>,
+    /// The run configuration menu under the title bar's selector.
+    run_menu: Option<Entity<InputState>>,
+    /// When a click outside last closed the run menu: the same click lands
+    /// on the selector, which must not reopen it.
+    run_menu_closed_at: Option<std::time::Instant>,
 
     panel_sizes: HashMap<&'static str, Entity<ResizableState>>,
     palette: Option<Entity<Palette>>,
@@ -148,6 +187,10 @@ impl Workspace {
         let panes = [cx.new(Pane::new), cx.new(Pane::new)];
         let agent = cx.new(|cx| AgentController::new(record.id, root.clone(), cx));
         let agent_panel = cx.new(|cx| AgentPanel::new(agent.clone(), window, cx));
+        let chat_history = cx.new(|cx| ChatHistory::new(agent.clone(), window, cx));
+        let diff_panel = cx.new(|cx| DiffPanel::new(agent.clone(), source_control.clone(), cx));
+        let debugger = cx.new(|cx| Debugger::new(root.clone(), record.id, cx));
+        let debug_panel = cx.new(|cx| DebugPanel::new(debugger.clone(), window, cx));
 
         let mut subscriptions = vec![
             cx.subscribe_in(&explorer, window, |this, _, event: &ExplorerEvent, window, cx| match event {
@@ -195,8 +238,31 @@ impl Workspace {
                 AgentPanelEvent::OpenFile(path) => {
                     this.open_file(path.clone(), true, window, cx);
                 }
+                AgentPanelEvent::ToggleDiff => this.toggle_diff(window, cx),
+            }),
+            cx.subscribe_in(&chat_history, window, |this, _, event: &ChatHistoryEvent, window, cx| match event {
+                ChatHistoryEvent::Opened => window.focus(&this.agent_panel.focus_handle(cx)),
+            }),
+            cx.subscribe_in(&diff_panel, window, |this, _, event: &DiffPanelEvent, window, cx| match event {
+                DiffPanelEvent::OpenFile(path) => {
+                    this.open_file(path.clone(), true, window, cx);
+                }
+                DiffPanelEvent::OpenDiff { title, diff } => {
+                    this.open_read_only(title, "diff", diff.clone(), window, cx);
+                }
+                DiffPanelEvent::Close => this.toggle_diff(window, cx),
             }),
             cx.observe(&agent, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&debugger, window, Self::on_debugger_event),
+            cx.observe(&debugger, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&debug_panel, window, |this, _, event: &DebugPanelEvent, window, cx| match event {
+                DebugPanelEvent::Open { path, line } => {
+                    if let Some(editor) = this.open_file(path.clone(), true, window, cx) {
+                        let line = *line;
+                        editor.update(cx, |editor, cx| editor.go_to(line, 0, window, cx));
+                    }
+                }
+            }),
         ];
         for (ix, pane) in panes.iter().enumerate() {
             subscriptions.push(cx.subscribe_in(pane, window, move |this, _, event: &PaneEvent, window, cx| {
@@ -257,7 +323,14 @@ impl Workspace {
             terminal: None,
             agent,
             agent_panel,
+            chat_history,
+            diff_panel,
             agent_browser: None,
+            debugger,
+            debug_panel,
+            gutter_popup: None,
+            run_menu: None,
+            run_menu_closed_at: None,
             panel_sizes: HashMap::new(),
             palette: None,
             palette_return: None,
@@ -273,7 +346,9 @@ impl Workspace {
         if workspace.layout.terminal_visible {
             workspace.ensure_terminal(window, cx);
         }
+        workspace.sync_chat_mode(cx);
         cx.on_release(|this: &mut Self, cx| {
+            this.debugger.update(cx, |debugger, cx| debugger.stop(cx));
             this.agent.update(cx, |agent, _| agent.shutdown());
             this.lsp.update(cx, |lsp, cx| lsp.shutdown(cx));
         })
@@ -320,6 +395,8 @@ impl Workspace {
                         }
                         (TabKind::File, editor.path().to_string_lossy().into_owned())
                     }
+                    // Notebooks are scratch work; they don't come back.
+                    PaneItem::Notebook(_) => continue,
                     PaneItem::Browser(browser) => {
                         let url = browser.read(cx).url().to_string();
                         if url.is_empty() || url == "about:blank" {
@@ -429,6 +506,9 @@ impl Workspace {
         if path.is_dir() {
             return None;
         }
+        if focus {
+            self.leave_chat(cx);
+        }
         // Already open: prefer the active pane, then the other.
         let order = if self.active_pane == 1 { [1, 0] } else { [0, 1] };
         for pane_ix in order {
@@ -465,7 +545,7 @@ impl Workspace {
         if !diagnostics.is_empty() {
             editor.update(cx, |editor, cx| editor.set_diagnostics(&diagnostics, cx));
         }
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |this, _, event: &EditorEvent, window, cx| {
+        self._subscriptions.push(cx.subscribe_in(&editor, window, |this, editor_entity, event: &EditorEvent, window, cx| {
             match event {
                 EditorEvent::Saved(_) => this.source_control.update(cx, |scm, cx| scm.refresh(cx)),
                 EditorEvent::Locations { kind, symbol, origin, targets } => {
@@ -474,9 +554,14 @@ impl Workspace {
                 EditorEvent::Notify(message) => {
                     window.push_notification(Notification::info(message.clone()), cx);
                 }
+                EditorEvent::Gutter(event) => this.on_gutter(&editor_entity, event.clone(), window, cx),
+                EditorEvent::Edited { old } => this.on_edited(&editor_entity, old, cx),
                 EditorEvent::Changed => {}
             }
         }));
+        let weak_debugger = self.debugger.downgrade();
+        editor.update(cx, |editor, cx| editor.set_debugger(weak_debugger, cx));
+        self.refresh_decorations(&editor, cx);
         let pane = self.active_pane().clone();
         pane.update(cx, |pane, cx| pane.add_item(PaneItem::Editor(editor.clone()), focus, window, cx));
         self.explorer.update(cx, |e, cx| e.reveal(&path, cx));
@@ -593,7 +678,56 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Opens a notebook for the function at the cursor of the active editor.
+    fn open_notebook(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_pane().read(cx).active_editor().cloned() else {
+            window.push_notification(Notification::info("Open a source file first."), cx);
+            return;
+        };
+        let (path, text, line) = {
+            let editor = editor.read(cx);
+            (editor.path().to_path_buf(), editor.text(cx), editor.cursor(cx).line as usize)
+        };
+        if cockpit_notebook::language_for(&path).is_none() {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            window.push_notification(Notification::info(format!("Notebooks don't support {name} yet.")), cx);
+            return;
+        }
+        let project = cockpit_notebook::Project {
+            root: self.root.clone(),
+            cargo_targets: self.debugger.read(cx).targets().to_vec(),
+        };
+        let request_path = path.clone();
+        // Finding the crate runs `cargo metadata`; keep it off the UI thread.
+        let opening = cx.background_spawn(async move {
+            cockpit_notebook::open(cockpit_notebook::OpenRequest { path: &request_path, text: &text, line, project: &project })
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = opening.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(notebook) => this.add_notebook(notebook, path, window, cx),
+                Err(err) => window.push_notification(Notification::info(capitalize(&err.to_string())), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn add_notebook(&mut self, notebook: cockpit_notebook::Notebook, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_chat(cx);
+        let source = Target { path, line: notebook.line as u32, column: 0 };
+        let view = cx.new(|cx| NotebookView::new(notebook, source, window, cx));
+        self._subscriptions.push(cx.subscribe_in(&view, window, |this, _, event: &NotebookEvent, window, cx| {
+            if let NotebookEvent::OpenSource(target) = event {
+                this.jump_to(target, window, cx);
+            }
+        }));
+        let pane = self.active_pane().clone();
+        pane.update(cx, |pane, cx| pane.add_item(PaneItem::Notebook(view), true, window, cx));
+    }
+
     fn open_read_only(&mut self, title: &str, extension: &str, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_chat(cx);
         let editor = cx.new(|cx| EditorView::read_only(title, extension, text, window, cx));
         let pane = self.active_pane().clone();
         pane.update(cx, |pane, cx| pane.add_item(PaneItem::Editor(editor), true, window, cx));
@@ -651,6 +785,9 @@ impl Workspace {
     // --- filesystem --------------------------------------------------------
 
     fn on_fs_change(&mut self, change: FsChange, window: &mut Window, cx: &mut Context<Self>) {
+        if change.paths.iter().any(|p| p.file_name().is_some_and(|n| n == "Cargo.toml")) {
+            self.debugger.update(cx, |d, cx| d.refresh_targets(cx));
+        }
         if !change.paths.is_empty() {
             self.explorer.update(cx, |e, cx| e.refresh_paths(change.paths.iter(), cx));
             for editor in self.all_editors(cx) {
@@ -697,6 +834,7 @@ impl Workspace {
                     t.focus_active(window, cx);
                 });
                 self.layout.terminal_visible = true;
+                self.layout.bottom = BottomTool::Terminal;
                 self.save_layout(cx);
                 cx.notify();
             }
@@ -923,8 +1061,13 @@ impl Workspace {
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.layout.terminal_visible = !self.layout.terminal_visible;
         if self.layout.terminal_visible {
-            let terminal = self.ensure_terminal(window, cx);
-            terminal.update(cx, |t, cx| t.focus_active(window, cx));
+            match self.layout.bottom {
+                BottomTool::Terminal => {
+                    let terminal = self.ensure_terminal(window, cx);
+                    terminal.update(cx, |t, cx| t.focus_active(window, cx));
+                }
+                BottomTool::Debug => window.focus(&self.debug_panel.focus_handle(cx)),
+            }
         } else {
             self.focus_center(window, cx);
         }
@@ -942,6 +1085,7 @@ impl Workspace {
             t.focus_active(window, cx);
         });
         self.layout.terminal_visible = true;
+        self.layout.bottom = BottomTool::Terminal;
         self.save_layout(cx);
         cx.notify();
     }
@@ -957,13 +1101,81 @@ impl Workspace {
             (true, SidebarView::Search) => self.search.update(cx, |s, cx| s.focus_query(None, window, cx)),
             (true, SidebarView::Explorer) => window.focus(&self.explorer.focus_handle(cx)),
             (true, SidebarView::SourceControl) => window.focus(&self.source_control.focus_handle(cx)),
+            (true, SidebarView::Chats) => window.focus(&self.agent_panel.focus_handle(cx)),
             (false, _) => self.focus_center(window, cx),
         }
+        self.sync_chat_mode(cx);
         self.save_layout(cx);
         cx.notify();
     }
 
+    // --- chat mode -----------------------------------------------------------
+
+    /// The conversation fills the center instead of the editor.
+    fn chat_mode(&self) -> bool {
+        self.layout.sidebar == SidebarView::Chats
+    }
+
+    /// The chat tab: enters chat mode with the history out; once in it,
+    /// slides the history in and out.
+    fn show_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat_mode() {
+            self.layout.sidebar_visible = !self.layout.sidebar_visible;
+        } else {
+            self.layout.sidebar = SidebarView::Chats;
+            self.layout.sidebar_visible = true;
+        }
+        self.sync_chat_mode(cx);
+        window.focus(&self.agent_panel.focus_handle(cx));
+        self.save_layout(cx);
+        cx.notify();
+    }
+
+    /// Back to the editor, e.g. because a file is being opened.
+    fn leave_chat(&mut self, cx: &mut Context<Self>) {
+        if !self.chat_mode() {
+            return;
+        }
+        self.layout.sidebar = SidebarView::Explorer;
+        self.sync_chat_mode(cx);
+        self.save_layout(cx);
+        cx.notify();
+    }
+
+    /// Slides the diff panel out beside the chat (entering chat mode first
+    /// when needed).
+    fn toggle_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat_mode() {
+            self.layout.diff_visible = !self.layout.diff_visible;
+        } else {
+            self.layout.sidebar = SidebarView::Chats;
+            self.layout.diff_visible = true;
+            window.focus(&self.agent_panel.focus_handle(cx));
+        }
+        if self.layout.diff_visible {
+            self.diff_panel.update(cx, |panel, cx| panel.shown(cx));
+        }
+        self.sync_chat_mode(cx);
+        self.save_layout(cx);
+        cx.notify();
+    }
+
+    /// Tells the agent panel whether it is the full-width chat.
+    fn sync_chat_mode(&self, cx: &mut Context<Self>) {
+        let (full, diff) = (self.chat_mode(), self.layout.diff_visible);
+        self.agent_panel.update(cx, |panel, cx| panel.set_chat_mode(full, diff, cx));
+    }
+
     fn toggle_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat_mode() {
+            // The conversation moves from the center back to the dock.
+            self.leave_chat(cx);
+            self.layout.agent_visible = true;
+            window.focus(&self.agent_panel.focus_handle(cx));
+            self.save_layout(cx);
+            cx.notify();
+            return;
+        }
         self.layout.agent_visible = !self.layout.agent_visible;
         if self.layout.agent_visible {
             window.focus(&self.agent_panel.focus_handle(cx));
@@ -987,6 +1199,7 @@ impl Workspace {
     fn start_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.layout.sidebar = SidebarView::SourceControl;
         self.layout.sidebar_visible = true;
+        self.sync_chat_mode(cx);
         self.source_control.update(cx, |scm, cx| scm.focus_message(window, cx));
         self.save_layout(cx);
         cx.notify();
@@ -1014,7 +1227,7 @@ impl Workspace {
     }
 
     fn focus_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.layout.agent_visible {
+        if !self.layout.agent_visible && !self.chat_mode() {
             self.layout.agent_visible = true;
             self.save_layout(cx);
         }
@@ -1158,6 +1371,12 @@ impl Workspace {
     /// Workspace name, then the active file's path inside it.
     fn breadcrumb(&self, cx: &App) -> Vec<SharedString> {
         let mut crumbs: Vec<SharedString> = vec![self.name.clone()];
+        if self.chat_mode() {
+            crumbs.push("Chat".into());
+            let title = self.agent.read(cx).active_thread().map(|t| t.title.clone());
+            crumbs.push(title.unwrap_or_else(|| "New chat".into()));
+            return crumbs;
+        }
         match self.active_pane().read(cx).active_item() {
             Some(PaneItem::Editor(editor)) => {
                 let editor = editor.read(cx);
@@ -1265,6 +1484,7 @@ impl Workspace {
                 .child(breadcrumb)
                 .children(pill)
                 .child(div().flex_1())
+                .child(self.render_run_widget(cx))
                 .child(
                     h_flex()
                         .flex_none()
@@ -1284,11 +1504,15 @@ impl Workspace {
                                 .tooltip(chrome::tooltip("Toggle terminal (⌘J)"))
                                 .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))),
                         )
-                        .child(
+                        .child(if self.chat_mode() {
+                            chrome::frame_button("toggle-diff", IconName::PanelRight, false, cx)
+                                .tooltip(chrome::tooltip("Toggle changes (⇧⌘D)"))
+                                .on_click(cx.listener(|this, _, window, cx| this.toggle_diff(window, cx)))
+                        } else {
                             chrome::frame_button("toggle-agent", IconName::PanelRight, false, cx)
                                 .tooltip(chrome::tooltip("Toggle Codex (⌥⌘B)"))
-                                .on_click(cx.listener(|this, _, window, cx| this.toggle_agent(window, cx))),
-                        ),
+                                .on_click(cx.listener(|this, _, window, cx| this.toggle_agent(window, cx)))
+                        }),
                 )
                 .when(running, |el| {
                     el.child(
@@ -1329,6 +1553,7 @@ impl Workspace {
     fn render_activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme::tokens(cx).clone();
         let current = self.layout.sidebar_visible.then_some(self.layout.sidebar);
+        let chat_mode = self.chat_mode();
         let changes = self.source_control.read(cx).change_count();
         let item = |id: &'static str, view: SidebarView, icon: gpui_component::Icon, tooltip: &'static str, cx: &mut Context<Self>| {
             chrome::frame_button(id, icon, current == Some(view), cx)
@@ -1372,6 +1597,15 @@ impl Workspace {
                         )
                     }),
             )
+            .child(
+                chrome::frame_button("activity-chat", icon("message-square"), chat_mode, cx)
+                    .tooltip(chrome::tooltip(if chat_mode && self.layout.sidebar_visible {
+                        "Hide chat history (⇧⌘A)"
+                    } else {
+                        "Chat (⇧⌘A)"
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| this.show_chat(window, cx))),
+            )
             .child(div().flex_1())
             .child(
                 chrome::frame_button("activity-browser", IconName::Globe, false, cx)
@@ -1379,7 +1613,7 @@ impl Workspace {
                     .on_click(cx.listener(|this, _, window, cx| this.new_browser_tab(window, cx))),
             )
             .child(
-                chrome::frame_button("activity-codex", icon("sparkles"), self.layout.agent_visible, cx)
+                chrome::frame_button("activity-codex", icon("sparkles"), self.layout.agent_visible && !chat_mode, cx)
                     .tooltip(chrome::tooltip("Codex (⌥⌘B)"))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_agent(window, cx))),
             )
@@ -1390,6 +1624,7 @@ impl Workspace {
             SidebarView::Explorer => self.explorer.clone().into_any_element(),
             SidebarView::SourceControl => self.source_control.clone().into_any_element(),
             SidebarView::Search => self.search.clone().into_any_element(),
+            SidebarView::Chats => self.chat_history.clone().into_any_element(),
         }
     }
 
@@ -1405,6 +1640,9 @@ impl Workspace {
     }
 
     fn render_center(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.chat_mode() {
+            return self.agent_panel.clone().into_any_element();
+        }
         if !self.layout.split {
             return self.panes[0].clone().into_any_element();
         }
@@ -1428,11 +1666,12 @@ impl Workspace {
     }
 
     /// The editor area, with the terminal under it when shown.
-    fn render_middle(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_middle(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let center = self.render_center(cx);
-        let Some(terminal) = self.terminal.clone().filter(|_| self.layout.terminal_visible) else {
+        if !self.layout.terminal_visible {
             return center;
-        };
+        }
+        let terminal = self.render_bottom(window, cx);
         let sizes = self.panel_sizes("rows", cx);
         v_resizable("workspace-rows")
             .with_state(&sizes)
@@ -1446,16 +1685,26 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_columns(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let middle = self.render_middle(cx);
-        let (sidebar, agent) = (self.layout.sidebar_visible, self.layout.agent_visible);
-        if !sidebar && !agent {
+    fn render_columns(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let middle = self.render_middle(window, cx);
+        let sidebar = self.layout.sidebar_visible;
+        // In chat mode the conversation is the center, so the right column
+        // is its diff panel instead of the docked agent.
+        let right = if self.chat_mode() {
+            self.layout.diff_visible.then_some(Right::Diff)
+        } else {
+            self.layout.agent_visible.then_some(Right::Agent)
+        };
+        if !sidebar && right.is_none() {
             return middle;
         }
-        let key = match (sidebar, agent) {
-            (true, true) => "columns",
-            (true, false) => "columns-sidebar",
-            _ => "columns-agent",
+        let key = match (sidebar, right) {
+            (true, Some(Right::Agent)) => "columns",
+            (true, Some(Right::Diff)) => "columns-sidebar-diff",
+            (true, None) => "columns-sidebar",
+            (false, Some(Right::Agent)) => "columns-agent",
+            (false, Some(Right::Diff)) => "columns-diff",
+            (false, None) => unreachable!("handled above"),
         };
         let sizes = self.panel_sizes(key, cx);
         h_resizable(key)
@@ -1469,12 +1718,16 @@ impl Workspace {
                 )
             })
             .child(resizable_panel().child(middle))
-            .when(agent, |group| {
+            .when_some(right, |group, right| {
+                let (size, element) = match right {
+                    Right::Agent => (px(380.), self.agent_panel.clone().into_any_element()),
+                    Right::Diff => (px(480.), self.diff_panel.clone().into_any_element()),
+                };
                 group.child(
                     resizable_panel()
-                        .size(px(380.))
+                        .size(size)
                         .size_range(px(300.)..px(1000.))
-                        .child(div().size_full().child(self.agent_panel.clone())),
+                        .child(div().size_full().child(element)),
                 )
             })
             .into_any_element()
@@ -1509,6 +1762,10 @@ impl Workspace {
             ConnectionState::Failed(_) => Some((format!("{name} stopped").into(), t.danger)),
             ConnectionState::Idle => None,
         };
+        let debug_status: Option<(SharedString, Hsla)> = self.debugger.read(cx).session().filter(|s| s.is_live()).map(|s| {
+            let color = if s.phase == Phase::Paused { cx.theme().info } else { t.success };
+            (format!("{} · {}", s.config.label(), debug::phase_label(&s.phase)).into(), color)
+        });
         let hover = t.frame_hover;
         let clickable = move |id: &'static str| {
             h_flex()
@@ -1561,6 +1818,15 @@ impl Workspace {
                     ),
             )
             .when_some(lsp_status, |el, status| el.child(div().truncate().max_w(px(320.)).child(status)))
+            .when_some(debug_status, |el, (text, color)| {
+                el.child(
+                    clickable("status-debug")
+                        .text_color(color)
+                        .child(icon("bug").size(px(12.)))
+                        .child(text)
+                        .on_click(cx.listener(|this, _, window, cx| this.show_bottom(BottomTool::Debug, true, window, cx))),
+                )
+            })
             .child(div().flex_1())
             .when_some(editor_info, |el, (position, language, ending)| {
                 el.child(div().px(px(6.)).child(position))
@@ -1579,8 +1845,8 @@ impl Workspace {
     }
 
     /// The content card: every panel lives inside it.
-    fn render_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let columns = self.render_columns(cx);
+    fn render_card(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let columns = self.render_columns(window, cx);
         let t = theme::tokens(cx);
         div()
             .flex_1()
@@ -1597,11 +1863,570 @@ impl Workspace {
     }
 }
 
+/// What the right-hand column shows.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Right {
+    Agent,
+    Diff,
+}
+
+/// A menu or editor opened from the gutter, at a window position.
+enum GutterPopup {
+    /// Run or debug what a run icon stands for.
+    Runnable { position: Point<Pixels>, config: RunConfig },
+    /// Edit a breakpoint's condition and log message.
+    Breakpoint {
+        position: Point<Pixels>,
+        path: PathBuf,
+        line: usize,
+        enabled: bool,
+        condition: Entity<InputState>,
+        log: Entity<InputState>,
+    },
+}
+
+// --- run and debug ------------------------------------------------------------
+impl Workspace {
+    fn on_debugger_event(
+        &mut self,
+        _: &Entity<Debugger>,
+        event: &DebuggerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            DebuggerEvent::DecorationsChanged => {
+                for editor in self.all_editors(cx) {
+                    self.refresh_decorations(&editor, cx);
+                }
+                cx.notify();
+            }
+            DebuggerEvent::Reveal { path, line } => {
+                if let Some(editor) = self.open_file(path.clone(), true, window, cx) {
+                    let line = *line;
+                    editor.update(cx, |editor, cx| editor.go_to(line, 0, window, cx));
+                }
+                self.debug_panel.update(cx, |panel, cx| panel.show_tab(PanelTab::Debugger, cx));
+                self.show_bottom(BottomTool::Debug, false, window, cx);
+            }
+            DebuggerEvent::SessionStarted => {
+                self.debug_panel.update(cx, |panel, cx| panel.show_tab(PanelTab::Console, cx));
+                self.show_bottom(BottomTool::Debug, false, window, cx);
+            }
+            DebuggerEvent::Notify(message) => {
+                window.push_notification(Notification::info(message.clone()), cx);
+            }
+            DebuggerEvent::RunInTerminal { program, args } => {
+                let terminal = self.ensure_terminal(window, cx);
+                let program = Some((program.clone(), args.clone()));
+                terminal.update(cx, |t, cx| {
+                    t.add_terminal(program, cx);
+                    t.focus_active(window, cx);
+                });
+                self.show_bottom(BottomTool::Terminal, false, window, cx);
+            }
+        }
+    }
+
+    /// Shows the bottom dock with `tool`.
+    fn show_bottom(&mut self, tool: BottomTool, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if tool == BottomTool::Terminal {
+            self.ensure_terminal(window, cx);
+        }
+        if !self.layout.terminal_visible || self.layout.bottom != tool {
+            self.layout.terminal_visible = true;
+            self.layout.bottom = tool;
+            self.save_layout(cx);
+        }
+        if focus {
+            match tool {
+                BottomTool::Debug => window.focus(&self.debug_panel.focus_handle(cx)),
+                BottomTool::Terminal => {
+                    if let Some(terminal) = &self.terminal {
+                        terminal.update(cx, |t, cx| t.focus_active(window, cx));
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Draws breakpoints, run icons and the paused line in `editor`.
+    fn refresh_decorations(&self, editor: &Entity<EditorView>, cx: &mut Context<Self>) {
+        let (path, text) = {
+            let view = editor.read(cx);
+            if view.is_read_only() {
+                return;
+            }
+            (view.path().to_path_buf(), view.rope(cx).to_string())
+        };
+        let (decorations, runnables) = debug_editor::decorations(self.debugger.read(cx), &path, &text, cx);
+        editor.update(cx, |editor, cx| editor.set_decorations(decorations, runnables, cx));
+    }
+
+    fn on_edited(&mut self, editor: &Entity<EditorView>, old: &gpui_component::input::Rope, cx: &mut Context<Self>) {
+        let path = editor.read(cx).path().to_path_buf();
+        if !self.debugger.read(cx).breakpoints().for_file(&path).is_empty() {
+            let (old, new) = (old.to_string(), editor.read(cx).rope(cx).to_string());
+            // Emits DecorationsChanged (and so a redraw) when something moved.
+            self.debugger.update(cx, |d, cx| d.reanchor(&path, &old, &new, cx));
+        }
+        self.refresh_decorations(editor, cx);
+    }
+
+    fn on_gutter(&mut self, editor: &Entity<EditorView>, event: GutterEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let path = editor.read(cx).path().to_path_buf();
+        let runnable = editor.read(cx).runnables().iter().find(|r| r.line == event.row).cloned();
+        match event.button {
+            MouseButton::Left if event.in_lane && runnable.is_some() => {
+                let config = runnable.expect("checked").config;
+                self.gutter_popup = Some(GutterPopup::Runnable { position: event.position, config });
+                cx.notify();
+            }
+            MouseButton::Left if event.modifiers.alt => {
+                self.debugger.update(cx, |d, cx| d.toggle_breakpoint_enabled(&path, event.row, cx));
+            }
+            MouseButton::Left => {
+                self.debugger.update(cx, |d, cx| d.toggle_breakpoint(&path, event.row, cx));
+            }
+            MouseButton::Right => {
+                if self.debugger.read(cx).breakpoints().get(&path, event.row).is_none() {
+                    self.debugger.update(cx, |d, cx| d.toggle_breakpoint(&path, event.row, cx));
+                }
+                self.edit_breakpoint(path, event.row, event.position, window, cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn edit_breakpoint(&mut self, path: PathBuf, line: usize, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(bp) = self.debugger.read(cx).breakpoints().get(&path, line).cloned() else { return };
+        let condition = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Stop only when this is true, e.g. i > 10")
+                .default_value(bp.condition.clone().unwrap_or_default())
+        });
+        let log = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Log instead of stopping, e.g. i = {i}")
+                .default_value(bp.log_message.clone().unwrap_or_default())
+        });
+        for input in [&condition, &log] {
+            self._subscriptions.push(cx.subscribe_in(input, window, |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.close_gutter_popup(true, window, cx);
+                }
+            }));
+        }
+        condition.update(cx, |input, cx| input.focus(window, cx));
+        self.gutter_popup = Some(GutterPopup::Breakpoint { position, path, line, enabled: bp.enabled, condition, log });
+        cx.notify();
+    }
+
+    /// Closes the gutter popup; a breakpoint editor saves when `commit`.
+    fn close_gutter_popup(&mut self, commit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(GutterPopup::Breakpoint { path, line, enabled, condition, log, .. }) = self.gutter_popup.take() {
+            if commit {
+                let text = |input: &Entity<InputState>| {
+                    let value = input.read(cx).value().trim().to_string();
+                    (!value.is_empty()).then_some(value)
+                };
+                let previous = self.debugger.read(cx).breakpoints().get(&path, line).cloned();
+                if let Some(previous) = previous {
+                    let updated = LineBreakpoint {
+                        enabled,
+                        condition: text(&condition),
+                        log_message: text(&log),
+                        ..previous
+                    };
+                    self.debugger.update(cx, |d, cx| d.update_breakpoint(&path, updated, cx));
+                }
+            }
+        }
+        self.gutter_popup = None;
+        self.focus_center(window, cx);
+        cx.notify();
+    }
+
+    /// The runnable at or above the cursor in the active editor.
+    fn runnable_at_cursor(&self, cx: &App) -> Option<RunConfig> {
+        let editor = self.active_pane().read(cx).active_editor()?.read(cx);
+        let line = editor.cursor(cx).line as usize;
+        editor
+            .runnables()
+            .iter()
+            .filter(|r| r.line <= line)
+            .max_by_key(|r| (r.config.exact, r.line))
+            .map(|r| r.config.clone())
+    }
+
+    fn run_at_cursor(&mut self, debug: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.runnable_at_cursor(cx) else {
+            window.push_notification(
+                Notification::info("No `fn main` or test at the cursor; using the selected configuration."),
+                cx,
+            );
+            self.debugger.update(cx, |d, cx| if debug { d.debug_selected(cx) } else { d.run_selected(cx) });
+            return;
+        };
+        self.debugger.update(cx, |d, cx| if debug { d.debug(config, cx) } else { d.run(config, cx) });
+    }
+
+    fn toggle_breakpoint_at_cursor(&mut self, cx: &mut Context<Self>) {
+        let Some(location) = self.current_location(cx) else { return };
+        let line = location.line as usize;
+        self.debugger.update(cx, |d, cx| d.toggle_breakpoint(&location.path, line, cx));
+    }
+
+    fn run_to_cursor(&mut self, cx: &mut Context<Self>) {
+        let Some(location) = self.current_location(cx) else { return };
+        let line = location.line as usize;
+        self.debugger.update(cx, |d, cx| d.run_to_cursor(&location.path, line, cx));
+    }
+
+    fn toggle_run_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.run_menu.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self.run_menu_closed_at.take().is_some_and(|at| at.elapsed() < Duration::from_millis(400)) {
+            return;
+        }
+        let args = self
+            .debugger
+            .read(cx)
+            .selected_config()
+            .map(|c| debug::join_args(&c.args))
+            .unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Program arguments").default_value(args));
+        self._subscriptions.push(cx.subscribe_in(&input, window, |this, input, event: &InputEvent, _, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                let args = input.read(cx).value().to_string();
+                this.debugger.update(cx, |d, cx| d.set_program_args(&args, cx));
+                this.run_menu = None;
+                cx.notify();
+            }
+        }));
+        self.run_menu = Some(input);
+        cx.notify();
+    }
+
+    fn close_run_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(input) = self.run_menu.take() {
+            self.run_menu_closed_at = Some(std::time::Instant::now());
+            let args = input.read(cx).value().to_string();
+            self.debugger.update(cx, |d, cx| d.set_program_args(&args, cx));
+            cx.notify();
+        }
+    }
+
+    /// The title bar's run widget: configuration, Run, Debug, Stop.
+    fn render_run_widget(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme::tokens(cx).clone();
+        let debugger = self.debugger.read(cx);
+        let selected = debugger.selected_config().cloned();
+        let live = debugger.is_live();
+        let paused = debugger.is_paused();
+        let has_project = debugger.has_cargo_project();
+        let label: SharedString = selected
+            .as_ref()
+            .map(|c| c.label().into())
+            .unwrap_or_else(|| if has_project { "No configuration".into() } else { "Run".into() });
+        let (hover, surface, border) = (t.raised, t.surface, t.border_strong);
+
+        let selector = div()
+            .relative()
+            .child(
+                h_flex()
+                    .id("run-config")
+                    .h(px(26.))
+                    .max_w(px(220.))
+                    .px(px(8.))
+                    .gap(px(6.))
+                    .rounded(px(7.))
+                    .border_1()
+                    .border_color(border)
+                    .bg(surface)
+                    .text_size(TEXT_BODY)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .tooltip(chrome::tooltip("Run configuration"))
+                    .when(live, |el| el.child(chrome::status_dot(if paused { cx.theme().info } else { t.success })))
+                    .child(div().min_w_0().truncate().child(label))
+                    .child(gpui_component::Icon::new(IconName::ChevronDown).size(px(12.)).text_color(t.fg_subtle))
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_run_menu(window, cx))),
+            )
+            .when_some(self.run_menu.clone(), |el, input| el.child(self.render_run_menu(input, cx)));
+
+        h_flex()
+            .flex_none()
+            .gap(px(2.))
+            .child(selector)
+            .child(
+                chrome::frame_button("title-run", icon("play"), false, cx)
+                    .text_color(t.success)
+                    .tooltip(chrome::tooltip("Run (⌃R)"))
+                    .on_click(cx.listener(|this, _, _, cx| this.debugger.update(cx, |d, cx| d.run_selected(cx)))),
+            )
+            .child(
+                chrome::frame_button("title-debug", icon("bug"), false, cx)
+                    .text_color(t.success)
+                    .tooltip(chrome::tooltip("Debug (⌃D)"))
+                    .on_click(cx.listener(|this, _, _, cx| this.debugger.update(cx, |d, cx| d.debug_selected(cx)))),
+            )
+            .when(live, |el| {
+                el.child(
+                    chrome::frame_button("title-stop-debug", icon("square"), false, cx)
+                        .text_color(t.danger)
+                        .tooltip(chrome::tooltip("Stop (⌘F2)"))
+                        .on_click(cx.listener(|this, _, _, cx| this.debugger.update(cx, |d, cx| d.stop(cx)))),
+                )
+            })
+    }
+
+    fn render_run_menu(&self, input: Entity<InputState>, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme::tokens(cx).clone();
+        let debugger = self.debugger.read(cx);
+        let configs = debugger.configs();
+        let selected = debugger.selected_config().cloned();
+        let error = debugger.targets_error().map(str::to_string);
+        let hover = t.hover;
+        let mut list = v_flex().p(px(4.)).gap(px(1.));
+        if configs.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .text_size(TEXT_SMALL)
+                    .text_color(t.fg_muted)
+                    .child(error.unwrap_or_else(|| {
+                        "No binaries or examples found. Tests show a ▶ in the gutter.".to_string()
+                    })),
+            );
+        }
+        for (ix, config) in configs.into_iter().enumerate() {
+            let is_selected = selected.as_ref().is_some_and(|s| debug::same_config(s, &config));
+            let kind = if config.test { "test" } else if config.target_kind == cockpit_debugger::TargetKind::Example { "example" } else { "bin" };
+            let label = config.label();
+            list = list.child(
+                h_flex()
+                    .id(("run-config-item", ix))
+                    .h(px(26.))
+                    .px(px(8.))
+                    .gap(px(8.))
+                    .rounded(RADIUS)
+                    .cursor_pointer()
+                    .when(is_selected, |el| el.bg(t.accent_soft))
+                    .when(!is_selected, |el| el.hover(move |s| s.bg(hover)))
+                    .child(icon(if config.test { "list-checks" } else { "play" }).size(px(12.)).text_color(t.success))
+                    .child(div().flex_1().min_w_0().truncate().text_size(TEXT_BODY).child(label))
+                    .child(div().text_size(TEXT_CAPTION).text_color(t.fg_subtle).child(kind))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let config = config.clone();
+                        this.debugger.update(cx, |d, cx| d.select_config(config, cx));
+                        this.run_menu = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        deferred(
+            anchored().anchor(Corner::TopLeft).snap_to_window_with_margin(px(8.)).child(
+                v_flex()
+                    .id("run-menu")
+                    .mt(px(30.))
+                    .w(px(300.))
+                    .rounded(RADIUS_LG)
+                    .border_1()
+                    .border_color(t.border_strong)
+                    .bg(t.surface)
+                    .shadow_lg()
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_run_menu(cx)))
+                    .child(div().px(px(10.)).pt(px(8.)).child(chrome::caps_label("Run configurations", cx)))
+                    .child(list)
+                    .child(
+                        v_flex()
+                            .p(px(8.))
+                            .gap(px(4.))
+                            .border_t_1()
+                            .border_color(t.border)
+                            .child(div().text_size(TEXT_SMALL).text_color(t.fg_muted).child("Program arguments (↩ to save)"))
+                            .child(Input::new(&input).small()),
+                    ),
+            ),
+        )
+        .with_priority(2)
+    }
+
+    fn render_gutter_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let popup = self.gutter_popup.as_ref()?;
+        let t = theme::tokens(cx).clone();
+        let hover = t.hover;
+        let card = |position: Point<Pixels>, width: f32| {
+            anchored()
+                .position(point(position.x + px(8.), position.y + px(8.)))
+                .snap_to_window_with_margin(px(8.))
+                .child(
+                    v_flex()
+                        .id("gutter-popup")
+                        .w(px(width))
+                        .rounded(RADIUS_LG)
+                        .border_1()
+                        .border_color(t.border_strong)
+                        .bg(t.surface)
+                        .shadow_lg()
+                        .occlude()
+                        .text_size(TEXT_BODY),
+                )
+        };
+        let element = match popup {
+            GutterPopup::Runnable { position, config } => {
+                let label = config.label();
+                let item = |id: &'static str, icon_name: &'static str, text: String, debug: bool, cx: &mut Context<Self>| {
+                    let config = config.clone();
+                    h_flex()
+                        .id(id)
+                        .h(px(28.))
+                        .px(px(10.))
+                        .gap(px(8.))
+                        .rounded(RADIUS)
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover))
+                        .child(icon(icon_name).size(px(13.)).text_color(t.success))
+                        .child(div().min_w_0().truncate().child(text))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let config = config.clone();
+                            this.gutter_popup = None;
+                            this.focus_center(window, cx);
+                            if debug {
+                                this.debugger.update(cx, |d, cx| d.debug(config, cx));
+                            } else {
+                                this.debugger.update(cx, |d, cx| d.run(config, cx));
+                            }
+                        }))
+                };
+                card(*position, 280.)
+                    .child(
+                        v_flex()
+                            .p(px(4.))
+                            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_gutter_popup(false, window, cx)))
+                            .child(item("gutter-run", "play", format!("Run '{label}'"), false, cx))
+                            .child(item("gutter-debug", "bug", format!("Debug '{label}'"), true, cx)),
+                    )
+                    .into_any_element()
+            }
+            GutterPopup::Breakpoint { position, path, line, enabled, condition, log } => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let enabled = *enabled;
+                let (remove_path, remove_line) = (path.clone(), *line);
+                card(*position, 340.)
+                    .child(
+                        v_flex()
+                            .p(px(10.))
+                            .gap(px(8.))
+                            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_gutter_popup(true, window, cx)))
+                            .child(
+                                h_flex()
+                                    .gap(px(8.))
+                                    .child(chrome::caps_label(format!("Breakpoint · {name}:{}", line + 1), cx))
+                                    .child(div().flex_1())
+                                    .child(
+                                        Checkbox::new("bp-enabled")
+                                            .checked(enabled)
+                                            .label("Enabled")
+                                            .small()
+                                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                                if let Some(GutterPopup::Breakpoint { enabled, .. }) = this.gutter_popup.as_mut() {
+                                                    *enabled = *checked;
+                                                }
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(div().text_size(TEXT_SMALL).text_color(t.fg_muted).child("Condition"))
+                            .child(Input::new(condition).small())
+                            .child(div().text_size(TEXT_SMALL).text_color(t.fg_muted).child("Log message (doesn't stop; {expr} is replaced)"))
+                            .child(Input::new(log).small())
+                            .child(
+                                h_flex()
+                                    .gap(px(6.))
+                                    .pt(px(2.))
+                                    .child(
+                                        Button::new("bp-remove")
+                                            .label("Remove")
+                                            .small()
+                                            .ghost()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                let path = remove_path.clone();
+                                                this.debugger.update(cx, |d, cx| d.remove_breakpoint(&path, remove_line, cx));
+                                                this.close_gutter_popup(false, window, cx);
+                                            })),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        Button::new("bp-done")
+                                            .label("Done")
+                                            .small()
+                                            .primary()
+                                            .on_click(cx.listener(|this, _, window, cx| this.close_gutter_popup(true, window, cx))),
+                                    ),
+                            ),
+                    )
+                    .into_any_element()
+            }
+        };
+        Some(deferred(element).with_priority(2).into_any_element())
+    }
+
+    /// The bottom dock: a stripe of tools (terminal, debug) and the shown one.
+    fn render_bottom(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let tool = self.layout.bottom;
+        let content = match tool {
+            BottomTool::Terminal => self.ensure_terminal(window, cx).into_any_element(),
+            BottomTool::Debug => self.debug_panel.clone().into_any_element(),
+        };
+        let t = theme::tokens(cx).clone();
+        let debugging = self.debugger.read(cx).is_live();
+        h_flex()
+            .size_full()
+            .child(
+                v_flex()
+                    .w(px(36.))
+                    .h_full()
+                    .flex_none()
+                    .items_center()
+                    .pt(px(3.))
+                    .gap(px(2.))
+                    .border_r_1()
+                    .border_color(t.border)
+                    .child(
+                        chrome::frame_button("bottom-terminal", icon("terminal"), tool == BottomTool::Terminal, cx)
+                            .tooltip(chrome::tooltip("Terminal (⌘J)"))
+                            .on_click(cx.listener(|this, _, window, cx| this.show_bottom(BottomTool::Terminal, true, window, cx))),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .child(
+                                chrome::frame_button("bottom-debug", icon("bug"), tool == BottomTool::Debug, cx)
+                                    .tooltip(chrome::tooltip("Debug (⌘5)"))
+                                    .on_click(cx.listener(|this, _, window, cx| this.show_bottom(BottomTool::Debug, true, window, cx))),
+                            )
+                            .when(debugging, |el| {
+                                el.child(div().absolute().top(px(4.)).right(px(4.)).child(chrome::status_dot(t.success)))
+                            }),
+                    ),
+            )
+            .child(div().flex_1().min_w_0().h_full().child(content))
+            .into_any_element()
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dialogs = Root::render_dialog_layer(window, cx);
         let notifications = Root::render_notification_layer(window, cx);
-        let card = self.render_card(cx);
+        let card = self.render_card(window, cx);
         let t = theme::tokens(cx).clone();
 
         v_flex()
@@ -1631,6 +2456,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &actions::ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
             .on_action(cx.listener(|this, _: &actions::ToggleTerminal, window, cx| this.toggle_terminal(window, cx)))
             .on_action(cx.listener(|this, _: &actions::ToggleAgentPanel, window, cx| this.toggle_agent(window, cx)))
+            .on_action(cx.listener(|this, _: &actions::ShowChat, window, cx| this.show_chat(window, cx)))
+            .on_action(cx.listener(|this, _: &actions::ToggleDiffPanel, window, cx| this.toggle_diff(window, cx)))
             .on_action(cx.listener(|this, _: &actions::ShowExplorer, window, cx| {
                 this.show_sidebar(SidebarView::Explorer, window, cx)
             }))
@@ -1659,6 +2486,31 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &actions::RestartLanguageServers, window, cx| {
                 this.restart_language_servers(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &actions::RunSelected, _, cx| this.debugger.update(cx, |d, cx| d.run_selected(cx))))
+            .on_action(cx.listener(|this, _: &actions::DebugSelected, _, cx| this.debugger.update(cx, |d, cx| d.debug_selected(cx))))
+            .on_action(cx.listener(|this, _: &actions::RunAtCursor, window, cx| this.run_at_cursor(false, window, cx)))
+            .on_action(cx.listener(|this, _: &actions::DebugAtCursor, window, cx| this.run_at_cursor(true, window, cx)))
+            .on_action(cx.listener(|this, _: &actions::StopRun, _, cx| this.debugger.update(cx, |d, cx| d.stop(cx))))
+            .on_action(cx.listener(|this, _: &actions::RestartDebugging, _, cx| this.debugger.update(cx, |d, cx| d.restart(cx))))
+            .on_action(cx.listener(|this, _: &actions::Resume, _, cx| this.debugger.update(cx, |d, cx| d.resume(cx))))
+            .on_action(cx.listener(|this, _: &actions::Pause, _, cx| this.debugger.update(cx, |d, cx| d.pause(cx))))
+            .on_action(cx.listener(|this, _: &actions::StepOver, _, cx| this.debugger.update(cx, |d, cx| d.step_over(cx))))
+            .on_action(cx.listener(|this, _: &actions::StepInto, _, cx| this.debugger.update(cx, |d, cx| d.step_into(cx))))
+            .on_action(cx.listener(|this, _: &actions::StepOut, _, cx| this.debugger.update(cx, |d, cx| d.step_out(cx))))
+            .on_action(cx.listener(|this, _: &actions::RunToCursor, _, cx| this.run_to_cursor(cx)))
+            .on_action(cx.listener(|this, _: &actions::OpenNotebook, window, cx| this.open_notebook(window, cx)))
+            .on_action(cx.listener(|this, _: &actions::ToggleBreakpoint, _, cx| this.toggle_breakpoint_at_cursor(cx)))
+            .on_action(cx.listener(|this, _: &actions::ViewBreakpoints, window, cx| {
+                this.debug_panel.update(cx, |p, cx| p.show_tab(PanelTab::Breakpoints, cx));
+                this.show_bottom(BottomTool::Debug, true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &actions::EvaluateExpression, window, cx| {
+                this.show_bottom(BottomTool::Debug, false, window, cx);
+                this.debug_panel.update(cx, |p, cx| p.focus_evaluate(None, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &actions::ShowDebugPanel, window, cx| {
+                this.show_bottom(BottomTool::Debug, true, window, cx);
             }))
             .child(self.render_title_bar(cx))
             .child(
@@ -1718,6 +2570,7 @@ impl Render for Workspace {
                     .with_priority(1),
                 )
             })
+            .children(self.render_gutter_popup(cx))
             .children(dialogs)
             .children(notifications)
     }
@@ -1730,6 +2583,13 @@ fn push_bounded(stack: &mut Vec<Target>, target: Target) {
     if stack.len() > NAV_HISTORY {
         stack.remove(0);
     }
+}
+
+/// `text` with its first letter capitalized, for notifications built from
+/// error messages.
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
 }
 
 /// Palette rows for `targets`, with each line's text as its preview. Each

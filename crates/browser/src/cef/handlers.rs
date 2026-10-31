@@ -22,7 +22,7 @@ pub(crate) struct AppConfig {
 }
 
 wrap_app! {
-    pub(crate) struct CockpitApp {
+    pub(crate) struct HangarApp {
         config: AppConfig,
     }
 
@@ -40,12 +40,12 @@ wrap_app! {
             // Unsigned development builds change identity on every rebuild,
             // which would make the Keychain prompt for the cookie key each
             // launch. Release builds use the real Keychain.
-            if cfg!(debug_assertions) || std::env::var_os("COCKPIT_CEF_MOCK_KEYCHAIN").is_some() {
+            if cfg!(debug_assertions) || std::env::var_os("HANGAR_CEF_MOCK_KEYCHAIN").is_some() {
                 command_line.append_switch(Some(&"use-mock-keychain".into()));
             }
             // Escape hatch for broken helper setups. Disables Chromium's
             // process sandbox, so never on by default.
-            if std::env::var_os("COCKPIT_CEF_NO_SANDBOX").is_some() {
+            if std::env::var_os("HANGAR_CEF_NO_SANDBOX").is_some() {
                 command_line.append_switch(Some(&"no-sandbox".into()));
             }
             if let Some(port) = self.config.remote_debugging_port {
@@ -61,13 +61,13 @@ wrap_app! {
         }
 
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
-            Some(CockpitBrowserProcessHandler::new())
+            Some(HangarBrowserProcessHandler::new())
         }
     }
 }
 
 wrap_browser_process_handler! {
-    pub(crate) struct CockpitBrowserProcessHandler;
+    pub(crate) struct HangarBrowserProcessHandler;
 
     impl BrowserProcessHandler {
         /// The pump runs at 60 Hz regardless, so there is nothing to schedule.
@@ -80,7 +80,7 @@ wrap_browser_process_handler! {
 pub(crate) struct TabRef(pub(crate) Rc<TabShared>);
 
 wrap_render_handler! {
-    pub(crate) struct CockpitRenderHandler {
+    pub(crate) struct HangarRenderHandler {
         tab: TabRef,
     }
 
@@ -164,7 +164,7 @@ fn is_main_frame(frame: &Option<&mut Frame>) -> bool {
 }
 
 wrap_display_handler! {
-    pub(crate) struct CockpitDisplayHandler {
+    pub(crate) struct HangarDisplayHandler {
         tab: TabRef,
     }
 
@@ -270,7 +270,7 @@ pub(crate) fn cursor_kind(cursor: CursorType) -> CursorKind {
 }
 
 wrap_load_handler! {
-    pub(crate) struct CockpitLoadHandler {
+    pub(crate) struct HangarLoadHandler {
         tab: TabRef,
     }
 
@@ -323,7 +323,7 @@ wrap_load_handler! {
 }
 
 wrap_life_span_handler! {
-    pub(crate) struct CockpitLifeSpanHandler {
+    pub(crate) struct HangarLifeSpanHandler {
         tab: TabRef,
     }
 
@@ -363,7 +363,7 @@ wrap_life_span_handler! {
 }
 
 wrap_context_menu_handler! {
-    pub(crate) struct CockpitContextMenuHandler;
+    pub(crate) struct HangarContextMenuHandler;
 
     impl ContextMenuHandler {
         /// Chromium's native context menu cannot attach to an off-screen
@@ -383,7 +383,7 @@ wrap_context_menu_handler! {
 }
 
 wrap_client! {
-    pub(crate) struct CockpitClient {
+    pub(crate) struct HangarClient {
         render_handler: RenderHandler,
         display_handler: DisplayHandler,
         load_handler: LoadHandler,
@@ -414,14 +414,14 @@ wrap_client! {
     }
 }
 
-impl CockpitClient {
+impl HangarClient {
     pub(crate) fn build(tab: Rc<TabShared>) -> Client {
         Self::new(
-            CockpitRenderHandler::new(TabRef(tab.clone())),
-            CockpitDisplayHandler::new(TabRef(tab.clone())),
-            CockpitLoadHandler::new(TabRef(tab.clone())),
-            CockpitLifeSpanHandler::new(TabRef(tab)),
-            CockpitContextMenuHandler::new(),
+            HangarRenderHandler::new(TabRef(tab.clone())),
+            HangarDisplayHandler::new(TabRef(tab.clone())),
+            HangarLoadHandler::new(TabRef(tab.clone())),
+            HangarLifeSpanHandler::new(TabRef(tab)),
+            HangarContextMenuHandler::new(),
         )
     }
 }

@@ -30,7 +30,7 @@ pub use input::{KeyInput, Modifiers, MouseButton, MouseInput};
 
 use std::{path::PathBuf, rc::Rc};
 
-/// Entry point of Chromium's helper processes (the `Cockpit Helper*.app`
+/// Entry point of Chromium's helper processes (the `Hangar Helper*.app`
 /// executables). Only meaningful inside the macOS app bundle.
 pub fn run_helper() -> i32 {
     #[cfg(target_os = "macos")]

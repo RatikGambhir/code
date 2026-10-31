@@ -27,7 +27,8 @@ use gpui_component::input::{
 };
 use gpui_component::Rope;
 use lsp_types::{
-    CodeAction, CodeActionOrCommand, CompletionContext, CompletionResponse, CompletionTriggerKind,
+    CodeAction, CodeActionOrCommand, CompletionContext, CompletionItem, CompletionResponse, CompletionTextEdit,
+    CompletionTriggerKind,
     GotoDefinitionResponse, LocationLink, OneOf, TextEdit, WorkspaceEdit,
 };
 
@@ -333,9 +334,85 @@ fn progress_text(
 /// An editor's file as the language server sees it.
 ///
 /// Everything here runs on the main thread, so plain cells are enough.
+/// How far the server's lines are from the editor's: a notebook cell is
+/// shown to the server inside fixed text (see [`LspDocument::open_cell`]),
+/// so its line 0 is the server's line `n`. Columns are the same.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LineShift(pub u32);
+
+impl LineShift {
+    pub fn to_server(self, position: lsp_types::Position) -> lsp_types::Position {
+        lsp_types::Position::new(position.line + self.0, position.character)
+    }
+
+    /// `None` for a position in the text around the editor's.
+    pub fn from_server(self, position: lsp_types::Position) -> Option<lsp_types::Position> {
+        let line = position.line.checked_sub(self.0)?;
+        Some(lsp_types::Position::new(line, position.character))
+    }
+
+    pub fn range_from_server(self, range: lsp_types::Range) -> Option<lsp_types::Range> {
+        Some(lsp_types::Range::new(self.from_server(range.start)?, self.from_server(range.end)?))
+    }
+
+    /// Completion edits in editor lines. An import the server would add
+    /// above the cell goes at the cell's top instead; other edits outside
+    /// it are dropped.
+    fn completions(self, response: CompletionResponse) -> CompletionResponse {
+        if self.0 == 0 {
+            return response;
+        }
+        let map = |items: Vec<CompletionItem>| -> Vec<CompletionItem> {
+            items
+                .into_iter()
+                .map(|mut item| {
+                    item.text_edit = item.text_edit.and_then(|edit| match edit {
+                        CompletionTextEdit::Edit(mut edit) => {
+                            edit.range = self.range_from_server(edit.range)?;
+                            Some(CompletionTextEdit::Edit(edit))
+                        }
+                        CompletionTextEdit::InsertAndReplace(mut edit) => {
+                            edit.insert = self.range_from_server(edit.insert)?;
+                            edit.replace = self.range_from_server(edit.replace)?;
+                            Some(CompletionTextEdit::InsertAndReplace(edit))
+                        }
+                    });
+                    item.additional_text_edits = item.additional_text_edits.map(|edits| {
+                        edits
+                            .into_iter()
+                            .filter_map(|mut edit| match self.range_from_server(edit.range) {
+                                Some(range) => {
+                                    edit.range = range;
+                                    Some(edit)
+                                }
+                                None if edit.range.start == edit.range.end => {
+                                    edit.range = lsp_types::Range::default();
+                                    Some(edit)
+                                }
+                                None => None,
+                            })
+                            .collect()
+                    });
+                    item
+                })
+                .collect()
+        };
+        match response {
+            CompletionResponse::Array(items) => CompletionResponse::Array(map(items)),
+            CompletionResponse::List(mut list) => {
+                list.items = map(list.items);
+                CompletionResponse::List(list)
+            }
+        }
+    }
+}
+
 pub struct LspDocument {
     pub client: Arc<LspClient>,
     pub path: PathBuf,
+    /// Text the server sees before and after the editor's (notebook cells).
+    surround: Option<(String, String)>,
+    pub shift: LineShift,
     version: Cell<i32>,
     /// The text the server has; compared before each request so the server
     /// never answers for stale text (completion is asked for before the
@@ -358,11 +435,45 @@ impl LspDocument {
         Ok(Rc::new(Self {
             client,
             path,
+            surround: None,
+            shift: LineShift::default(),
             version: Cell::new(1),
             synced: RefCell::new(text.clone()),
             diagnostics,
             hovered_definitions: Arc::default(),
         }))
+    }
+
+    /// A notebook cell, shown to the server as `prefix + text + suffix` in
+    /// `path` (a file the editor does not have open).
+    pub fn open_cell(
+        client: Arc<LspClient>,
+        path: PathBuf,
+        language: &str,
+        text: &Rope,
+        prefix: String,
+        suffix: String,
+    ) -> Result<Rc<Self>> {
+        let shift = LineShift(prefix.matches('\n').count() as u32);
+        client.did_open(&path, lsp_language_id(language), 1, &format!("{prefix}{text}{suffix}"))?;
+        Ok(Rc::new(Self {
+            client,
+            path,
+            surround: Some((prefix, suffix)),
+            shift,
+            version: Cell::new(1),
+            synced: RefCell::new(text.clone()),
+            diagnostics: Rc::default(),
+            hovered_definitions: Arc::default(),
+        }))
+    }
+
+    /// The whole text the server has for `text`.
+    fn server_text(&self, text: &Rope) -> String {
+        match &self.surround {
+            Some((prefix, suffix)) => format!("{prefix}{text}{suffix}"),
+            None => text.to_string(),
+        }
     }
 
     /// Sends the text to the server if it changed since the last sync.
@@ -372,7 +483,7 @@ impl LspDocument {
         }
         let version = self.version.get() + 1;
         self.version.set(version);
-        if let Err(err) = self.client.did_change(&self.path, version, &text.to_string()) {
+        if let Err(err) = self.client.did_change(&self.path, version, &self.server_text(text)) {
             tracing::warn!("didChange {}: {err:#}", self.path.display());
         }
         *self.synced.borrow_mut() = text.clone();
@@ -497,10 +608,11 @@ impl CompletionProvider for LspCompletion {
                 trigger_character: None,
             },
         };
-        let request = self.doc.client.completion(&self.doc.path, position, Some(context));
+        let shift = self.doc.shift;
+        let request = self.doc.client.completion(&self.doc.path, shift.to_server(position), Some(context));
         cx.background_spawn(async move {
             let response = request.await?.unwrap_or(CompletionResponse::Array(Vec::new()));
-            Ok(rank_completions(response, &word))
+            Ok(rank_completions(shift.completions(response), &word))
         })
     }
 
@@ -607,9 +719,16 @@ impl HoverProvider for LspHover {
         cx: &mut App,
     ) -> Task<Result<Option<lsp_types::Hover>>> {
         self.doc.sync(text);
-        let position = text.offset_to_position(offset);
+        let shift = self.doc.shift;
+        let position = shift.to_server(text.offset_to_position(offset));
         let request = self.doc.client.hover(&self.doc.path, position);
-        cx.background_spawn(request)
+        cx.background_spawn(async move {
+            let hover = request.await?;
+            Ok(hover.map(|mut hover| {
+                hover.range = hover.range.and_then(|range| shift.range_from_server(range));
+                hover
+            }))
+        })
     }
 }
 
@@ -805,6 +924,15 @@ pub fn install_providers(doc: &Rc<LspDocument>, input: &mut InputState) {
     };
 }
 
+/// Completion and hover for a notebook cell. Go to definition and code
+/// actions are left out: they would act on the server's text around the
+/// cell.
+pub fn install_cell_providers(doc: &Rc<LspDocument>, input: &mut InputState) {
+    install_providers(doc, input);
+    input.lsp.definition_provider = None;
+    input.lsp.code_action_providers.clear();
+}
+
 pub fn remove_providers(input: &mut InputState) {
     input.lsp.completion_provider = None;
     input.lsp.hover_provider = None;
@@ -860,6 +988,35 @@ mod tests {
         let (edits, others) = edits_for_path(&workspace_edit, &here);
         assert_eq!(edits.len(), 2);
         assert_eq!(others, 1);
+    }
+
+    #[test]
+    fn cell_positions_shift_by_the_prefix() {
+        use lsp_types::{Position, Range};
+        let shift = LineShift(4);
+        assert_eq!(shift.to_server(Position::new(0, 3)), Position::new(4, 3));
+        assert_eq!(shift.from_server(Position::new(5, 2)), Some(Position::new(1, 2)));
+        assert_eq!(shift.from_server(Position::new(3, 0)), None);
+
+        let item = |range: Range, import: Range| CompletionItem {
+            label: "HashMap".into(),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(range, "HashMap".into()))),
+            additional_text_edits: Some(vec![TextEdit::new(import, "use std::collections::HashMap;\n".into())]),
+            ..Default::default()
+        };
+        let at = |line, col| Position::new(line, col);
+        let response = CompletionResponse::Array(vec![
+            item(Range::new(at(6, 4), at(6, 8)), Range::new(at(1, 0), at(1, 0))),
+            // An edit that would change the hidden text is dropped.
+            item(Range::new(at(1, 0), at(1, 4)), Range::new(at(1, 0), at(2, 0))),
+        ]);
+        let CompletionResponse::Array(items) = shift.completions(response) else { panic!() };
+        let Some(CompletionTextEdit::Edit(edit)) = &items[0].text_edit else { panic!() };
+        assert_eq!(edit.range, Range::new(at(2, 4), at(2, 8)));
+        // The import goes at the top of the cell.
+        assert_eq!(items[0].additional_text_edits.as_ref().unwrap()[0].range, Range::default());
+        assert!(items[1].text_edit.is_none());
+        assert!(items[1].additional_text_edits.as_ref().unwrap().is_empty());
     }
 
     #[test]

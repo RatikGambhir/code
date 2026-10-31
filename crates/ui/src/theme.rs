@@ -1,4 +1,4 @@
-//! Cockpit's look.
+//! Hangar's look.
 //!
 //! Everything is derived from three choices the user makes: an accent colour,
 //! how strongly the window frame is tinted by it, and light or dark. The
@@ -469,7 +469,7 @@ fn highlight_theme(t: &Tokens) -> Option<Arc<HighlightTheme>> {
     let style = serde_json::Value::Object(style);
     match serde_json::from_value::<HighlightThemeStyle>(style) {
         Ok(style) => Some(Arc::new(HighlightTheme {
-            name: "Cockpit".into(),
+            name: "Hangar".into(),
             appearance: if t.dark { ThemeMode::Dark } else { ThemeMode::Light },
             style,
         })),

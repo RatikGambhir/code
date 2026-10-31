@@ -1023,23 +1023,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cockpit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-channel 2.5.0",
- "cockpit-agents",
- "cockpit-browser",
- "cockpit-common",
- "cockpit-persistence",
- "cockpit-ui",
- "gpui",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "cockpit-agents"
 version = "0.1.0"
 dependencies = [
@@ -1087,6 +1070,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-debugger"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "cockpit-common",
+ "cockpit-editor",
+ "futures",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "cockpit-editor"
 version = "0.1.0"
 dependencies = [
@@ -1115,6 +1116,25 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "cockpit-notebook"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "cockpit-common",
+ "cockpit-debugger",
+ "cockpit-editor",
+ "futures",
+ "lsp-types",
+ "parking_lot",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]
@@ -1174,8 +1194,10 @@ dependencies = [
  "cockpit-agents",
  "cockpit-browser",
  "cockpit-common",
+ "cockpit-debugger",
  "cockpit-editor",
  "cockpit-git",
+ "cockpit-notebook",
  "cockpit-orchestrator",
  "cockpit-persistence",
  "cockpit-terminal",
@@ -2699,8 +2721,6 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d021d46b4088d3d93a57ccdf443da85695a77272108caca2f6fe5369f584966a"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2984,6 +3004,23 @@ dependencies = [
  "crunchy",
  "num-traits",
  "zerocopy",
+]
+
+[[package]]
+name = "hangar"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "cockpit-agents",
+ "cockpit-browser",
+ "cockpit-common",
+ "cockpit-persistence",
+ "cockpit-ui",
+ "gpui",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

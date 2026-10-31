@@ -1,4 +1,4 @@
-//! The subset of the Codex App Server protocol (v2) that Cockpit speaks.
+//! The subset of the Codex App Server protocol (v2) that Hangar speaks.
 //!
 //! Field names and shapes follow the schema `codex app-server generate-ts`
 //! emits (checked against codex-cli 0.163). The Claude backend

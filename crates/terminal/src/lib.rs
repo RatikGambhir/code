@@ -289,7 +289,7 @@ fn spawn_reader(
     };
 
     std::thread::Builder::new()
-        .name("cockpit-pty-reader".into())
+        .name("hangar-pty-reader".into())
         .spawn(move || {
             let mut buf = vec![0u8; 64 * 1024];
             loop {

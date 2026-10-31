@@ -44,7 +44,7 @@ pub fn key_chip(keys: impl Into<SharedString>, cx: &App) -> Div {
         .child(keys.into())
 }
 
-/// Cockpit's mark: a 2×2 grid of rounded tiles in the accent.
+/// Hangar's mark: a 2×2 grid of rounded tiles in the accent.
 pub fn logo_mark(size: f32, cx: &App) -> Div {
     let accent = tokens(cx).accent;
     let tile = size * 0.42;

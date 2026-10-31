@@ -12,12 +12,13 @@ echo "==> tests"
 cargo test --quiet \
   -p cockpit-common -p cockpit-persistence -p cockpit-git -p cockpit-terminal \
   -p cockpit-editor -p cockpit-agents -p cockpit-orchestrator -p cockpit-browser \
+  -p cockpit-debugger -p cockpit-notebook \
   -p xtask
 
 echo "==> UI and app (host)"
 # Linking GPUI's tests on Linux needs the X11/Wayland development libraries.
 cargo test --quiet -p cockpit-ui --lib
-cargo check --quiet -p cockpit --all-targets
+cargo check --quiet -p hangar --all-targets
 
 echo "==> Chromium backend (macOS, type-check only)"
 rustup target add aarch64-apple-darwin >/dev/null 2>&1 || true

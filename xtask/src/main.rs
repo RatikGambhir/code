@@ -9,12 +9,12 @@
 //! the `.app` layout. `bundle` builds both executables and assembles
 //!
 //! ```text
-//! Cockpit.app/Contents/
+//! Hangar.app/Contents/
 //!   Info.plist
-//!   MacOS/Cockpit
-//!   Resources/Cockpit.icns                      (if packaging/macos has one)
+//!   MacOS/Hangar
+//!   Resources/Hangar.icns                      (if packaging/macos has one)
 //!   Frameworks/Chromium Embedded Framework.framework
-//!   Frameworks/Cockpit Helper.app               (and (GPU), (Renderer),
+//!   Frameworks/Hangar Helper.app               (and (GPU), (Renderer),
 //!                                                (Plugin), (Alerts))
 //! ```
 //!
@@ -32,10 +32,10 @@ use std::{
 
 use anyhow::{bail, Context as _, Result};
 
-const APP_NAME: &str = "Cockpit";
-const BUNDLE_ID: &str = "dev.cockpit.ide";
-const MAIN_BIN: &str = "cockpit";
-const HELPER_BIN: &str = "cockpit-helper";
+const APP_NAME: &str = "Hangar";
+const BUNDLE_ID: &str = "dev.hangar.ide";
+const MAIN_BIN: &str = "hangar";
+const HELPER_BIN: &str = "hangar-helper";
 const FRAMEWORK: &str = "Chromium Embedded Framework.framework";
 const MIN_MACOS: &str = "12.0";
 
@@ -143,7 +143,7 @@ fn bundle(options: BundleOptions) -> Result<()> {
     let mut cargo = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     cargo
         .current_dir(&root)
-        .args(["build", "--package", "cockpit", "--bins"]);
+        .args(["build", "--package", "hangar", "--bins"]);
     if options.release {
         cargo.arg("--release");
     }
@@ -296,7 +296,7 @@ fn sign(app: &Path, identity: Option<&str>, entitlements: &Path) -> Result<()> {
             Some(entitlements_file),
         )?;
     }
-    codesign(app, Some("Cockpit.entitlements"))
+    codesign(app, Some("Hangar.entitlements"))
 }
 
 fn run_command(command: &mut Command, what: &str) -> Result<()> {
@@ -378,13 +378,13 @@ fn main_info_plist(has_icon: bool) -> String {
         ("CFBundleDisplayName", Value::Str(APP_NAME)),
         ("LSApplicationCategoryType", Value::Str("public.app-category.developer-tools")),
         ("NSHighResolutionCapable", Value::Bool(true)),
-        ("NSCameraUsageDescription", Value::Str("A web page in Cockpit's browser wants to use the camera.")),
+        ("NSCameraUsageDescription", Value::Str("A web page in Hangar's browser wants to use the camera.")),
         (
             "NSMicrophoneUsageDescription",
-            Value::Str("A web page in Cockpit's browser wants to use the microphone."),
+            Value::Str("A web page in Hangar's browser wants to use the microphone."),
         ),
         // Folders can be dropped on the Dock icon or opened with
-        // `open -a Cockpit <folder>`.
+        // `open -a Hangar <folder>`.
         (
             "CFBundleDocumentTypes",
             Value::Array(vec![Value::Dict(vec![
@@ -416,22 +416,22 @@ mod tests {
     #[test]
     fn plists_are_well_formed_enough() {
         let main = main_info_plist(false);
-        assert!(main.contains("<key>CFBundleExecutable</key>\n\t<string>Cockpit</string>"));
+        assert!(main.contains("<key>CFBundleExecutable</key>\n\t<string>Hangar</string>"));
         assert!(!main.contains("CFBundleIconFile"));
         assert_eq!(main.matches("<dict>").count(), main.matches("</dict>").count());
         assert!(main.contains("<array>\n\t\t<dict>"));
         assert!(main.contains("<string>public.folder</string>"));
 
-        let helper = helper_info_plist("Cockpit Helper (GPU)", "helper.gpu");
-        assert!(helper.contains("<string>dev.cockpit.ide.helper.gpu</string>"));
+        let helper = helper_info_plist("Hangar Helper (GPU)", "helper.gpu");
+        assert!(helper.contains("<string>dev.hangar.ide.helper.gpu</string>"));
         assert!(helper.contains("<key>LSUIElement</key>"));
     }
 
     #[test]
     fn helper_names_match_what_chromium_looks_for() {
         let names: Vec<String> = HELPERS.iter().map(|(s, _, _)| format!("{APP_NAME} Helper{s}")).collect();
-        assert!(names.contains(&"Cockpit Helper (Renderer)".to_string()));
-        assert!(names.contains(&"Cockpit Helper".to_string()));
+        assert!(names.contains(&"Hangar Helper (Renderer)".to_string()));
+        assert!(names.contains(&"Hangar Helper".to_string()));
     }
 
     #[test]

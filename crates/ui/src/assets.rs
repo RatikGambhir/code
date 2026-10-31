@@ -1,4 +1,4 @@
-//! Asset source: gpui-component's icon set plus Cockpit's own icons.
+//! Asset source: gpui-component's icon set plus Hangar's own icons.
 
 use std::borrow::Cow;
 
@@ -8,6 +8,13 @@ use gpui_component::Icon;
 
 /// Extra Lucide icons (ISC licensed, see `assets/icons/LICENSE-lucide.txt`).
 const ICONS: &[(&str, &[u8])] = &[
+    ("icons/cockpit/arrow-down-to-dot.svg", include_bytes!("../../../assets/icons/arrow-down-to-dot.svg")),
+    ("icons/cockpit/arrow-right-to-line.svg", include_bytes!("../../../assets/icons/arrow-right-to-line.svg")),
+    ("icons/cockpit/arrow-up-from-dot.svg", include_bytes!("../../../assets/icons/arrow-up-from-dot.svg")),
+    ("icons/cockpit/bug.svg", include_bytes!("../../../assets/icons/bug.svg")),
+    ("icons/cockpit/list-tree.svg", include_bytes!("../../../assets/icons/list-tree.svg")),
+    ("icons/cockpit/pause.svg", include_bytes!("../../../assets/icons/pause.svg")),
+    ("icons/cockpit/redo-dot.svg", include_bytes!("../../../assets/icons/redo-dot.svg")),
     ("icons/cockpit/arrow-up.svg", include_bytes!("../../../assets/icons/arrow-up.svg")),
     ("icons/cockpit/circle-dot.svg", include_bytes!("../../../assets/icons/circle-dot.svg")),
     ("icons/cockpit/circle-stop.svg", include_bytes!("../../../assets/icons/circle-stop.svg")),
@@ -30,6 +37,11 @@ const ICONS: &[(&str, &[u8])] = &[
     ("icons/cockpit/terminal.svg", include_bytes!("../../../assets/icons/terminal.svg")),
     ("icons/cockpit/wrench.svg", include_bytes!("../../../assets/icons/wrench.svg")),
     ("icons/cockpit/x.svg", include_bytes!("../../../assets/icons/x.svg")),
+    ("icons/cockpit/archive.svg", include_bytes!("../../../assets/icons/archive.svg")),
+    ("icons/cockpit/external-link.svg", include_bytes!("../../../assets/icons/external-link.svg")),
+    ("icons/cockpit/message-square.svg", include_bytes!("../../../assets/icons/message-square.svg")),
+    ("icons/cockpit/square-pen.svg", include_bytes!("../../../assets/icons/square-pen.svg")),
+    ("icons/cockpit/notebook-pen.svg", include_bytes!("../../../assets/icons/notebook-pen.svg")),
 ];
 
 pub struct Assets;
@@ -54,7 +66,7 @@ impl AssetSource for Assets {
     }
 }
 
-/// One of Cockpit's own icons, by file stem (`"git-branch"`).
+/// One of Hangar's own icons, by file stem (`"git-branch"`).
 pub fn icon(name: &str) -> Icon {
     Icon::empty().path(SharedString::from(format!("icons/cockpit/{name}.svg")))
 }

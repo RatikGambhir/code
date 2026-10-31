@@ -1,6 +1,6 @@
 //! Agent integrations: OpenAI Codex and Anthropic Claude.
 //!
-//! Cockpit drives Codex through its App Server (`codex app-server`), the
+//! Hangar drives Codex through its App Server (`codex app-server`), the
 //! same JSON-RPC interface the official IDE extensions use, and Claude
 //! through Claude Code's headless stream-json mode ([`claude`]), the
 //! interface the Claude Agent SDK uses. This crate is the Codex transport

@@ -1,15 +1,15 @@
 //! End-to-end checks against a real Claude Code.
 //!
-//! Skipped unless `COCKPIT_CLAUDE_BIN` points at a `claude` executable:
+//! Skipped unless `HANGAR_CLAUDE_BIN` points at a `claude` executable:
 //!
 //! ```sh
-//! COCKPIT_CLAUDE_BIN=$(which claude) cargo test -p cockpit-agents --test live_claude
+//! HANGAR_CLAUDE_BIN=$(which claude) cargo test -p cockpit-agents --test live_claude
 //! ```
 //!
 //! This starts Claude Code and reads its version, account and model list,
-//! which bills nothing. Set `COCKPIT_CLAUDE_LIVE_TURN=1` as well to send a
+//! which bills nothing. Set `HANGAR_CLAUDE_LIVE_TURN=1` as well to send a
 //! real prompt on the account Claude Code is signed in to (it uses
-//! `COCKPIT_CLAUDE_LIVE_MODEL`, Claude Haiku 5.5 by default).
+//! `HANGAR_CLAUDE_LIVE_MODEL`, Claude Haiku 5.5 by default).
 
 use std::time::Duration;
 
@@ -20,8 +20,8 @@ use cockpit_agents::{
 
 #[test]
 fn version_account_models_and_a_turn_against_claude_code() {
-    let Some(bin) = std::env::var_os("COCKPIT_CLAUDE_BIN") else {
-        eprintln!("COCKPIT_CLAUDE_BIN not set; skipping");
+    let Some(bin) = std::env::var_os("HANGAR_CLAUDE_BIN") else {
+        eprintln!("HANGAR_CLAUDE_BIN not set; skipping");
         return;
     };
     let runtime = AgentRuntime::new().unwrap();
@@ -38,12 +38,12 @@ fn version_account_models_and_a_turn_against_claude_code() {
     assert_eq!(models[0].id, cockpit_agents::claude::DEFAULT_MODEL);
     eprintln!("models: {:?}", models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>());
 
-    if std::env::var_os("COCKPIT_CLAUDE_LIVE_TURN").is_none() {
+    if std::env::var_os("HANGAR_CLAUDE_LIVE_TURN").is_none() {
         connection.backend.shutdown();
         return;
     }
 
-    let model = std::env::var("COCKPIT_CLAUDE_LIVE_MODEL").unwrap_or_else(|_| "claude-haiku-5-5".into());
+    let model = std::env::var("HANGAR_CLAUDE_LIVE_MODEL").unwrap_or_else(|_| "claude-haiku-5-5".into());
     let thread = futures::executor::block_on(connection.backend.start_thread(ThreadConfig {
         cwd: Some(workdir.path().to_string_lossy().into_owned()),
         model: Some(model.clone()),

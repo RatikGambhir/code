@@ -98,7 +98,7 @@ impl CefRuntime {
         let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
 
         let args = Args::new();
-        let mut app = handlers::CockpitApp::new(handlers::AppConfig {
+        let mut app = handlers::HangarApp::new(handlers::AppConfig {
             remote_debugging_port: options.remote_debugging_port,
         });
         let code = cef::execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
@@ -182,7 +182,7 @@ impl CefRuntime {
 pub fn run_helper() -> i32 {
     let args = Args::new();
     // Helpers enter the sandbox before loading anything else. With
-    // `--no-sandbox` (COCKPIT_CEF_NO_SANDBOX) there is nothing to enter.
+    // `--no-sandbox` (HANGAR_CEF_NO_SANDBOX) there is nothing to enter.
     let _sandbox = (!std::env::args().any(|arg| arg == "--no-sandbox")).then(|| {
         let mut sandbox = cef::sandbox::Sandbox::new();
         sandbox.initialize(args.as_main_args());
@@ -195,7 +195,7 @@ pub fn run_helper() -> i32 {
         return 1;
     }
     let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
-    let mut app = handlers::CockpitApp::new(handlers::AppConfig {
+    let mut app = handlers::HangarApp::new(handlers::AppConfig {
         remote_debugging_port: None,
     });
     cef::execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut())

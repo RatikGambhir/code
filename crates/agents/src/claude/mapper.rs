@@ -1,4 +1,4 @@
-//! Claude Code's stream-json protocol, mapped onto Cockpit's events.
+//! Claude Code's stream-json protocol, mapped onto Hangar's events.
 //!
 //! `claude -p --input-format stream-json --output-format stream-json` writes
 //! one JSON object per line: `system`, `assistant`, `user` (tool results),
@@ -37,7 +37,7 @@ pub enum Output {
 }
 
 /// An in-process MCP server Claude Code can call (`type: "sdk"` in
-/// `--mcp-config`). Cockpit's dynamic tools (the IDE browser) are offered to
+/// `--mcp-config`). Hangar's dynamic tools (the IDE browser) are offered to
 /// Claude this way, so they go through the same tool policy as for Codex.
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpServerSpec {
@@ -54,7 +54,7 @@ pub struct McpToolSpec {
 
 impl McpServerSpec {
     /// One server per dynamic tool namespace; loose functions share a
-    /// `cockpit` server.
+    /// `hangar` server.
     pub fn from_dynamic(specs: &[DynamicToolSpec]) -> Vec<McpServerSpec> {
         let mut servers: Vec<McpServerSpec> = Vec::new();
         let mut loose = Vec::new();
@@ -68,7 +68,7 @@ impl McpServerSpec {
             }
         }
         if !loose.is_empty() {
-            servers.push(McpServerSpec { name: "cockpit".into(), tools: loose });
+            servers.push(McpServerSpec { name: "hangar".into(), tools: loose });
         }
         servers
     }
@@ -658,7 +658,7 @@ impl Mapper {
             Some("mcp_message") => self.on_mcp_message(request_id, request, out),
             other => out.push(Output::Write(control_error(
                 &request_id,
-                &format!("Cockpit does not support the {} control request", other.unwrap_or("unnamed")),
+                &format!("Hangar does not support the {} control request", other.unwrap_or("unnamed")),
             ))),
         }
     }
@@ -736,7 +736,7 @@ impl Mapper {
                 if let Some(id) = &context.tool_use_id {
                     self.denied.insert(id.clone());
                 }
-                let mut deny = json!({"behavior": "deny", "message": "The user declined this action in Cockpit."});
+                let mut deny = json!({"behavior": "deny", "message": "The user declined this action in Hangar."});
                 if decision == ApprovalDecision::Cancel {
                     deny["interrupt"] = json!(true);
                     self.interrupt();
@@ -803,7 +803,7 @@ impl Mapper {
         out.push(Output::Write(mcp_reply(&request_id, Some(id), reply)));
     }
 
-    /// Cockpit's answer to a dynamic tool call, as the line to send back.
+    /// Hangar's answer to a dynamic tool call, as the line to send back.
     pub fn tool_reply(&mut self, request_id: &str, response: &DynamicToolCallResponse) -> Option<Value> {
         let call = self.mcp_calls.remove(request_id)?;
         let content: Vec<Value> = response
