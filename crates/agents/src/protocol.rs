@@ -1,7 +1,9 @@
 //! The subset of the Codex App Server protocol (v2) that Cockpit speaks.
 //!
 //! Field names and shapes follow the schema `codex app-server generate-ts`
-//! emits (checked against codex-cli 0.163). The server evolves quickly, so
+//! emits (checked against codex-cli 0.163). The Claude backend
+//! ([`crate::claude`]) maps Claude Code's messages onto these same types, so
+//! the transcript and the UI have one vocabulary for both providers. The server evolves quickly, so
 //! everything here is written to *tolerate* drift: unknown fields are
 //! ignored, optional fields default, and unknown enum values or item types
 //! decode to an `Unknown`/`Other` variant instead of failing the message.
@@ -375,6 +377,18 @@ pub enum ThreadItem {
         #[serde(default)]
         id: String,
     },
+    /// A built-in tool call with a one-line summary (Claude's Read, Grep,
+    /// WebFetch…). Codex never sends it; the Claude backend builds it.
+    #[serde(rename = "cockpitToolCall", rename_all = "camelCase")]
+    ToolCall {
+        id: String,
+        #[serde(default)]
+        tool: String,
+        #[serde(default)]
+        detail: Option<String>,
+        #[serde(default)]
+        success: Option<bool>,
+    },
     /// Item types this build does not render.
     #[serde(other)]
     Other,
@@ -392,6 +406,7 @@ impl ThreadItem {
             | ThreadItem::McpToolCall { id, .. }
             | ThreadItem::DynamicToolCall { id, .. }
             | ThreadItem::WebSearch { id, .. }
+            | ThreadItem::ToolCall { id, .. }
             | ThreadItem::ContextCompaction { id } => Some(id),
             ThreadItem::Other => None,
         }
@@ -481,6 +496,18 @@ pub struct TokenUsageBreakdown {
 }
 
 impl TokenUsageBreakdown {
+    /// Component-wise sum, used to keep running totals.
+    pub fn saturating_add(&self, other: &TokenUsageBreakdown) -> TokenUsageBreakdown {
+        TokenUsageBreakdown {
+            total_tokens: self.total_tokens.saturating_add(other.total_tokens),
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            cached_input_tokens: self.cached_input_tokens.saturating_add(other.cached_input_tokens),
+            cache_write_input_tokens: self.cache_write_input_tokens.saturating_add(other.cache_write_input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            reasoning_output_tokens: self.reasoning_output_tokens.saturating_add(other.reasoning_output_tokens),
+        }
+    }
+
     /// Component-wise `self - earlier`, clamped at zero. Used to turn the
     /// server's running totals into per-update deltas.
     pub fn saturating_sub(&self, earlier: &TokenUsageBreakdown) -> TokenUsageBreakdown {
@@ -731,6 +758,17 @@ pub enum Account {
         #[serde(default)]
         plan_type: Value,
     },
+    /// Signed in to Claude Code (built from `claude auth status`).
+    #[serde(rename_all = "camelCase")]
+    Claude {
+        #[serde(default)]
+        email: Option<String>,
+        /// "claude.ai", "console", an API key or a cloud provider.
+        #[serde(default)]
+        method: Option<String>,
+        #[serde(default)]
+        plan: Option<String>,
+    },
     #[serde(other)]
     Other,
 }
@@ -739,6 +777,8 @@ pub enum Account {
 #[serde(rename_all = "camelCase", default)]
 pub struct GetAccountResponse {
     pub account: Option<Account>,
+    /// The backend needs a sign-in before it can run turns. (Codex's name
+    /// for it; the Claude backend sets it too.)
     pub requires_openai_auth: bool,
 }
 

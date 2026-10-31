@@ -1,7 +1,8 @@
-//! The Codex side of a workspace: connection, threads, turns, approvals,
-//! browser tool calls and usage accounting. The panel renders it.
+//! The agent side of a workspace: connection (Codex or Claude), threads,
+//! turns, approvals, browser tool calls and usage accounting. The panel
+//! renders it.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
 use chrono::Local;
 use cockpit_agents::{
@@ -9,14 +10,14 @@ use cockpit_agents::{
         ApprovalDecision, DynamicToolCallResponse, GetAccountResponse, LoginParams, LoginResponse,
         Model, ThreadItem, UserInput,
     },
-    AgentBackend, AgentEvent, ApprovalState, Connection, Prompt, ToolCall, Transcript,
+    AgentBackend, AgentEvent, ApprovalState, Connection, Prompt, Provider, ToolCall, Transcript,
 };
 use cockpit_browser::BrowserAction;
 use cockpit_orchestrator::{
     admit_turn, Admission, AgentPolicy, AutoDecision, Dispatch, Orchestrator, PermissionPreset,
     QueuedPrompt, ToolDecision, TurnContext,
 };
-use cockpit_persistence::{now_ts, AgentThreadRecord, TokenCounts, UsageFilter};
+use cockpit_persistence::{now_ts, AgentThreadRecord, TokenCounts, UsageFilter, UsageRecord};
 use gpui::{App, AppContext as _, Context, EventEmitter, SharedString, Task};
 
 use crate::state::AppState;
@@ -27,7 +28,7 @@ const POLICY_KEY: &str = "global";
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectionState {
     Idle,
-    /// `codex` was not found.
+    /// The provider's CLI (`codex`, `claude`) was not found.
     NotInstalled,
     Connecting,
     Connected { user_agent: String },
@@ -54,21 +55,33 @@ pub struct PendingToolCall {
 pub enum AgentControllerEvent {
     /// Something to show the user outside the panel.
     Notify(SharedString),
-    /// Run a browser action for Codex and answer with `respond_tool_call`.
+    /// Run a browser action for the agent and answer with `respond_tool_call`.
     RunBrowserAction { call: Box<ToolCall>, action: BrowserAction },
-    /// Codex edited these files.
+    /// The agent edited these files.
     FilesChanged(Vec<PathBuf>),
+    /// Run a program in a new terminal tab (Claude Code's interactive
+    /// sign-in, which owns the credentials).
+    RunInTerminal { program: String, args: Vec<String> },
 }
+
+type Connecting = Pin<Box<dyn Future<Output = anyhow::Result<Connection>> + Send>>;
 
 pub struct AgentController {
     workspace_id: i64,
     cwd: PathBuf,
+    provider: Provider,
+    /// Bumped on every (re)connect, so a connection that finishes after the
+    /// user switched provider is dropped instead of installed.
+    connection_generation: u64,
     state: ConnectionState,
     backend: Option<Arc<dyn AgentBackend>>,
     models: Vec<Model>,
     account: Option<GetAccountResponse>,
     login: Option<LoginResponse>,
+    /// The current provider's threads.
     threads: Vec<ThreadSession>,
+    /// The other provider's threads, swapped in when the user switches.
+    parked_threads: Vec<ThreadSession>,
     active: Option<String>,
     orchestrator: Orchestrator,
     pending_tools: Vec<PendingToolCall>,
@@ -81,7 +94,10 @@ pub struct AgentController {
     usage_today: i64,
     /// A prompt typed before any thread existed; sent once one is created.
     first_prompt: Option<String>,
+    /// Claude Code's sign-in is running in a terminal.
+    terminal_login: bool,
     _events: Option<Task<()>>,
+    _login_poll: Option<Task<()>>,
 }
 
 impl EventEmitter<AgentControllerEvent> for AgentController {}
@@ -89,25 +105,35 @@ impl EventEmitter<AgentControllerEvent> for AgentController {}
 impl AgentController {
     pub fn new(workspace_id: i64, cwd: PathBuf, cx: &mut Context<Self>) -> Self {
         let settings = AppState::global(cx).settings.clone();
+        let provider = settings.agent_provider;
+        let (model, effort) = match provider {
+            Provider::OpenAi => (settings.default_model, settings.default_effort),
+            Provider::Anthropic => (settings.claude_model, settings.claude_effort),
+        };
         let controller = Self {
             workspace_id,
             cwd,
+            provider,
+            connection_generation: 0,
             state: ConnectionState::Idle,
             backend: None,
             models: Vec::new(),
             account: None,
             login: None,
             threads: Vec::new(),
+            parked_threads: Vec::new(),
             active: None,
             orchestrator: Orchestrator::new(AgentPolicy::default()),
             pending_tools: Vec::new(),
-            model: settings.default_model,
-            effort: settings.default_effort,
+            model,
+            effort,
             browser_tools: settings.agent_browser_tools,
             agent_browser_url: None,
             usage_today: 0,
             first_prompt: None,
+            terminal_login: false,
             _events: None,
+            _login_poll: None,
         };
         controller.load_saved_state(cx);
         controller
@@ -131,10 +157,15 @@ impl AgentController {
                             this.orchestrator.set_policy(policy);
                         }
                         for record in threads {
-                            if this.threads.iter().any(|t| t.id == record.thread_id) {
+                            if this.threads.iter().chain(&this.parked_threads).any(|t| t.id == record.thread_id) {
                                 continue;
                             }
-                            this.threads.push(ThreadSession {
+                            let list = if Provider::from_key(record.provider.as_deref()) == this.provider {
+                                &mut this.threads
+                            } else {
+                                &mut this.parked_threads
+                            };
+                            list.push(ThreadSession {
                                 title: record
                                     .title
                                     .clone()
@@ -161,6 +192,20 @@ impl AgentController {
 
     pub fn state(&self) -> &ConnectionState {
         &self.state
+    }
+
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    /// "Codex" or "Claude", for messages.
+    pub fn agent_name(&self) -> &'static str {
+        self.provider.agent_name()
+    }
+
+    /// Claude Code's sign-in is running in a terminal tab.
+    pub fn terminal_login(&self) -> bool {
+        self.terminal_login
     }
 
     pub fn cwd(&self) -> &std::path::Path {
@@ -242,22 +287,40 @@ impl AgentController {
             return;
         }
         let state = AppState::global(cx);
-        let Some(launch) = state.codex_launch() else {
+        let connecting: Option<Connecting> = match self.provider {
+            // The experimental API is what allows client-side (browser) tools.
+            Provider::OpenAi => state
+                .codex_launch()
+                .map(|launch| Box::pin(state.agents.connect_codex(launch, self.cwd.clone(), true)) as Connecting),
+            Provider::Anthropic => state
+                .claude_launch()
+                .map(|launch| Box::pin(state.agents.connect_claude(launch, self.cwd.clone())) as Connecting),
+        };
+        let Some(connecting) = connecting else {
             self.state = ConnectionState::NotInstalled;
             cx.notify();
             return;
         };
-        // The experimental API is what allows client-side (browser) tools.
-        let connecting = state.agents.connect_codex(launch, self.cwd.clone(), true);
+        self.connection_generation += 1;
+        let generation = self.connection_generation;
         self.state = ConnectionState::Connecting;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let connection = connecting.await;
-            this.update(cx, |this, cx| match connection {
-                Ok(connection) => this.on_connected(connection, cx),
-                Err(err) => {
-                    this.state = ConnectionState::Failed(format!("{err:#}"));
-                    cx.notify();
+            this.update(cx, |this, cx| {
+                if this.connection_generation != generation {
+                    // The user switched provider (or reconnected) meanwhile.
+                    if let Ok(connection) = connection {
+                        connection.backend.shutdown();
+                    }
+                    return;
+                }
+                match connection {
+                    Ok(connection) => this.on_connected(connection, cx),
+                    Err(err) => {
+                        this.state = ConnectionState::Failed(format!("{err:#}"));
+                        cx.notify();
+                    }
                 }
             })
         })
@@ -304,12 +367,24 @@ impl AgentController {
     fn refresh_account(&mut self, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else { return };
         let account = backend.account();
+        let provider = self.provider;
         cx.spawn(async move |this, cx| {
             let account = account.await;
             this.update(cx, |this, cx| {
+                if this.provider != provider {
+                    return;
+                }
                 match account {
-                    Ok(account) => this.account = Some(account),
-                    Err(err) => tracing::warn!("reading the Codex account: {err:#}"),
+                    Ok(account) => {
+                        this.account = Some(account);
+                        if this.terminal_login && !this.needs_login() {
+                            this.terminal_login = false;
+                            this._login_poll = None;
+                            let name = this.agent_name();
+                            cx.emit(AgentControllerEvent::Notify(format!("Signed in to {name}.").into()));
+                        }
+                    }
+                    Err(err) => tracing::warn!("reading the {} account: {err:#}", provider.agent_name()),
                 }
                 cx.notify();
             })
@@ -317,16 +392,52 @@ impl AgentController {
         .detach();
     }
 
-    pub fn reconnect(&mut self, cx: &mut Context<Self>) {
+    /// Drops the connection and everything that depended on it.
+    fn disconnect(&mut self) {
         if let Some(backend) = self.backend.take() {
             backend.shutdown();
         }
         self._events = None;
+        self._login_poll = None;
+        self.terminal_login = false;
+        self.connection_generation += 1;
         self.state = ConnectionState::Idle;
+        self.pending_tools.clear();
         for thread in &mut self.threads {
             thread.loaded = false;
+            thread.loading = false;
+            self.orchestrator.cancel_queued(&thread.id);
+            self.orchestrator.turn_finished(&thread.id);
         }
+    }
+
+    pub fn reconnect(&mut self, cx: &mut Context<Self>) {
+        self.disconnect();
         self.connect(cx);
+    }
+
+    /// Switches the panel to another provider's agent. Its threads, model
+    /// and sign-in are separate; the choice is remembered.
+    pub fn set_provider(&mut self, provider: Provider, cx: &mut Context<Self>) {
+        if provider == self.provider {
+            return;
+        }
+        self.disconnect();
+        self.provider = provider;
+        self.models.clear();
+        self.account = None;
+        self.login = None;
+        self.first_prompt = None;
+        std::mem::swap(&mut self.threads, &mut self.parked_threads);
+        self.active = None;
+        let settings = &AppState::global(cx).settings;
+        (self.model, self.effort) = match provider {
+            Provider::OpenAi => (settings.default_model.clone(), settings.default_effort.clone()),
+            Provider::Anthropic => (settings.claude_model.clone(), settings.claude_effort.clone()),
+        };
+        AppState::save_settings(cx, |settings| settings.agent_provider = provider);
+        self.connect(cx);
+        cx.notify();
     }
 
     pub fn login_with_chatgpt(&mut self, cx: &mut Context<Self>) {
@@ -347,6 +458,58 @@ impl AgentController {
             })
         })
         .detach();
+    }
+
+    /// Starts Claude Code's own sign-in in a terminal tab: claude.ai (a
+    /// Claude plan) or, with `console`, an Anthropic Console account billed
+    /// per API use. Claude Code keeps the credentials.
+    pub fn login_with_claude(&mut self, console: bool, cx: &mut Context<Self>) {
+        let Some(launch) = AppState::global(cx).claude_launch() else {
+            self.state = ConnectionState::NotInstalled;
+            cx.notify();
+            return;
+        };
+        let flag = if console { "--console" } else { "--claudeai" };
+        cx.emit(AgentControllerEvent::RunInTerminal {
+            program: launch.program.to_string_lossy().into_owned(),
+            args: vec!["auth".into(), "login".into(), flag.into()],
+        });
+        self.terminal_login = true;
+        // Notice a fresh sign-in on its own; an expired one needs "Check
+        // again" (the status already says signed in).
+        self._login_poll = Some(cx.spawn(async move |this, cx| {
+            for _ in 0..200 {
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        if this.terminal_login && this.needs_login() {
+                            this.refresh_account(cx);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    /// The user finished signing in (in the terminal); look again.
+    pub fn check_login(&mut self, cx: &mut Context<Self>) {
+        if let Some(backend) = &self.backend {
+            backend.forget_auth_failure();
+        }
+        self.refresh_account(cx);
+    }
+
+    pub fn cancel_terminal_login(&mut self, cx: &mut Context<Self>) {
+        self.terminal_login = false;
+        self._login_poll = None;
+        cx.notify();
     }
 
     pub fn login_with_api_key(&mut self, api_key: String, cx: &mut Context<Self>) {
@@ -370,16 +533,27 @@ impl AgentController {
         self.model = model.clone();
         // The previous effort may not exist for the new model.
         self.effort = None;
-        AppState::save_settings(cx, |settings| {
-            settings.default_model = model;
-            settings.default_effort = None;
+        let provider = self.provider;
+        AppState::save_settings(cx, |settings| match provider {
+            Provider::OpenAi => {
+                settings.default_model = model;
+                settings.default_effort = None;
+            }
+            Provider::Anthropic => {
+                settings.claude_model = model;
+                settings.claude_effort = None;
+            }
         });
         cx.notify();
     }
 
     pub fn set_effort(&mut self, effort: Option<String>, cx: &mut Context<Self>) {
         self.effort = effort.clone();
-        AppState::save_settings(cx, |settings| settings.default_effort = effort);
+        let provider = self.provider;
+        AppState::save_settings(cx, |settings| match provider {
+            Provider::OpenAi => settings.default_effort = effort,
+            Provider::Anthropic => settings.claude_effort = effort,
+        });
         cx.notify();
     }
 
@@ -418,7 +592,7 @@ impl AgentController {
 
     fn start_thread(&mut self, with_tools: bool, cx: &mut Context<Self>) {
         let Some(backend) = self.backend.clone() else {
-            cx.emit(AgentControllerEvent::Notify("Codex is not connected.".into()));
+            cx.emit(AgentControllerEvent::Notify(format!("{} is not connected.", self.agent_name()).into()));
             return;
         };
         let config = self.orchestrator.thread_config(
@@ -452,6 +626,7 @@ impl AgentController {
                         cwd: Some(this.cwd.to_string_lossy().into_owned()),
                         created_at: now_ts(),
                         updated_at: now_ts(),
+                        provider: Some(this.provider.key().into()),
                     };
                     AppState::global(cx)
                         .db
@@ -495,10 +670,13 @@ impl AgentController {
         if let Some(thread) = self.thread_mut(&id) {
             thread.loading = true;
         }
+        // Codex remembers a thread's tools; Claude Code gets them each time
+        // its process starts, so a resumed Claude thread needs them again.
+        let with_tools = self.provider == Provider::Anthropic && self.browser_tools;
         let config = self.orchestrator.thread_config(
             Some(self.cwd.to_string_lossy().into_owned()),
             None,
-            false,
+            with_tools,
         );
         let request = backend.resume_thread(id.clone(), config);
         cx.spawn(async move |this, cx| {
@@ -547,7 +725,7 @@ impl AgentController {
             return;
         }
         if self.backend.is_none() {
-            cx.emit(AgentControllerEvent::Notify("Codex is not connected.".into()));
+            cx.emit(AgentControllerEvent::Notify(format!("{} is not connected.", self.agent_name()).into()));
             return;
         }
         let Some(thread_id) = self.active.clone() else {
@@ -650,8 +828,9 @@ impl AgentController {
             let result = request.await;
             this.update(cx, |this, cx| {
                 if let Err(err) = result {
+                    let name = this.provider.agent_name();
                     if let Some(thread) = this.thread_mut(&thread_id) {
-                        thread.transcript.push_error(format!("Codex did not start the turn: {err:#}"));
+                        thread.transcript.push_error(format!("{name} did not start the turn: {err:#}"));
                     }
                     // Free the slot so queued prompts are not stuck.
                     if let Some(next) = this.orchestrator.turn_finished(&thread_id) {
@@ -697,7 +876,8 @@ impl AgentController {
     ) {
         if let Some(backend) = &self.backend {
             if let Err(err) = backend.resolve_approval(request_id, decision) {
-                cx.emit(AgentControllerEvent::Notify(format!("Could not answer Codex: {err:#}").into()));
+                let name = self.agent_name();
+                cx.emit(AgentControllerEvent::Notify(format!("Could not answer {name}: {err:#}").into()));
                 return;
             }
         }
@@ -722,7 +902,7 @@ impl AgentController {
                 self.respond_tool_call(&call, DynamicToolCallResponse::text(reason, false));
             }
             Ok((action, ToolDecision::NeedsApproval(reason))) => {
-                cx.emit(AgentControllerEvent::Notify(format!("Codex asks: {reason}").into()));
+                cx.emit(AgentControllerEvent::Notify(format!("{} asks: {reason}", self.agent_name()).into()));
                 self.pending_tools.push(PendingToolCall { call, action, reason });
             }
         }
@@ -766,6 +946,9 @@ impl AgentController {
             AgentEvent::ToolCallRequested(call) => self.on_tool_call(call.clone(), cx),
             AgentEvent::TokenUsage { thread_id, turn_id, usage } => {
                 self.record_usage(thread_id.clone(), turn_id.clone(), usage.total, cx)
+            }
+            AgentEvent::TurnUsage { thread_id, turn_id, usage, .. } => {
+                self.record_turn_usage(thread_id.clone(), turn_id.clone(), *usage, cx)
             }
             AgentEvent::ThreadNameUpdated { thread_id, name: Some(name) } => {
                 if let Some(thread) = self.thread_mut(thread_id) {
@@ -820,9 +1003,9 @@ impl AgentController {
                 let decision = self.orchestrator.auto_decide(approval);
                 let thread_id = approval.thread_id.clone();
                 match decision {
-                    AutoDecision::AskUser => {
-                        cx.emit(AgentControllerEvent::Notify("Codex is waiting for your approval.".into()))
-                    }
+                    AutoDecision::AskUser => cx.emit(AgentControllerEvent::Notify(
+                        format!("{} is waiting for your approval.", self.agent_name()).into(),
+                    )),
                     AutoDecision::Accept => {
                         self.resolve_approval(&thread_id, &approval.request_id, ApprovalDecision::Accept, cx);
                         if let Some(thread) = self.thread_mut(&thread_id) {
@@ -861,6 +1044,7 @@ impl AgentController {
             AgentEvent::ItemStarted { turn_id, .. }
             | AgentEvent::ItemCompleted { turn_id, .. }
             | AgentEvent::TokenUsage { turn_id, .. }
+            | AgentEvent::TurnUsage { turn_id, .. }
             | AgentEvent::Error { turn_id, .. } => Some(turn_id.clone()),
             _ => None,
         };
@@ -897,6 +1081,45 @@ impl AgentController {
         let write = AppState::global(cx).db.write(move |w| {
             w.record_thread_usage_total(&thread_id, Some(&turn_id), Some(workspace_id), &model, counts)
         });
+        cx.spawn(async move |this, cx| {
+            if let Err(err) = write.await {
+                tracing::warn!("recording token usage: {err:#}");
+            }
+            this.update(cx, |this, cx| this.refresh_usage(cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Records one turn's usage as reported by a backend that counts per
+    /// turn (Claude), rather than as a running total.
+    fn record_turn_usage(
+        &mut self,
+        thread_id: String,
+        turn_id: String,
+        usage: cockpit_agents::protocol::TokenUsageBreakdown,
+        cx: &mut Context<Self>,
+    ) {
+        let model = self
+            .threads
+            .iter()
+            .find(|t| t.id == thread_id)
+            .and_then(|t| t.model.clone())
+            .or_else(|| self.effective_model().map(|m| m.id.clone()))
+            .unwrap_or_else(|| "unknown".into());
+        let record = UsageRecord {
+            thread_id: Some(thread_id),
+            turn_id: Some(turn_id),
+            workspace_id: Some(self.workspace_id),
+            model,
+            counts: TokenCounts {
+                input_tokens: usage.input_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                output_tokens: usage.output_tokens,
+                reasoning_output_tokens: usage.reasoning_output_tokens,
+                total_tokens: usage.total_tokens,
+            },
+        };
+        let write = AppState::global(cx).db.write(move |w| w.record_usage(&record));
         cx.spawn(async move |this, cx| {
             if let Err(err) = write.await {
                 tracing::warn!("recording token usage: {err:#}");

@@ -23,4 +23,5 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+cockpit-common.workspace = true
 futures = { workspace = true, features = ["executor"] }

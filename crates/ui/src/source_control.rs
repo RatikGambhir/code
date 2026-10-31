@@ -12,10 +12,14 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement as _,
-    v_flex, ActiveTheme as _, Disableable as _, IconName, Sizable as _,
+    v_flex, Disableable as _, IconName, Sizable as _,
 };
 
-use crate::{assets::icon, theme};
+use crate::{
+    assets::icon,
+    chrome::{self, caps_label, panel_header},
+    theme::{self, tokens, RADIUS, TEXT_MONO, TEXT_SMALL},
+};
 
 pub enum SourceControlEvent {
     /// The repository status was refreshed.
@@ -243,6 +247,11 @@ impl SourceControl {
         .detach();
     }
 
+    /// Focuses the commit message.
+    pub fn focus_message(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.message.update(cx, |state, cx| state.focus(window, cx));
+    }
+
     fn has_staged(&self) -> bool {
         self.status.as_ref().is_some_and(|s| s.staged().next().is_some())
     }
@@ -280,17 +289,15 @@ impl SourceControl {
         entries: Vec<StatusEntry>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
+        let subtle = tokens(cx).fg_subtle;
         let all: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
-        let mut section = v_flex().child(
+        let mut section = v_flex().px(px(6.)).pb(px(6.)).child(
             h_flex()
-                .h(px(26.))
-                .px_3()
+                .h(px(28.))
+                .pl(px(8.))
                 .gap_1()
-                .text_xs()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(muted)
-                .child(div().flex_1().child(format!("{title} ({})", entries.len())))
+                .child(caps_label(title, cx))
+                .child(div().flex_1().text_size(TEXT_SMALL).text_color(subtle).child(entries.len().to_string()))
                 .child(
                     Button::new(if staged { "unstage-all" } else { "stage-all" })
                         .icon(if staged { IconName::Minus } else { IconName::Plus })
@@ -316,7 +323,8 @@ impl SourceControl {
     fn render_entry(&self, ix: usize, entry: StatusEntry, staged: bool, cx: &mut Context<Self>) -> AnyElement {
         let state = if staged { entry.index } else { entry.display_state() };
         let color = state_color(state, cx);
-        let muted = cx.theme().muted_foreground;
+        let t = tokens(cx);
+        let (muted, fg, mono) = (t.fg_subtle, t.fg, t.mono.clone());
         let path = Path::new(&entry.path);
         let name = path
             .file_name()
@@ -330,19 +338,22 @@ impl SourceControl {
         let prefix = if staged { "staged" } else { "unstaged" };
         let (open_path, action_path, discard_path) = (entry.path.clone(), entry.path.clone(), entry.path.clone());
 
-        h_flex()
-            .id((prefix, ix))
+        chrome::list_row((prefix, ix), false, cx)
             .group("scm-row")
-            .h(px(24.))
-            .pl_4()
-            .pr_2()
-            .gap_1()
-            .text_sm()
-            .cursor_pointer()
-            .hover(|el| el.bg(theme::hover_overlay(cx)))
+            .pr(px(4.))
+            .gap(px(4.))
             .on_click(cx.listener(move |this, _, _, cx| this.open_diff(open_path.clone(), staged, cx)))
-            .child(div().flex_shrink().truncate().text_color(color).child(name))
-            .child(div().flex_1().min_w_0().truncate().text_xs().text_color(muted).child(dir))
+            .child(
+                div()
+                    .flex_shrink()
+                    .truncate()
+                    .font_family(mono.clone())
+                    .text_size(TEXT_MONO)
+                    .text_color(if state == FileState::Deleted { muted } else { fg })
+                    .when(state == FileState::Deleted, |el| el.line_through())
+                    .child(name),
+            )
+            .child(div().flex_1().min_w_0().truncate().text_size(TEXT_SMALL).text_color(muted).child(dir))
             .when(!staged, |el| {
                 el.child(
                     Button::new(("discard", ix))
@@ -374,7 +385,7 @@ impl SourceControl {
                         }
                     })),
             )
-            .child(div().w(px(14.)).text_xs().text_color(color).child(state.badge()))
+            .child(chrome::status_badge(state.badge(), color, cx))
             .into_any_element()
     }
 }
@@ -389,15 +400,9 @@ fn state_color(state: FileState, cx: &App) -> Hsla {
 
 impl Render for SourceControl {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
-        let header = h_flex()
-            .h(px(30.))
-            .px_3()
-            .gap_1()
-            .text_xs()
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .text_color(muted)
-            .child(div().flex_1().child("SOURCE CONTROL"))
+        let t = tokens(cx).clone();
+        let muted = t.fg_muted;
+        let header = panel_header("Source control", cx)
             .child(
                 Button::new("scm-refresh")
                     .icon(icon("refresh-cw"))
@@ -412,14 +417,14 @@ impl Render for SourceControl {
         if self.repo.is_none() {
             return root.child(
                 v_flex()
-                    .p_3()
-                    .gap_2()
-                    .text_sm()
+                    .px(px(14.))
+                    .gap(px(10.))
+                    .text_size(theme::TEXT_BODY)
                     .text_color(muted)
                     .child("This folder is not a git repository.")
                     .child(
                         Button::new("git-init")
-                            .label("Initialize Repository")
+                            .label("Initialize repository")
                             .small()
                             .on_click(cx.listener(|this, _, _, cx| this.init_repository(cx))),
                     ),
@@ -445,24 +450,27 @@ impl Render for SourceControl {
 
         root.child(
             v_flex()
-                .px_3()
-                .pb_2()
-                .gap_2()
+                .px(px(12.))
+                .pb(px(10.))
+                .gap(px(8.))
                 .when_some(branch, |el, branch| {
                     el.child(
                         h_flex()
-                            .gap_1()
-                            .text_xs()
+                            .px(px(2.))
+                            .gap(px(6.))
+                            .text_size(TEXT_SMALL)
                             .text_color(muted)
-                            .child(icon("git-branch").xsmall())
-                            .child(branch),
+                            .child(icon("git-branch").size(px(12.)))
+                            .child(div().font_family(t.mono.clone()).child(branch)),
                     )
                 })
                 .child(
                     div()
-                        .rounded_md()
+                        .px(px(2.))
+                        .rounded(RADIUS)
                         .border_1()
-                        .border_color(cx.theme().border)
+                        .border_color(t.border_strong)
+                        .bg(t.surface)
                         .child(Input::new(&self.message).appearance(false).small()),
                 )
                 .child(
@@ -482,11 +490,14 @@ impl Render for SourceControl {
                 v_flex()
                     .id("scm-lists")
                     .size_full()
+                    .pt(px(4.))
+                    .border_t_1()
+                    .border_color(t.border)
                     .overflow_y_scrollbar()
                     .when(!staged.is_empty(), |el| {
-                        el.child(self.render_section("STAGED CHANGES", true, staged, cx))
+                        el.child(self.render_section("Staged changes", true, staged, cx))
                     })
-                    .child(self.render_section("CHANGES", false, unstaged, cx)),
+                    .child(self.render_section("Changes", false, unstaged, cx)),
             ),
         )
     }

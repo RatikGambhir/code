@@ -11,7 +11,7 @@ use crate::{
     rpc::{RequestId, RpcError},
 };
 
-/// An approval Codex is waiting on.
+/// An approval the agent is waiting on.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingApproval {
     pub request_id: RequestId,
@@ -31,6 +31,12 @@ pub enum ApprovalKind {
     FileChange {
         reason: Option<String>,
         grant_root: Option<String>,
+    },
+    /// Any other tool (Claude asks before WebFetch, MCP tools and so on).
+    Tool {
+        tool: String,
+        detail: Option<String>,
+        reason: Option<String>,
     },
 }
 
@@ -97,6 +103,16 @@ pub enum AgentEvent {
         turn_id: String,
         usage: ThreadTokenUsage,
     },
+    /// What one finished turn used. Backends that report per-turn usage
+    /// (Claude) send this instead of running totals (`TokenUsage`).
+    TurnUsage {
+        thread_id: String,
+        turn_id: String,
+        usage: TokenUsageBreakdown,
+        /// Tokens in the context window after the turn, when known.
+        context_tokens: Option<i64>,
+        model_context_window: Option<i64>,
+    },
     ApprovalRequested(PendingApproval),
     /// The server no longer needs an answer (the turn ended, say).
     ApprovalResolved {
@@ -145,6 +161,7 @@ impl AgentEvent {
             | AgentEvent::PlanUpdated { thread_id, .. }
             | AgentEvent::DiffUpdated { thread_id, .. }
             | AgentEvent::TokenUsage { thread_id, .. }
+            | AgentEvent::TurnUsage { thread_id, .. }
             | AgentEvent::ApprovalResolved { thread_id, .. }
             | AgentEvent::Error { thread_id, .. } => Some(thread_id),
             AgentEvent::ApprovalRequested(approval) => Some(&approval.thread_id),
@@ -184,6 +201,7 @@ impl AgentEvent {
             AgentEvent::PlanUpdated { .. } => "turn/plan/updated",
             AgentEvent::DiffUpdated { .. } => "turn/diff/updated",
             AgentEvent::TokenUsage { .. } => "thread/tokenUsage/updated",
+            AgentEvent::TurnUsage { .. } => "turn/usage",
             AgentEvent::ApprovalRequested(_) => "approval/requested",
             AgentEvent::ApprovalResolved { .. } => "approval/resolved",
             AgentEvent::ToolCallRequested(_) => "tool/call",
@@ -240,12 +258,18 @@ impl AgentEvent {
             AgentEvent::PlanUpdated { steps, .. } => json!({"steps": steps.len()}),
             AgentEvent::DiffUpdated { diff, .. } => json!({"diffBytes": diff.len()}),
             AgentEvent::TokenUsage { usage, .. } => json!(usage),
+            AgentEvent::TurnUsage { usage, context_tokens, model_context_window, .. } => json!({
+                "usage": usage,
+                "contextTokens": context_tokens,
+                "modelContextWindow": model_context_window,
+            }),
             AgentEvent::ApprovalRequested(approval) => json!({
                 "request": approval.request_id,
                 "item": approval.item_id,
                 "kind": match &approval.kind {
                     ApprovalKind::Command { command, .. } => json!({"command": command}),
                     ApprovalKind::FileChange { grant_root, .. } => json!({"fileChange": grant_root}),
+                    ApprovalKind::Tool { tool, .. } => json!({"tool": tool}),
                 },
             }),
             AgentEvent::ApprovalResolved { request_id, .. } => json!({"request": request_id}),

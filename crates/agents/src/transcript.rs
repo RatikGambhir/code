@@ -281,6 +281,25 @@ impl Transcript {
                 self.usage = Some(*usage);
                 self.revision += 1;
             }
+            AgentEvent::TurnUsage { usage, context_tokens, model_context_window, .. } => {
+                let mut total = self.usage.unwrap_or_default();
+                total.total = total.total.saturating_add(usage);
+                // `last` is what the context meter reads: the context size
+                // after the turn when the backend knows it.
+                total.last = match context_tokens {
+                    Some(tokens) => TokenUsageBreakdown {
+                        total_tokens: *tokens,
+                        input_tokens: *tokens,
+                        ..Default::default()
+                    },
+                    None => *usage,
+                };
+                if model_context_window.is_some() {
+                    total.model_context_window = *model_context_window;
+                }
+                self.usage = Some(total);
+                self.revision += 1;
+            }
             AgentEvent::ApprovalRequested(PendingApproval {
                 request_id,
                 turn_id,
@@ -555,6 +574,11 @@ fn entry_kind(item: &ThreadItem) -> Option<EntryKind> {
             detail: Some(arguments.to_string()),
             success: *success,
         },
+        ThreadItem::ToolCall { tool, detail, success, .. } => EntryKind::Tool {
+            label: tool.clone(),
+            detail: detail.clone(),
+            success: *success,
+        },
         ThreadItem::WebSearch { query, .. } => EntryKind::Tool {
             label: "web search".into(),
             detail: query.clone(),
@@ -744,5 +768,26 @@ mod tests {
         t.apply(&AgentEvent::Disconnected { reason: "codex exited".into() });
         assert!(!t.is_running());
         assert!(t.entries().iter().all(|e| !e.streaming));
+    }
+
+    #[test]
+    fn per_turn_usage_accumulates_and_feeds_the_context_meter() {
+        let mut t = Transcript::new();
+        let turn_usage = |total, context| AgentEvent::TurnUsage {
+            thread_id: "t".into(),
+            turn_id: "u".into(),
+            usage: TokenUsageBreakdown { total_tokens: total, input_tokens: total, ..Default::default() },
+            context_tokens: context,
+            model_context_window: Some(1_000_000),
+        };
+        t.apply(&turn_usage(100, Some(80)));
+        t.apply(&turn_usage(50, None));
+        let usage = t.usage().unwrap();
+        assert_eq!(usage.total.total_tokens, 150);
+        assert_eq!(usage.last.total_tokens, 50, "without a context size, the turn's usage");
+        assert_eq!(usage.model_context_window, Some(1_000_000));
+
+        t.apply(&completed(ThreadItem::ToolCall { id: "r".into(), tool: "Read".into(), detail: Some("a.rs".into()), success: Some(true) }));
+        assert!(matches!(&t.entries()[0].kind, EntryKind::Tool { label, success: Some(true), .. } if label == "Read"));
     }
 }

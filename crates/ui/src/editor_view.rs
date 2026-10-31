@@ -1,26 +1,45 @@
 //! A code editor tab: gpui-component's rope-based editor bound to a file.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc};
 
 use anyhow::Result;
 use cockpit_editor::{lsp::LspClient, Document};
 use gpui::{
-    div, prelude::*, px, App, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
-    Subscription, Window,
+    div, prelude::*, px, App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton,
+    MouseDownEvent, MouseMoveEvent, SharedString, Subscription, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState, Position},
+    input::{self, Input, InputEvent, InputState, Position, RopeExt as _},
     v_flex, ActiveTheme as _, Sizable as _,
 };
 
-use crate::lsp::{self, LspManager};
+use crate::{
+    actions::{self, CODE_EDITOR_CONTEXT},
+    lsp::{self, LspDocument, LspManager, Target},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocationKind {
+    Definition,
+    References,
+}
 
 pub enum EditorEvent {
     /// Title or dirty state changed.
     Changed,
     Saved(PathBuf),
+    /// The language server answered a go-to-definition or find-references
+    /// request; the workspace jumps or lists the places.
+    Locations {
+        kind: LocationKind,
+        symbol: String,
+        origin: Target,
+        targets: Vec<Target>,
+    },
+    /// Something to tell the user ("No definition found").
+    Notify(String),
 }
 
 pub struct EditorView {
@@ -30,8 +49,9 @@ pub struct EditorView {
     /// The file changed on disk while it had unsaved edits.
     conflict: bool,
     read_only: bool,
-    lsp: Option<Arc<LspClient>>,
-    lsp_version: i32,
+    lsp: Option<Rc<LspDocument>>,
+    /// The file's diagnostics, shared with the code action provider.
+    diagnostics: Rc<RefCell<Vec<lsp_types::Diagnostic>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -57,13 +77,20 @@ impl EditorView {
         };
         let view = Self::with_document(document, false, window, cx);
         if let Some(lsp) = lsp {
-            let language = view.document.language();
-            if language != "text" {
-                let this = cx.entity().downgrade();
-                lsp.update(cx, |lsp, cx| lsp.attach(language, this, cx));
-            }
+            view.connect_lsp(lsp, cx);
         }
         Ok(view)
+    }
+
+    /// Asks the workspace's language servers for this file's server; it calls
+    /// back [`Self::attach_lsp`] once that is running.
+    pub fn connect_lsp(&self, lsp: &Entity<LspManager>, cx: &mut Context<Self>) {
+        let language = self.document.language();
+        if self.read_only || language == "text" {
+            return;
+        }
+        let this = cx.entity().downgrade();
+        lsp.update(cx, |lsp, cx| lsp.attach(language, this, cx));
     }
 
     /// A read-only buffer that is not backed by a file the user edits (diffs).
@@ -104,7 +131,7 @@ impl EditorView {
             conflict: false,
             read_only,
             lsp: None,
-            lsp_version: 0,
+            diagnostics: Rc::default(),
             _subscriptions: vec![subscription],
         }
     }
@@ -149,8 +176,8 @@ impl EditorView {
         self.document.save(&text)?;
         self.dirty = false;
         self.conflict = false;
-        if let Some(client) = &self.lsp {
-            let _ = client.did_save(self.document.path(), &text);
+        if let Some(doc) = &self.lsp {
+            doc.saved(&text);
         }
         cx.emit(EditorEvent::Saved(self.document.path().to_path_buf()));
         cx.emit(EditorEvent::Changed);
@@ -213,29 +240,126 @@ impl EditorView {
     // --- language server ---------------------------------------------------
 
     pub fn attach_lsp(&mut self, client: Arc<LspClient>, cx: &mut Context<Self>) {
-        let path = self.document.path().to_path_buf();
-        self.lsp_version = 1;
-        let text = self.text(cx);
-        if let Err(err) = client.did_open(&path, lsp::language_id(self.document.language()), 1, &text) {
-            tracing::warn!("didOpen {}: {err:#}", path.display());
+        if self.lsp.is_some() {
             return;
         }
-        let (completion, hover) = lsp::providers(&client, &path);
-        self.input.update(cx, |input, _| {
-            input.lsp.completion_provider = Some(completion);
-            input.lsp.hover_provider = hover;
-        });
-        self.lsp = Some(client);
+        let path = self.document.path().to_path_buf();
+        let text = self.input.read(cx).text().clone();
+        let doc = match LspDocument::open(client, path, self.document.language(), &text, self.diagnostics.clone()) {
+            Ok(doc) => doc,
+            Err(err) => {
+                tracing::warn!("didOpen {}: {err:#}", self.document.path().display());
+                return;
+            }
+        };
+        self.input.update(cx, |input, _| lsp::install_providers(&doc, input));
+        self.lsp = Some(doc);
+    }
+
+    /// Disconnects from the language server (it is restarting).
+    pub fn detach_lsp(&mut self, cx: &mut Context<Self>) {
+        self.detach();
+        self.input.update(cx, |input, _| lsp::remove_providers(input));
     }
 
     fn sync_lsp(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = &self.lsp else { return };
-        self.lsp_version += 1;
-        let text = self.input.read(cx).text().to_string();
-        let _ = client.did_change(self.document.path(), self.lsp_version, &text);
+        let Some(doc) = &self.lsp else { return };
+        doc.sync(self.input.read(cx).text());
+    }
+
+    /// The cursor as a [`Target`], where a jump returns to.
+    fn cursor_target(&self, cx: &App) -> Target {
+        let cursor = self.cursor(cx);
+        Target {
+            path: self.document.path().to_path_buf(),
+            line: cursor.line,
+            column: cursor.character,
+        }
+    }
+
+    /// The identifier at the cursor, for titles.
+    fn symbol_at_cursor(&self, cx: &App) -> String {
+        let input = self.input.read(cx);
+        input.text().word_at(input.cursor())
+    }
+
+    /// F12 and the context menu's Go to Definition.
+    pub fn go_to_definition(&mut self, cx: &mut Context<Self>) {
+        self.request_locations(LocationKind::Definition, cx);
+    }
+
+    /// ⇧F12.
+    pub fn find_references(&mut self, cx: &mut Context<Self>) {
+        self.request_locations(LocationKind::References, cx);
+    }
+
+    fn request_locations(&mut self, kind: LocationKind, cx: &mut Context<Self>) {
+        let Some(doc) = self.lsp.clone() else {
+            let message = match self.document.language() {
+                "text" => "No language server for this file.".to_string(),
+                language => format!("No language server is running for {language}."),
+            };
+            cx.emit(EditorEvent::Notify(message));
+            return;
+        };
+        if kind == LocationKind::References && !lsp::supports_references(&doc) {
+            cx.emit(EditorEvent::Notify(format!("{} cannot find references.", doc.client.name())));
+            return;
+        }
+        doc.sync(self.input.read(cx).text());
+        let origin = self.cursor_target(cx);
+        let symbol = self.symbol_at_cursor(cx);
+        let position = lsp_types::Position::new(origin.line, origin.column);
+        let request: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Target>>>>> = match kind {
+            LocationKind::Definition => Box::pin(doc.definitions(position)),
+            LocationKind::References => Box::pin(doc.references(position)),
+        };
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            this.update(cx, |_, cx| match result {
+                Ok(targets) => cx.emit(EditorEvent::Locations { kind, symbol, origin, targets }),
+                Err(err) => cx.emit(EditorEvent::Notify(format!("{}: {err:#}", doc.client.name()))),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// ⌘-click on a symbol the editor underlined: jump to its definition.
+    /// The editor would only move within this buffer, so the click is taken
+    /// here before it reaches the editor.
+    fn on_mouse_down_capture(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.button != MouseButton::Left || !event.modifiers.secondary() {
+            return;
+        }
+        let Some(doc) = &self.lsp else { return };
+        let targets = lsp::link_targets(&doc.hovered_definitions());
+        if targets.is_empty() {
+            return;
+        }
+        cx.stop_propagation();
+        doc.clear_hovered_definitions();
+        let origin = self.cursor_target(cx);
+        let symbol = self.symbol_at_cursor(cx);
+        cx.emit(EditorEvent::Locations {
+            kind: LocationKind::Definition,
+            symbol,
+            origin,
+            targets,
+        });
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, _: &mut Context<Self>) {
+        // Without ⌘ the editor drops its underline; so does the ⌘-click target.
+        if !event.modifiers.secondary() {
+            if let Some(doc) = &self.lsp {
+                doc.clear_hovered_definitions();
+            }
+        }
     }
 
     pub fn set_diagnostics(&mut self, diagnostics: &[lsp_types::Diagnostic], cx: &mut Context<Self>) {
+        *self.diagnostics.borrow_mut() = diagnostics.to_vec();
         let diagnostics = diagnostics.to_vec();
         self.input.update(cx, |input, cx| {
             if let Some(set) = input.diagnostics_mut() {
@@ -247,8 +371,8 @@ impl EditorView {
     }
 
     pub fn detach(&mut self) {
-        if let Some(client) = self.lsp.take() {
-            let _ = client.did_close(self.document.path());
+        if let Some(doc) = self.lsp.take() {
+            doc.close();
         }
     }
 
@@ -257,8 +381,9 @@ impl EditorView {
             .px_3()
             .py_1()
             .gap_2()
-            .text_sm()
-            .bg(cx.theme().warning.opacity(0.15))
+            .font_family(cx.theme().font_family.clone())
+            .text_size(crate::theme::TEXT_BODY)
+            .bg(cx.theme().warning.opacity(0.1))
             .border_b_1()
             .border_color(cx.theme().border)
             .child(div().flex_1().child("This file changed on disk while you had unsaved edits."))
@@ -289,8 +414,23 @@ impl Drop for EditorView {
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let font_size = px(crate::state::AppState::global(cx).settings.editor_font_size);
         v_flex()
+            .key_context(CODE_EDITOR_CONTEXT)
             .size_full()
+            .capture_any_mouse_down(cx.listener(Self::on_mouse_down_capture))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_action(cx.listener(|this, _: &actions::GoToDefinition, _, cx| this.go_to_definition(cx)))
+            .on_action(cx.listener(|this, _: &actions::FindReferences, _, cx| this.find_references(cx)))
+            // The editor's context menu sends its own Go to Definition, which
+            // only works within the buffer; answer it here instead.
+            .capture_action(cx.listener(|this, _: &input::GoToDefinition, _, cx| {
+                cx.stop_propagation();
+                this.go_to_definition(cx);
+            }))
+            .font_family(crate::theme::tokens(cx).mono.clone())
+            .text_size(font_size)
+            .line_height(font_size * 1.6)
             .when(self.conflict, |el| el.child(self.render_conflict(cx)))
             .child(
                 div().flex_1().min_h(px(0.)).child(

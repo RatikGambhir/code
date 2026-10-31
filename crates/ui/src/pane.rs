@@ -8,13 +8,15 @@ use gpui::{
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex, ActiveTheme as _, Icon, IconName, Sizable as _,
+    h_flex, v_flex, Icon, IconName, Sizable as _,
 };
 
 use crate::{
     assets::icon,
     browser_view::{BrowserEvent, BrowserView},
+    chrome::{self, key_chip},
     editor_view::{EditorEvent, EditorView},
+    theme::{tokens, TEXT_BODY, TEXT_MONO},
 };
 
 #[derive(Clone)]
@@ -52,11 +54,12 @@ impl PaneItem {
         }
     }
 
-    fn icon(&self, cx: &App) -> Icon {
+    /// Files are told apart by name alone; diffs and pages get an icon.
+    fn icon(&self, cx: &App) -> Option<Icon> {
         match self {
-            PaneItem::Editor(editor) if editor.read(cx).is_read_only() => icon("git-compare"),
-            PaneItem::Editor(_) => Icon::new(IconName::File),
-            PaneItem::Browser(_) => Icon::new(IconName::Globe),
+            PaneItem::Editor(editor) if editor.read(cx).is_read_only() => Some(icon("git-compare")),
+            PaneItem::Editor(_) => None,
+            PaneItem::Browser(_) => Some(Icon::new(IconName::Globe)),
         }
     }
 
@@ -174,6 +177,7 @@ impl Pane {
         let subscription = match &item {
             PaneItem::Editor(editor) => cx.subscribe(editor, |_, _, event: &EditorEvent, cx| match event {
                 EditorEvent::Changed | EditorEvent::Saved(_) => cx.notify(),
+                EditorEvent::Locations { .. } | EditorEvent::Notify(_) => {}
             }),
             PaneItem::Browser(browser) => cx.subscribe(browser, |_, _, event: &BrowserEvent, cx| {
                 if matches!(event, BrowserEvent::Changed | BrowserEvent::Navigated { .. }) {
@@ -301,52 +305,50 @@ impl Pane {
     }
 
     fn render_tab(&self, index: usize, item: &PaneItem, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
+        let t = tokens(cx).clone();
         let active = index == self.active;
         let dirty = item.is_dirty(cx);
         let title = item.title(cx);
         let tooltip = item.tooltip(cx);
-        let (bg, fg) = if active {
-            (theme.tab_active, theme.tab_active_foreground)
-        } else {
-            (theme.tab, theme.tab_foreground)
-        };
-        h_flex()
-            .id(("pane-tab", index))
+        let is_file = matches!(item, PaneItem::Editor(_));
+        chrome::underline_tab(("pane-tab", index), active, cx)
             .group("pane-tab")
-            .h_full()
-            .flex_none()
             .max_w(px(220.))
-            .pl_3()
-            .pr_1()
-            .gap_1p5()
-            .text_sm()
-            .bg(bg)
-            .text_color(fg)
-            .border_r_1()
-            .border_color(theme.border)
-            .when(active, |el| el.border_t_2().border_color(theme.primary))
-            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
+            .pr(px(4.))
+            .map(|el| if is_file { el.font_family(t.mono.clone()).text_size(TEXT_MONO) } else { el.text_size(TEXT_BODY) })
+            .tooltip(chrome::tooltip(tooltip))
             .on_click(cx.listener(move |this, _, window, cx| this.activate(index, true, window, cx)))
             .on_mouse_down(
                 MouseButton::Middle,
                 cx.listener(move |this, _, window, cx| this.close_item(index, window, cx)),
             )
-            .child(item.icon(cx).small().text_color(theme.muted_foreground))
+            .children(item.icon(cx).map(|icon| icon.size(px(13.)).text_color(t.fg_subtle)))
             .child(div().truncate().child(title))
             .child(
+                // The close button, or the unsaved dot until it is hovered.
                 div()
+                    .relative()
                     .size(px(18.))
                     .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
+                    .when(dirty, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .size(px(7.))
+                                .rounded_full()
+                                .bg(t.fg_muted)
+                                .group_hover("pane-tab", |s| s.invisible()),
+                        )
+                    })
                     .child(
                         Button::new(("close-tab", index))
-                            .icon(if dirty { IconName::Dash } else { IconName::Close })
+                            .icon(IconName::Close)
                             .ghost()
                             .xsmall()
-                            .when(!active && !dirty, |b| b.invisible().group_hover("pane-tab", |s| s.visible()))
+                            .when(dirty || !active, |b| b.invisible().group_hover("pane-tab", |s| s.visible()))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.close_item(index, window, cx);
@@ -357,34 +359,37 @@ impl Pane {
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
-        let hint = |keys: &'static str, label: &'static str| {
+        let t = tokens(cx).clone();
+        let hint = |keys: &'static str, label: &'static str, cx: &App| {
             h_flex()
-                .gap_4()
-                .child(div().w(px(160.)).text_right().child(label))
-                .child(div().font_family(cx.theme().mono_font_family.clone()).child(keys))
+                .w(px(240.))
+                .h(px(28.))
+                .justify_between()
+                .child(div().text_color(t.fg_muted).child(label))
+                .child(key_chip(keys, cx))
         };
         v_flex()
             .size_full()
             .items_center()
             .justify_center()
-            .gap_2()
-            .text_sm()
-            .text_color(muted)
-            .child(hint("⌘P", "Go to file"))
-            .child(hint("⇧⌘P", "Command palette"))
-            .child(hint("⌘T", "New browser tab"))
-            .child(hint("⌘L", "Ask Codex"))
-            .child(hint("⌘J", "Toggle terminal"))
+            .gap(px(20.))
+            .text_size(TEXT_BODY)
+            .child(chrome::logo_mark(28., cx).opacity(0.85))
+            .child(
+                v_flex()
+                    .child(hint("⌘P", "Go to file", cx))
+                    .child(hint("⇧⌘P", "Command palette", cx))
+                    .child(hint("⌘T", "New browser tab", cx))
+                    .child(hint("⌘L", "Ask Codex", cx))
+                    .child(hint("⌘J", "Toggle terminal", cx)),
+            )
     }
 }
 
 impl Render for Pane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let tab_bar_bg = theme.tab_bar;
-        let border = theme.border;
-        let mut tabs = h_flex().id("pane-tabs").h_full().overflow_x_scroll();
+        let border = tokens(cx).border;
+        let mut tabs = h_flex().id("pane-tabs").h_full().px(px(4.)).overflow_x_scroll();
         for (index, item) in self.items.iter().enumerate() {
             tabs = tabs.child(self.render_tab(index, item, cx));
         }
@@ -395,9 +400,8 @@ impl Render for Pane {
             .when(!self.items.is_empty(), |el| {
                 el.child(
                     h_flex()
-                        .h(px(34.))
+                        .h(px(36.))
                         .flex_none()
-                        .bg(tab_bar_bg)
                         .border_b_1()
                         .border_color(border)
                         .child(tabs),

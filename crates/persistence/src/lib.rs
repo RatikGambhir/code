@@ -384,6 +384,9 @@ pub struct AgentThreadRecord {
     pub cwd: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// The agent provider ("openai", "anthropic"); `None` for older threads,
+    /// which are Codex's.
+    pub provider: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -406,6 +409,7 @@ impl Reader<'_> {
             AgentThreads::Cwd,
             AgentThreads::CreatedAt,
             AgentThreads::UpdatedAt,
+            AgentThreads::Provider,
         ])
         .filter(AgentThreads::WorkspaceId.equals(workspace_id))
         .filter_if((!include_archived).then(|| AgentThreads::Archived.equals(false)))
@@ -419,6 +423,7 @@ impl Reader<'_> {
                 cwd: row.col(AgentThreads::Cwd)?,
                 created_at: row.col(AgentThreads::CreatedAt)?,
                 updated_at: row.col(AgentThreads::UpdatedAt)?,
+                provider: row.col(AgentThreads::Provider)?,
             })
         })
     }
@@ -444,8 +449,8 @@ impl Reader<'_> {
 }
 
 impl Writer<'_> {
-    /// Inserts or refreshes a thread. Title, model and cwd are only replaced
-    /// by non-null values, so a partial update never erases them.
+    /// Inserts or refreshes a thread. Title, model, cwd and provider are only
+    /// replaced by non-null values, so a partial update never erases them.
     pub fn upsert_agent_thread(&self, thread: &AgentThreadRecord) -> Result<()> {
         AgentThreads::insert()
             .value(AgentThreads::ThreadId, &thread.thread_id)
@@ -455,10 +460,12 @@ impl Writer<'_> {
             .value(AgentThreads::Cwd, thread.cwd.as_deref())
             .value(AgentThreads::CreatedAt, thread.created_at)
             .value(AgentThreads::UpdatedAt, thread.updated_at)
+            .value(AgentThreads::Provider, thread.provider.as_deref())
             .on_conflict([AgentThreads::ThreadId])
             .keep_existing_if_null(AgentThreads::Title)
             .keep_existing_if_null(AgentThreads::Model)
             .keep_existing_if_null(AgentThreads::Cwd)
+            .keep_existing_if_null(AgentThreads::Provider)
             .take_new(AgentThreads::UpdatedAt)
             .execute(self)?;
         Ok(())
@@ -655,6 +662,7 @@ impl Writer<'_> {
                 cwd: None,
                 created_at: now,
                 updated_at: now,
+                provider: None,
             })?;
         }
         let baseline: TokenCounts = stored
@@ -956,6 +964,7 @@ mod tests {
             cwd: Some("/src/a".into()),
             created_at: 1,
             updated_at: 2,
+            provider: Some("anthropic".into()),
         };
         db.write(|w| {
             w.upsert_agent_thread(&thread)?;
@@ -969,6 +978,7 @@ mod tests {
         .unwrap();
         let threads = db.read(|r| r.agent_threads(ws.id, false)).unwrap();
         assert_eq!(threads[0].title.as_deref(), Some("Refactor auth"));
+        assert_eq!(threads[0].provider.as_deref(), Some("anthropic"), "kept by a partial upsert");
         assert_eq!(threads[0].updated_at, 3);
 
         let first = db

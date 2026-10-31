@@ -6,7 +6,7 @@ use cockpit_agents::{
     protocol::{ApprovalDecision, ItemStatus, LoginResponse, PlanStepStatus},
     rpc::RequestId,
     transcript::ChangedFile,
-    ApprovalKind, ApprovalState, Entry, EntryKind,
+    ApprovalKind, ApprovalState, Entry, EntryKind, Provider,
 };
 use cockpit_orchestrator::PermissionPreset;
 use gpui::{
@@ -22,11 +22,16 @@ use gpui_component::{
     spinner::Spinner,
     switch::Switch,
     text::TextView,
-    v_flex, ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _,
+    v_flex, Disableable as _, IconName, Sizable as _, StyledExt as _,
 };
 
 use super::{AgentController, ConnectionState};
-use crate::{actions, assets::icon, theme};
+use crate::{
+    actions,
+    assets::icon,
+    chrome::{self, caps_label, key_chip},
+    theme::{tokens, Tokens, RADIUS, RADIUS_LG, TEXT_BODY, TEXT_MONO, TEXT_SMALL, TEXT_TITLE},
+};
 
 /// Output shown for a command before the card is expanded.
 const COLLAPSED_OUTPUT_LINES: usize = 6;
@@ -46,6 +51,8 @@ pub struct AgentPanel {
     expanded: HashSet<String>,
     /// (thread, revision) last rendered, to follow new output.
     seen: (Option<String>, u64),
+    /// The provider the composer's placeholder names.
+    placeholder_for: Option<Provider>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -55,8 +62,8 @@ impl AgentPanel {
     pub fn new(controller: Entity<AgentController>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| {
             InputState::new(window, cx)
-                .auto_grow(2, 12)
-                .placeholder("Ask Codex…  (↩ send, ⇧↩ newline)")
+                .auto_grow(1, 12)
+                .placeholder("Ask Codex anything")
         });
         let api_key = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("sk-…"));
         let subscriptions = vec![
@@ -74,6 +81,7 @@ impl AgentPanel {
             scroll: ScrollHandle::new(),
             expanded: HashSet::new(),
             seen: (None, 0),
+            placeholder_for: None,
             _subscriptions: subscriptions,
         }
     }
@@ -133,6 +141,18 @@ impl AgentPanel {
         self.seen = current;
     }
 
+    /// Keeps "Ask Codex anything" / "Ask Claude anything" in step with the
+    /// provider.
+    fn sync_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let provider = self.controller.read(cx).provider();
+        if self.placeholder_for == Some(provider) {
+            return;
+        }
+        self.placeholder_for = Some(provider);
+        let text = format!("Ask {} anything", provider.agent_name());
+        self.composer.update(cx, |state, cx| state.set_placeholder(text, window, cx));
+    }
+
     // --- header ------------------------------------------------------------
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -141,32 +161,35 @@ impl AgentPanel {
             .active_thread()
             .map(|t| t.title.clone())
             .unwrap_or_else(|| "New conversation".into());
-        let (dot, status): (Hsla, SharedString) = match controller.state() {
-            ConnectionState::Connected { user_agent } => {
-                (theme::added(cx), format!("Connected · {user_agent}").into())
-            }
-            ConnectionState::Connecting => (cx.theme().warning, "Starting Codex…".into()),
-            ConnectionState::Idle => (cx.theme().muted_foreground, "Not running".into()),
-            ConnectionState::NotInstalled => (cx.theme().danger, "Codex not installed".into()),
-            ConnectionState::Failed(err) => (cx.theme().danger, format!("Disconnected: {err}").into()),
+        let name = controller.agent_name();
+        let status: SharedString = match controller.state() {
+            ConnectionState::Connected { user_agent } => format!("Connected · {user_agent}").into(),
+            ConnectionState::Connecting => format!("Starting {name}…").into(),
+            ConnectionState::Idle => "Not running".into(),
+            ConnectionState::NotInstalled => format!("{name} not installed").into(),
+            ConnectionState::Failed(err) => format!("Disconnected: {err}").into(),
         };
+        let provider = controller.provider();
         let handle = self.controller.clone();
+        let t = tokens(cx).clone();
+        let running = controller.is_running();
+        let (label, label_color): (SharedString, Hsla) = match controller.state() {
+            ConnectionState::Connected { .. } if running => ("Working".into(), t.accent_text),
+            ConnectionState::Connected { .. } => ("Ready".into(), t.fg_subtle),
+            ConnectionState::Connecting => ("Starting".into(), t.fg_subtle),
+            ConnectionState::Idle => ("Stopped".into(), t.fg_subtle),
+            ConnectionState::NotInstalled | ConnectionState::Failed(_) => ("Offline".into(), t.danger),
+        };
 
         h_flex()
             .id("agent-header")
-            .h(px(36.))
-            .px_2()
-            .gap_1()
+            .h(px(40.))
+            .flex_none()
+            .pl(px(8.))
+            .pr(px(8.))
+            .gap(px(4.))
             .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                div()
-                    .id("agent-status")
-                    .size(px(8.))
-                    .rounded_full()
-                    .bg(dot)
-                    .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(status.clone()).build(window, cx)),
-            )
+            .border_color(t.border)
             .child(
                 Button::new("thread-picker")
                     .label(title)
@@ -204,11 +227,23 @@ impl AgentPanel {
                     }),
             )
             .child(div().flex_1())
+            .child(provider_menu(self.controller.clone(), provider))
+            .child(
+                h_flex()
+                    .id("agent-status")
+                    .gap(px(6.))
+                    .px(px(4.))
+                    .text_size(TEXT_SMALL)
+                    .text_color(label_color)
+                    .tooltip(chrome::tooltip(status))
+                    .child(chrome::status_dot(label_color))
+                    .child(label),
+            )
             .child(
                 Button::new("new-thread")
                     .icon(icon("plus"))
                     .ghost()
-                    .small()
+                    .xsmall()
                     .tooltip("New thread (⇧⌘N)")
                     .disabled(!matches!(self.controller.read(cx).state(), ConnectionState::Connected { .. }))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -221,17 +256,10 @@ impl AgentPanel {
 
     fn render_connection(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let state = self.controller.read(cx).state().clone();
-        let muted = cx.theme().muted_foreground;
-        let card = || {
-            v_flex()
-                .m_3()
-                .p_3()
-                .gap_2()
-                .rounded_md()
-                .border_1()
-                .border_color(cx.theme().border)
-                .text_sm()
-        };
+        let provider = self.controller.read(cx).provider();
+        let name = provider.agent_name();
+        let muted = tokens(cx).fg_muted;
+        let card = || notice_card(tokens(cx));
         let retry = |label: &'static str| {
             Button::new("agent-retry")
                 .label(label)
@@ -243,19 +271,28 @@ impl AgentPanel {
         let element = match state {
             ConnectionState::Connected { .. } => return None,
             ConnectionState::Connecting => h_flex()
-                .m_3()
-                .gap_2()
-                .text_sm()
+                .m(px(14.))
+                .gap(px(8.))
+                .text_size(TEXT_BODY)
                 .text_color(muted)
                 .child(Spinner::new().small())
-                .child("Starting the Codex app server…")
+                .child(match provider {
+                    Provider::OpenAi => "Starting the Codex app server…",
+                    Provider::Anthropic => "Starting Claude Code…",
+                })
                 .into_any_element(),
             ConnectionState::Idle => card()
-                .child("Codex is not running.")
-                .child(retry("Start Codex"))
+                .child(format!("{name} is not running."))
+                .child(retry(match provider {
+                    Provider::OpenAi => "Start Codex",
+                    Provider::Anthropic => "Start Claude",
+                }))
                 .into_any_element(),
             ConnectionState::NotInstalled => card()
-                .child(div().font_semibold().child("Codex CLI not found"))
+                .child(div().text_size(TEXT_TITLE).font_semibold().child(match provider {
+                    Provider::OpenAi => "Codex CLI not found",
+                    Provider::Anthropic => "Claude Code not found",
+                }))
                 .child(
                     div()
                         .text_color(muted)
@@ -263,19 +300,27 @@ impl AgentPanel {
                 )
                 .child(
                     div()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .text_xs()
-                        .p_2()
-                        .rounded_sm()
-                        .bg(cx.theme().muted)
-                        .child("npm install -g @openai/codex\n# or\nbrew install codex"),
+                        .font_family(tokens(cx).mono.clone())
+                        .text_size(TEXT_MONO)
+                        .p(px(10.))
+                        .rounded(RADIUS)
+                        .bg(tokens(cx).raised)
+                        .child(match provider {
+                            Provider::OpenAi => "npm install -g @openai/codex\n# or\nbrew install codex",
+                            Provider::Anthropic => {
+                                "curl -fsSL https://claude.ai/install.sh | bash\n# or\nnpm install -g @anthropic-ai/claude-code"
+                            }
+                        }),
                 )
                 .child(retry("Retry"))
                 .into_any_element(),
             ConnectionState::Failed(err) => card()
-                .child(div().font_semibold().child("Codex stopped"))
+                .child(div().text_size(TEXT_TITLE).font_semibold().child(format!("{name} stopped")))
                 .child(div().text_color(muted).child(err))
-                .child(retry("Restart Codex"))
+                .child(retry(match provider {
+                    Provider::OpenAi => "Restart Codex",
+                    Provider::Anthropic => "Restart Claude",
+                }))
                 .into_any_element(),
         };
         Some(element)
@@ -286,17 +331,13 @@ impl AgentPanel {
         if !controller.needs_login() {
             return None;
         }
+        if controller.provider() == Provider::Anthropic {
+            return Some(self.render_claude_login(cx));
+        }
         let waiting = controller.login_state().cloned();
-        let muted = cx.theme().muted_foreground;
-        let mut card = v_flex()
-            .m_3()
-            .p_3()
-            .gap_2()
-            .rounded_md()
-            .border_1()
-            .border_color(cx.theme().border)
-            .text_sm()
-            .child(div().font_semibold().child("Sign in to Codex"))
+        let muted = tokens(cx).fg_muted;
+        let mut card = notice_card(tokens(cx))
+            .child(div().text_size(TEXT_TITLE).font_semibold().child("Sign in to Codex"))
             .child(
                 div()
                     .text_color(muted)
@@ -356,6 +397,87 @@ impl AgentPanel {
         Some(card.into_any_element())
     }
 
+    /// Claude Code signs in through its own interactive flow, so Cockpit
+    /// runs `claude auth login` in a terminal tab and never handles the
+    /// credentials.
+    fn render_claude_login(&self, cx: &mut Context<Self>) -> AnyElement {
+        let waiting = self.controller.read(cx).terminal_login();
+        let muted = tokens(cx).fg_muted;
+        let mut card = notice_card(tokens(cx))
+            .child(div().text_size(TEXT_TITLE).font_semibold().child("Sign in to Claude"))
+            .child(div().text_color(muted).child(
+                "Use your Claude plan, or an Anthropic Console account billed by API use. Claude Code signs in and keeps the credentials; Cockpit never sees them.",
+            ));
+        if waiting {
+            card = card
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .text_color(muted)
+                        .child(Spinner::new().small())
+                        .child("Finish signing in in the terminal below, then come back here."),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("claude-check-login")
+                                .label("I've signed in")
+                                .primary()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.controller.update(cx, |c, cx| c.check_login(cx));
+                                })),
+                        )
+                        .child(
+                            Button::new("claude-cancel-login")
+                                .label("Cancel")
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.controller.update(cx, |c, cx| c.cancel_terminal_login(cx));
+                                })),
+                        ),
+                );
+        } else {
+            card = card
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("login-claude")
+                                .label("Sign in with Claude")
+                                .primary()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.controller.update(cx, |c, cx| c.login_with_claude(false, cx));
+                                })),
+                        )
+                        .child(
+                            Button::new("login-console")
+                                .label("Use an Anthropic Console account")
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.controller.update(cx, |c, cx| c.login_with_claude(true, cx));
+                                })),
+                        ),
+                )
+                .child(div().text_size(TEXT_SMALL).text_color(muted).child(
+                    "An ANTHROPIC_API_KEY, Bedrock or Vertex set up for Claude Code works too. Already signed in elsewhere? Check again.",
+                ))
+                .child(
+                    Button::new("claude-recheck")
+                        .label("Check again")
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.controller.update(cx, |c, cx| c.check_login(cx));
+                        })),
+                );
+        }
+        card.into_any_element()
+    }
+
     // --- transcript ----------------------------------------------------------
 
     fn render_transcript(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -371,13 +493,12 @@ impl AgentPanel {
         let entries: Vec<Entry> = thread.transcript.entries().iter().map(displayed_part).collect();
         let cwd = controller.cwd().to_path_buf();
 
-        let mut list = v_flex().p_3().gap_3();
+        let mut list = v_flex().px(px(14.)).py(px(14.)).gap(px(12.)).text_size(TEXT_BODY);
         if loading {
             list = list.child(
                 h_flex()
                     .gap_2()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
+                    .text_color(tokens(cx).fg_muted)
                     .child(Spinner::new().small())
                     .child("Loading the conversation…"),
             );
@@ -388,11 +509,11 @@ impl AgentPanel {
         if running {
             list = list.child(
                 h_flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(Spinner::new().xsmall())
-                    .child("Codex is working…"),
+                    .gap(px(8.))
+                    .text_size(TEXT_SMALL)
+                    .text_color(tokens(cx).fg_muted)
+                    .child(Spinner::new().xsmall().color(tokens(cx).accent_text))
+                    .child("Working…"),
             );
         }
 
@@ -413,20 +534,43 @@ impl AgentPanel {
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
+        let t = tokens(cx);
         v_flex()
             .flex_1()
             .items_center()
             .justify_center()
-            .gap_2()
-            .p_6()
+            .gap(px(8.))
+            .px(px(32.))
             .text_center()
-            .text_color(muted)
-            .child(icon("sparkles").size(px(28.)))
-            .child(div().text_color(cx.theme().foreground).child("Ask Codex anything about this workspace"))
-            .child(div().text_sm().child(
-                "It can read and edit files, run commands in its sandbox and, with Browser on, look at pages in the built-in browser.",
-            ))
+            .text_size(TEXT_BODY)
+            .text_color(t.fg_muted)
+            .child(
+                div()
+                    .size(px(36.))
+                    .mb(px(4.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(10.))
+                    .bg(t.accent_soft)
+                    .text_color(t.accent_text)
+                    .child(icon("sparkles").size(px(18.))),
+            )
+            .child(
+                div()
+                    .text_size(TEXT_TITLE)
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(t.fg)
+                    .child(format!("Ask {} about this workspace", self.controller.read(cx).agent_name())),
+            )
+            .child(div().max_w(px(300.)).child(match self.controller.read(cx).provider() {
+                Provider::OpenAi => {
+                    "It reads and edits files, runs commands in its sandbox and, with Browser on, looks at pages in the built-in browser."
+                }
+                Provider::Anthropic => {
+                    "It reads and edits files, runs commands with your approval and, with Browser on, looks at pages in the built-in browser."
+                }
+            }))
     }
 
     fn render_entry(
@@ -437,9 +581,8 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
-        let border = theme.border;
+        let t = tokens(cx).clone();
+        let muted = t.fg_muted;
         let expanded = self.expanded.contains(&entry.id);
         let entry_id = entry.id.clone();
         match &entry.kind {
@@ -447,17 +590,17 @@ impl AgentPanel {
                 .justify_end()
                 .child(
                     div()
-                        .max_w(relative_px(0.9))
-                        .px_3()
-                        .py_2()
-                        .rounded_lg()
-                        .bg(theme.muted)
-                        .text_sm()
+                        .max_w(relative_px(0.88))
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded(RADIUS_LG)
+                        .bg(t.raised)
+                        .text_size(TEXT_BODY)
                         .child(text.clone()),
                 )
                 .into_any_element(),
             EntryKind::Agent { text } => div()
-                .text_sm()
+                .text_size(TEXT_BODY)
                 .child(TextView::markdown(SharedString::from(format!("md-{}", entry.id)), text.clone(), window, cx).selectable(true))
                 .into_any_element(),
             EntryKind::Reasoning { text } => {
@@ -470,20 +613,24 @@ impl AgentPanel {
                 };
                 div()
                     .id(SharedString::from(format!("reasoning-{}", entry.id)))
-                    .text_xs()
+                    .pl(px(10.))
+                    .border_l_2()
+                    .border_color(t.border)
+                    .text_size(TEXT_SMALL)
                     .italic()
-                    .text_color(muted)
+                    .text_color(t.fg_subtle)
                     .cursor_pointer()
+                    .hover(|s| s.text_color(muted))
                     .child(shown)
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle(&entry_id, cx)))
                     .into_any_element()
             }
-            EntryKind::Plan { text } => card(border)
-                .child(section_title("Plan", muted))
-                .child(div().text_sm().child(text.clone()))
+            EntryKind::Plan { text } => v_flex()
+                .gap(px(6.))
+                .child(caps_label("Plan", cx))
+                .child(div().text_size(TEXT_BODY).child(text.clone()))
                 .into_any_element(),
             EntryKind::Command { command, cwd: dir, output, status, exit_code, duration_ms } => {
-                let mono = theme.mono_font_family.clone();
                 let (badge, badge_color) = command_badge(*status, *exit_code, *duration_ms, cx);
                 let lines: Vec<&str> = output.lines().collect();
                 let shown = if expanded {
@@ -493,155 +640,155 @@ impl AgentPanel {
                     lines[start..].join("\n")
                 };
                 let more = !expanded && lines.len() > COLLAPSED_OUTPUT_LINES;
-                card(border)
+                activity_card(&t)
                     .child(
                         h_flex()
                             .id(SharedString::from(format!("cmd-{}", entry.id)))
-                            .gap_2()
+                            .gap(px(8.))
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| this.toggle(&entry_id, cx)))
-                            .child(icon("terminal").small().text_color(muted))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_family(mono.clone())
-                                    .text_xs()
-                                    .child(command.clone()),
-                            )
-                            .when(*status == ItemStatus::InProgress, |el| el.child(Spinner::new().xsmall()))
-                            .child(div().text_xs().text_color(badge_color).child(badge)),
+                            .child(div().flex_none().text_color(t.fg_subtle).child("run"))
+                            .child(div().flex_1().min_w_0().truncate().text_color(t.fg).child(command.clone()))
+                            .when(*status == ItemStatus::InProgress, |el| {
+                                el.child(Spinner::new().xsmall().color(t.accent_text))
+                            })
+                            .child(div().flex_none().text_color(badge_color).child(badge)),
                     )
                     .when(!dir.is_empty() && expanded, |el| {
-                        el.child(div().text_xs().text_color(muted).child(format!("in {dir}")))
+                        el.child(div().text_color(t.fg_subtle).child(format!("in {dir}")))
                     })
                     .when(!shown.is_empty(), |el| {
                         el.child(
                             div()
-                                .p_2()
-                                .rounded_sm()
-                                .bg(theme.background)
-                                .font_family(mono.clone())
-                                .text_xs()
+                                .p(px(8.))
+                                .rounded(px(5.))
+                                .bg(t.surface)
+                                .border_1()
+                                .border_color(t.border)
                                 .text_color(muted)
                                 .whitespace_normal()
                                 .child(shown),
                         )
                     })
                     .when(more, |el| {
-                        el.child(div().text_xs().text_color(muted).child(format!(
-                            "{} more lines — click the command to expand",
+                        el.child(div().text_color(t.fg_subtle).child(format!(
+                            "{} more lines · click the command to expand",
                             lines.len() - COLLAPSED_OUTPUT_LINES
                         )))
                     })
                     .into_any_element()
             }
             EntryKind::FileChange { files, status } => {
-                let mut card = card(border).child(
-                    h_flex()
-                        .gap_2()
-                        .child(icon("file-diff").small().text_color(muted))
-                        .child(section_title(
-                            match status {
-                                ItemStatus::InProgress => "Editing files",
-                                ItemStatus::Declined => "Edit declined",
-                                ItemStatus::Failed => "Edit failed",
-                                _ => "Edited files",
-                            },
-                            muted,
-                        )),
-                );
+                let verb = match status {
+                    ItemStatus::InProgress => "editing",
+                    ItemStatus::Declined => "declined",
+                    ItemStatus::Failed => "failed",
+                    _ => "edit",
+                };
+                let mut card = v_flex().gap(px(4.));
                 for (ix, file) in files.iter().enumerate() {
-                    card = card.child(self.render_changed_file(&entry.id, ix, file, cwd, cx));
+                    card = card.child(self.render_changed_file(&entry.id, ix, verb, *status, file, cwd, cx));
                 }
                 card.into_any_element()
             }
             EntryKind::Tool { label, detail, success } => {
                 let (mark, color) = match success {
-                    Some(true) => ("✓", theme::added(cx)),
-                    Some(false) => ("✗", cx.theme().danger),
-                    None => ("…", muted),
+                    Some(true) => ("done", t.success),
+                    Some(false) => ("failed", t.danger),
+                    None => ("…", t.fg_subtle),
                 };
-                h_flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(icon("wrench").xsmall())
-                    .child(div().text_color(cx.theme().foreground).child(label.clone()))
-                    .when_some(detail.clone(), |el, detail| {
-                        el.child(div().flex_1().min_w_0().truncate().child(detail))
-                    })
-                    .child(div().text_color(color).child(mark))
+                activity_card(&t)
+                    .child(
+                        h_flex()
+                            .gap(px(8.))
+                            .child(div().flex_none().text_color(t.fg).child(label.clone()))
+                            .when_some(detail.clone(), |el, detail| {
+                                el.child(div().flex_1().min_w_0().truncate().text_color(muted).child(detail))
+                            })
+                            .when(detail.is_none(), |el| el.child(div().flex_1()))
+                            .child(div().flex_none().text_color(color).child(mark)),
+                    )
                     .into_any_element()
             }
             EntryKind::Approval { request_id, kind, state } => {
                 self.render_approval(thread_id, &entry.id, request_id, kind, *state, cx)
             }
             EntryKind::Error { message } => div()
-                .px_3()
-                .py_2()
-                .rounded_md()
+                .px(px(12.))
+                .py(px(8.))
+                .rounded(RADIUS)
+                .bg(t.danger.alpha(0.08))
                 .border_1()
-                .border_color(theme.danger)
-                .text_sm()
-                .text_color(theme.danger)
+                .border_color(t.danger.alpha(0.3))
+                .text_size(TEXT_BODY)
+                .text_color(t.danger)
                 .child(message.clone())
                 .into_any_element(),
             EntryKind::Notice { text } => div()
                 .w_full()
                 .text_center()
-                .text_xs()
-                .text_color(muted)
+                .text_size(TEXT_SMALL)
+                .text_color(t.fg_subtle)
                 .child(text.clone())
                 .into_any_element(),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_changed_file(
         &self,
         entry_id: &str,
         ix: usize,
+        verb: &'static str,
+        status: ItemStatus,
         file: &ChangedFile,
         cwd: &std::path::Path,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let t = tokens(cx).clone();
         let key = format!("{entry_id}/{ix}");
         let expanded = self.expanded.contains(&key);
-        let muted = cx.theme().muted_foreground;
         let path = cwd.join(&file.path);
         let (added, removed) = diff_stats(&file.diff);
         let toggle_key = key.clone();
-        v_flex()
-            .gap_1()
+        let has_diff = !file.diff.is_empty();
+        activity_card(&t)
             .child(
                 h_flex()
-                    .gap_2()
-                    .text_xs()
-                    .child(
-                        Button::new(SharedString::from(format!("toggle-{key}")))
-                            .icon(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                            .ghost()
-                            .xsmall()
-                            .disabled(file.diff.is_empty())
-                            .on_click(cx.listener(move |this, _, _, cx| this.toggle(&toggle_key, cx))),
-                    )
+                    .id(SharedString::from(format!("toggle-{key}")))
+                    .gap(px(8.))
+                    .when(has_diff, |el| {
+                        el.cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| this.toggle(&toggle_key, cx)))
+                    })
+                    .child(div().flex_none().text_color(t.fg_subtle).child(verb))
                     .child(
                         div()
                             .id(SharedString::from(format!("open-{key}")))
                             .flex_1()
                             .min_w_0()
                             .truncate()
+                            .text_color(t.fg)
                             .cursor_pointer()
                             .hover(|s| s.underline())
                             .child(file.path.clone())
                             .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
                                 cx.emit(AgentPanelEvent::OpenFile(path.clone()));
                             })),
                     )
-                    .child(div().text_color(muted).child(file.change.clone()))
-                    .when(added > 0, |el| el.child(div().text_color(theme::added(cx)).child(format!("+{added}"))))
-                    .when(removed > 0, |el| el.child(div().text_color(theme::deleted(cx)).child(format!("-{removed}")))),
+                    .when(status == ItemStatus::InProgress, |el| {
+                        el.child(Spinner::new().xsmall().color(t.accent_text))
+                    })
+                    .when(added > 0, |el| el.child(div().flex_none().text_color(t.success).child(format!("+{added}"))))
+                    .when(removed > 0, |el| el.child(div().flex_none().text_color(t.danger).child(format!("−{removed}"))))
+                    .when(has_diff, |el| {
+                        el.child(
+                            gpui_component::Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+                                .size(px(12.))
+                                .text_color(t.fg_subtle),
+                        )
+                    }),
             )
             .when(expanded, |el| el.child(render_diff(&file.diff, cx)))
             .into_any_element()
@@ -656,11 +803,10 @@ impl AgentPanel {
         state: ApprovalState,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
+        let t = tokens(cx).clone();
         let (title, body, reason) = match kind {
             ApprovalKind::Command { command, cwd, reason } => (
-                "Run this command?",
+                "Run this command?".to_string(),
                 Some(format!(
                     "{}{}",
                     command.clone().unwrap_or_else(|| "(command not shown)".into()),
@@ -669,20 +815,20 @@ impl AgentPanel {
                 reason.clone(),
             ),
             ApprovalKind::FileChange { reason, grant_root } => (
-                "Apply these file changes?",
+                "Apply these file changes?".to_string(),
                 grant_root.as_ref().map(|root| format!("Also allow writes under {root} for this session")),
                 reason.clone(),
             ),
+            ApprovalKind::Tool { tool, detail, reason } => (format!("Allow {tool}?"), detail.clone(), reason.clone()),
         };
         let outcome = match state {
             ApprovalState::Pending => None,
-            ApprovalState::Accepted => Some(("Approved", theme::added(cx))),
-            ApprovalState::AcceptedForSession => Some(("Approved for this session", theme::added(cx))),
-            ApprovalState::Declined => Some(("Declined", theme.danger)),
-            ApprovalState::Expired => Some(("No longer needed", muted)),
+            ApprovalState::Accepted => Some(("Approved", t.success)),
+            ApprovalState::AcceptedForSession => Some(("Approved for this session", t.success)),
+            ApprovalState::Declined => Some(("Declined", t.danger)),
+            ApprovalState::Expired => Some(("No longer needed", t.fg_subtle)),
         };
-        let border = if state == ApprovalState::Pending { theme.warning } else { theme.border };
-        let mono = theme.mono_font_family.clone();
+        let pending = outcome.is_none();
 
         let decide = |label: &'static str, suffix: &str, decision: ApprovalDecision| {
             let thread_id = thread_id.to_string();
@@ -696,33 +842,36 @@ impl AgentPanel {
                 }))
         };
 
-        card(border)
+        attention_card(&t, pending)
             .child(
                 h_flex()
-                    .gap_2()
-                    .child(icon("shield-check").small().text_color(if outcome.is_none() { theme.warning } else { muted }))
-                    .child(div().text_sm().font_semibold().child(title)),
+                    .gap(px(8.))
+                    .child(icon("shield-check").size(px(14.)).text_color(if pending { t.warning } else { t.fg_subtle }))
+                    .child(div().text_size(TEXT_BODY).font_semibold().child(title)),
             )
             .when_some(body, |el, body| {
                 el.child(
                     div()
-                        .p_2()
-                        .rounded_sm()
-                        .bg(theme.background)
-                        .font_family(mono)
-                        .text_xs()
+                        .p(px(8.))
+                        .rounded(px(5.))
+                        .bg(t.surface)
+                        .border_1()
+                        .border_color(t.border)
+                        .font_family(t.mono.clone())
+                        .text_size(TEXT_SMALL)
                         .child(body),
                 )
             })
-            .when_some(reason, |el, reason| el.child(div().text_xs().text_color(muted).child(reason)))
+            .when_some(reason, |el, reason| el.child(div().text_size(TEXT_SMALL).text_color(t.fg_muted).child(reason)))
             .map(|el| match outcome {
-                Some((label, color)) => el.child(div().text_xs().text_color(color).child(label)),
+                Some((label, color)) => el.child(div().text_size(TEXT_SMALL).text_color(color).child(label)),
                 None => el.child(
                     h_flex()
-                        .gap_2()
+                        .gap(px(6.))
                         .child(decide("Approve", "accept", ApprovalDecision::Accept).primary())
                         .child(decide("Approve for session", "session", ApprovalDecision::AcceptForSession))
-                        .child(decide("Decline", "decline", ApprovalDecision::Decline).danger()),
+                        .child(div().flex_1())
+                        .child(decide("Decline", "decline", ApprovalDecision::Decline).ghost()),
                 ),
             })
             .into_any_element()
@@ -733,7 +882,8 @@ impl AgentPanel {
     /// Browser actions waiting for the user, and the live plan.
     fn render_pending(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let controller = self.controller.read(cx);
-        let theme = cx.theme();
+        let agent_name = controller.agent_name();
+        let t = tokens(cx).clone();
         let pending: Vec<(String, String)> = controller
             .pending_tools()
             .iter()
@@ -747,45 +897,44 @@ impl AgentPanel {
         if pending.is_empty() && plan.is_empty() {
             return None;
         }
-        let muted = theme.muted_foreground;
-        let mut column = v_flex().px_3().pt_2().gap_2();
+        let mut column = v_flex().px(px(14.)).pt(px(12.)).pb(px(4.)).gap(px(10.)).border_t_1().border_color(t.border);
         if !plan.is_empty() {
-            let mut steps = card(theme.border).child(
-                h_flex()
-                    .gap_2()
-                    .child(icon("list-checks").small().text_color(muted))
-                    .child(section_title("Plan", muted)),
-            );
+            let mut steps = v_flex().gap(px(7.)).child(caps_label("Plan", cx));
             for (step, status) in plan {
-                let (mark, color) = match status {
-                    PlanStepStatus::Completed => ("●", theme::added(cx)),
-                    PlanStepStatus::InProgress => ("◐", cx.theme().warning),
-                    _ => ("○", muted),
-                };
                 steps = steps.child(
                     h_flex()
-                        .gap_2()
-                        .text_xs()
-                        .child(div().text_color(color).child(mark))
-                        .child(div().flex_1().child(step)),
+                        .gap(px(8.))
+                        .text_size(TEXT_BODY)
+                        .child(plan_marker(status, &t))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(match status {
+                                    PlanStepStatus::Completed => t.fg_muted,
+                                    PlanStepStatus::InProgress => t.fg,
+                                    _ => t.fg_muted,
+                                })
+                                .child(step),
+                        ),
                 );
             }
             column = column.child(steps);
         }
         for (ix, (action, reason)) in pending.into_iter().enumerate() {
             column = column.child(
-                card(cx.theme().warning)
+                attention_card(&t, true)
                     .child(
                         h_flex()
-                            .gap_2()
-                            .child(IconName::Globe)
-                            .child(div().text_sm().font_semibold().child("Browser action needs approval")),
+                            .gap(px(8.))
+                            .child(gpui_component::Icon::new(IconName::Globe).size(px(14.)).text_color(t.warning))
+                            .child(div().text_size(TEXT_BODY).font_semibold().child("Browser action needs approval")),
                     )
-                    .child(div().text_xs().child(format!("Codex wants to {action}.")))
-                    .child(div().text_xs().text_color(muted).child(reason))
+                    .child(div().text_size(TEXT_SMALL).child(format!("{agent_name} wants to {action}.")))
+                    .child(div().text_size(TEXT_SMALL).text_color(t.fg_muted).child(reason))
                     .child(
                         h_flex()
-                            .gap_2()
+                            .gap(px(6.))
                             .child(
                                 Button::new(("tool-allow", ix))
                                     .label("Allow")
@@ -798,7 +947,7 @@ impl AgentPanel {
                             .child(
                                 Button::new(("tool-deny", ix))
                                     .label("Deny")
-                                    .danger()
+                                    .ghost()
                                     .xsmall()
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.controller.update(cx, |c, cx| c.answer_tool(ix, false, cx));
@@ -810,14 +959,14 @@ impl AgentPanel {
         Some(column.into_any_element())
     }
 
-    fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let controller = self.controller.read(cx);
         let connected = matches!(controller.state(), ConnectionState::Connected { .. }) && !controller.needs_login();
         let running = controller.is_running();
         let queued = controller.queued();
         let empty = self.composer.read(cx).value().trim().is_empty();
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
+        let focused = self.composer.read(cx).focus_handle(cx).is_focused(window);
+        let t = tokens(cx).clone();
 
         let model_label: SharedString = match (controller.model(), controller.effective_model()) {
             (_, Some(model)) => model.display_name.clone().into(),
@@ -837,6 +986,8 @@ impl AgentPanel {
             .into();
         let permissions = controller.permissions();
         let browser_tools = controller.browser_tools();
+        let browser_tooltip: SharedString =
+            format!("Let {} use the built-in browser (applies to new threads)", controller.agent_name()).into();
         let usage_today = controller.usage_today();
         let context = controller.active_thread().and_then(|t| {
             let usage = t.transcript.usage()?;
@@ -855,7 +1006,10 @@ impl AgentPanel {
                 let current = controller.model().map(str::to_string);
                 let default_handle = handle.clone();
                 menu = menu.item(
-                    PopupMenuItem::new("Server default")
+                    PopupMenuItem::new(match controller.provider() {
+                        Provider::OpenAi => "Server default",
+                        Provider::Anthropic => "Default (Claude Opus 5.5)",
+                    })
                         .checked(current.is_none())
                         .on_click(move |_, _, cx| default_handle.update(cx, |c, cx| c.set_model(None, cx))),
                 );
@@ -907,10 +1061,11 @@ impl AgentPanel {
             .dropdown_caret(true)
             .dropdown_menu(move |mut menu, _, cx| {
                 let current = handle.read(cx).permissions();
+                let provider = handle.read(cx).provider();
                 for preset in PermissionPreset::ALL {
                     let handle = handle.clone();
                     menu = menu.item(
-                        PopupMenuItem::new(permission_description(preset))
+                        PopupMenuItem::new(permission_description(preset, provider))
                             .checked(current == preset)
                             .on_click(move |_, _, cx| handle.update(cx, |c, cx| c.set_permissions(preset, cx))),
                     );
@@ -920,8 +1075,7 @@ impl AgentPanel {
 
         let action_button = if running && empty {
             Button::new("agent-stop")
-                .icon(icon("circle-stop"))
-                .danger()
+                .icon(icon("square"))
                 .small()
                 .tooltip("Stop (⌃C)")
                 .on_click(cx.listener(|this, _, _, cx| this.controller.update(cx, |c, cx| c.interrupt(cx))))
@@ -930,57 +1084,78 @@ impl AgentPanel {
                 .icon(icon("arrow-up"))
                 .primary()
                 .small()
-                .tooltip(if running { "Queue after the running turn" } else { "Send (Enter)" })
+                .tooltip(if running { "Queue after the running turn (↩)" } else { "Send (↩)" })
                 .disabled(empty || !connected)
                 .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
         };
 
         v_flex()
-            .p_2()
-            .gap_1()
-            .border_t_1()
-            .border_color(theme.border)
+            .flex_none()
+            .px(px(12.))
+            .pt(px(8.))
+            .pb(px(10.))
+            .gap(px(6.))
             .child(
-                div()
-                    .rounded_md()
+                v_flex()
+                    .rounded(RADIUS_LG)
                     .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.background)
-                    .px_1()
+                    .border_color(if focused { t.accent.alpha(0.55) } else { t.border_strong })
+                    .bg(t.surface)
+                    .when(!t.dark, |el| el.shadow_xs())
                     .child(
-                        Input::new(&self.composer)
-                            .appearance(false)
-                            .disabled(!connected),
+                        h_flex()
+                            .items_start()
+                            .pl(px(6.))
+                            .pr(px(10.))
+                            .pt(px(4.))
+                            .child(
+                                div().flex_1().text_size(TEXT_BODY).child(
+                                    Input::new(&self.composer)
+                                        .appearance(false)
+                                        .disabled(!connected),
+                                ),
+                            )
+                            // The shortcut that brings you here, while you are elsewhere.
+                            .when(empty && !focused, |el| el.child(div().pt(px(7.)).child(key_chip("⌘L", cx)))),
+                    )
+                    .child(
+                        h_flex()
+                            .px(px(6.))
+                            .pb(px(6.))
+                            .gap(px(2.))
+                            .child(div().flex_shrink().min_w_0().overflow_hidden().child(model_menu))
+                            .child(effort_menu)
+                            .child(permissions_menu)
+                            .child(div().flex_1())
+                            .child(
+                                h_flex()
+                                    .gap(px(5.))
+                                    .text_color(if browser_tools { t.accent_text } else { t.fg_subtle })
+                                    .child(gpui_component::Icon::new(IconName::Globe).size(px(13.)))
+                                    .child(Switch::new("browser-tools")
+                                    .checked(browser_tools)
+                                    .xsmall()
+                                    .tooltip(browser_tooltip)
+                                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                        let checked = *checked;
+                                        this.controller.update(cx, |c, cx| c.set_browser_tools(checked, cx));
+                                    }))),
+                            )
+                            .child(div().w(px(6.)))
+                            .child(action_button),
                     ),
             )
             .child(
                 h_flex()
-                    .gap_1()
-                    .child(model_menu)
-                    .child(effort_menu)
-                    .child(permissions_menu)
-                    .child(
-                        Switch::new("browser-tools")
-                            .checked(browser_tools)
-                            .label("Browser")
-                            .xsmall()
-                            .tooltip("Let Codex use the built-in browser (applies to new threads)")
-                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                let checked = *checked;
-                                this.controller.update(cx, |c, cx| c.set_browser_tools(checked, cx));
-                            })),
-                    )
+                    .px(px(4.))
+                    .gap(px(6.))
+                    .text_size(TEXT_SMALL)
+                    .text_color(t.fg_subtle)
+                    .child(format!("Today {} tokens", format_tokens(usage_today)))
+                    .when_some(context, |el, pct| el.child(format!("· context {pct}%")))
+                    .when(queued > 0, |el| el.child(format!("· {queued} queued")))
                     .child(div().flex_1())
-                    .child(action_button),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(format!("Today: {} tokens", format_tokens(usage_today)))
-                    .when_some(context, |el, pct| el.child(format!("· Context {pct}%")))
-                    .when(queued > 0, |el| el.child(format!("· {queued} queued"))),
+                    .child("↩ send · ⇧↩ newline"),
             )
     }
 }
@@ -994,6 +1169,7 @@ impl Focusable for AgentPanel {
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_output(cx);
+        self.sync_placeholder(window, cx);
         let connection = self.render_connection(cx);
         let login = if connection.is_none() { self.render_login(cx) } else { None };
         let body = if connection.is_some() || login.is_some() {
@@ -1005,7 +1181,7 @@ impl Render for AgentPanel {
         v_flex()
             .key_context("AgentComposer")
             .size_full()
-            .bg(cx.theme().background)
+            .text_color(tokens(cx).fg)
             .on_action(cx.listener(|this, _: &actions::InterruptAgent, _, cx| {
                 this.controller.update(cx, |c, cx| c.interrupt(cx));
             }))
@@ -1026,18 +1202,61 @@ impl Render for AgentPanel {
                 None => el.child(div().flex_1()),
             })
             .children(self.render_pending(cx))
-            .child(self.render_composer(cx))
+            .child(self.render_composer(window, cx))
     }
 }
 
 // --- helpers -----------------------------------------------------------------
 
-fn card(border: Hsla) -> gpui::Div {
-    v_flex().p_2().gap_1p5().rounded_md().border_1().border_color(border)
+/// A quiet box for one step of agent activity: commands, edits, tools.
+fn activity_card(t: &Tokens) -> gpui::Div {
+    v_flex()
+        .px(px(10.))
+        .py(px(7.))
+        .gap(px(6.))
+        .rounded(RADIUS)
+        .bg(t.raised)
+        .font_family(t.mono.clone())
+        .text_size(px(11.5))
 }
 
-fn section_title(text: &'static str, color: Hsla) -> impl IntoElement {
-    div().text_xs().font_semibold().text_color(color).child(text)
+/// A box that asks for a decision; it calms down once answered.
+fn attention_card(t: &Tokens, pending: bool) -> gpui::Div {
+    v_flex()
+        .p(px(12.))
+        .gap(px(8.))
+        .rounded(RADIUS_LG)
+        .border_1()
+        .when(pending, |el| el.border_color(t.warning.alpha(0.45)).bg(t.warning.alpha(0.06)))
+        .when(!pending, |el| el.border_color(t.border))
+}
+
+/// A card for connection and sign-in states.
+fn notice_card(t: &Tokens) -> gpui::Div {
+    v_flex()
+        .m(px(14.))
+        .p(px(14.))
+        .gap(px(10.))
+        .rounded(RADIUS_LG)
+        .border_1()
+        .border_color(t.border)
+        .text_size(TEXT_BODY)
+}
+
+/// The check circle in front of a plan step.
+fn plan_marker(status: PlanStepStatus, t: &Tokens) -> impl IntoElement {
+    let base = div().flex_none().size(px(14.)).rounded_full().flex().items_center().justify_center();
+    match status {
+        PlanStepStatus::Completed => base
+            .bg(t.accent)
+            .text_color(t.accent_fg)
+            .child(gpui_component::Icon::new(IconName::Check).size(px(9.))),
+        PlanStepStatus::InProgress => base
+            .border_1()
+            .border_color(t.accent)
+            .child(div().size(px(6.)).rounded_full().bg(t.accent)),
+        _ => base.border_1().border_color(t.border_strong),
+    }
 }
 
 fn relative_px(fraction: f32) -> gpui::Length {
@@ -1053,39 +1272,45 @@ fn command_badge(
     let duration = duration_ms
         .map(|ms| if ms >= 1000 { format!(" · {:.1}s", ms as f64 / 1000.0) } else { format!(" · {ms}ms") })
         .unwrap_or_default();
+    let t = tokens(cx);
     match (status, exit_code) {
-        (ItemStatus::InProgress, _) => ("running".into(), cx.theme().muted_foreground),
-        (ItemStatus::Declined, _) => ("declined".into(), cx.theme().danger),
-        (_, Some(0)) => (format!("exit 0{duration}"), theme::added(cx)),
-        (_, Some(code)) => (format!("exit {code}{duration}"), cx.theme().danger),
-        (ItemStatus::Failed, None) => ("failed".into(), cx.theme().danger),
-        _ => (format!("done{duration}"), cx.theme().muted_foreground),
+        (ItemStatus::InProgress, _) => ("running".into(), t.fg_subtle),
+        (ItemStatus::Declined, _) => ("declined".into(), t.danger),
+        (_, Some(0)) => (format!("ok{duration}"), t.fg_subtle),
+        (_, Some(code)) => (format!("exit {code}{duration}"), t.danger),
+        (ItemStatus::Failed, None) => ("failed".into(), t.danger),
+        _ => (format!("done{duration}"), t.fg_subtle),
     }
 }
 
 fn render_diff(diff: &str, cx: &App) -> AnyElement {
-    let added = theme::added(cx);
-    let deleted = theme::deleted(cx);
-    let muted = cx.theme().muted_foreground;
+    let t = tokens(cx);
     let mut lines = v_flex()
-        .p_2()
-        .rounded_sm()
-        .bg(cx.theme().background)
-        .font_family(cx.theme().mono_font_family.clone())
-        .text_xs();
+        .py(px(4.))
+        .rounded(px(5.))
+        .bg(t.surface)
+        .border_1()
+        .border_color(t.border)
+        .overflow_hidden();
     for line in tail_chars(diff, MAX_OUTPUT_CHARS).lines() {
-        let color = if line.starts_with("+++") || line.starts_with("---") {
-            muted
+        let (color, bg) = if line.starts_with("+++") || line.starts_with("---") {
+            (t.fg_subtle, None)
         } else if line.starts_with('+') {
-            added
+            (t.fg, Some(t.added_bg()))
         } else if line.starts_with('-') {
-            deleted
+            (t.fg, Some(t.removed_bg()))
         } else if line.starts_with("@@") {
-            cx.theme().accent_foreground
+            (t.accent_text, None)
         } else {
-            cx.theme().foreground
+            (t.fg_muted, None)
         };
-        lines = lines.child(div().text_color(color).child(if line.is_empty() { " ".to_string() } else { line.to_string() }));
+        lines = lines.child(
+            div()
+                .px(px(8.))
+                .text_color(color)
+                .when_some(bg, |el, bg| el.bg(bg))
+                .child(if line.is_empty() { " ".to_string() } else { line.to_string() }),
+        );
     }
     lines.into_any_element()
 }
@@ -1150,13 +1375,37 @@ fn tail_chars(text: &str, max: usize) -> &str {
     &text[start..]
 }
 
-fn permission_description(preset: PermissionPreset) -> String {
-    let detail = match preset {
-        PermissionPreset::ReadOnly => "reads files; asks before edits and commands",
-        PermissionPreset::Auto => "edits the workspace and runs sandboxed commands",
-        PermissionPreset::FullAccess => "no sandbox, never asks",
+fn permission_description(preset: PermissionPreset, provider: Provider) -> String {
+    let detail = match (provider, preset) {
+        (_, PermissionPreset::ReadOnly) => "reads files; asks before edits and commands",
+        (Provider::OpenAi, PermissionPreset::Auto) => "edits the workspace and runs sandboxed commands",
+        // Claude Code has no sandbox here, so commands still ask.
+        (Provider::Anthropic, PermissionPreset::Auto) => "edits files without asking; asks before commands",
+        (Provider::OpenAi, PermissionPreset::FullAccess) => "no sandbox, never asks",
+        (Provider::Anthropic, PermissionPreset::FullAccess) => "never asks (bypasses permissions)",
     };
     format!("{} — {detail}", preset.label())
+}
+
+/// The OpenAI / Anthropic switch in the panel header.
+fn provider_menu(handle: Entity<AgentController>, current: Provider) -> impl IntoElement {
+    Button::new("provider-picker")
+        .label(current.agent_name())
+        .ghost()
+        .xsmall()
+        .dropdown_caret(true)
+        .tooltip("Switch between OpenAI Codex and Anthropic Claude")
+        .dropdown_menu(move |mut menu, _, _| {
+            for provider in Provider::ALL {
+                let handle = handle.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(format!("{} · {}", provider.agent_name(), provider.company()))
+                        .checked(provider == current)
+                        .on_click(move |_, _, cx| handle.update(cx, |c, cx| c.set_provider(provider, cx))),
+                );
+            }
+            menu
+        })
 }
 
 fn format_tokens(tokens: i64) -> String {
@@ -1181,6 +1430,15 @@ mod tests {
     fn tail_respects_char_boundaries() {
         assert_eq!(tail_chars("héllo", 4), "llo");
         assert_eq!(tail_chars("abc", 10), "abc");
+    }
+
+    #[test]
+    fn permission_wording_follows_the_provider() {
+        // Claude Code has no command sandbox, so "Auto" must not promise one.
+        assert!(permission_description(PermissionPreset::Auto, Provider::OpenAi).contains("sandboxed"));
+        let claude = permission_description(PermissionPreset::Auto, Provider::Anthropic);
+        assert!(claude.contains("asks before commands") && !claude.contains("sandbox"));
+        assert!(permission_description(PermissionPreset::ReadOnly, Provider::Anthropic).starts_with("Read only"));
     }
 
     #[test]

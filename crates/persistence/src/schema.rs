@@ -117,6 +117,11 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE agent_threads ADD COLUMN usage_baseline TEXT;
     "#,
+    // 3: which agent provider a thread belongs to ("openai", "anthropic").
+    // Older rows are Codex threads.
+    r#"
+    ALTER TABLE agent_threads ADD COLUMN provider TEXT;
+    "#,
 ];
 
 table! {
@@ -165,7 +170,8 @@ table! {
 }
 
 table! {
-    /// Codex threads the IDE knows about, so they can be resumed.
+    /// Agent threads (Codex or Claude) the IDE knows about, so they can be
+    /// resumed.
     pub enum AgentThreads = "agent_threads" {
         ThreadId = "thread_id",
         WorkspaceId = "workspace_id",
@@ -177,6 +183,8 @@ table! {
         Archived = "archived",
         /// JSON `TokenCounts`: the thread's cumulative usage last recorded.
         UsageBaseline = "usage_baseline",
+        /// "openai" or "anthropic"; NULL for threads from before providers.
+        Provider = "provider",
     }
 }
 

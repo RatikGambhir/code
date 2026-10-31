@@ -1,8 +1,9 @@
 //! The agent backend abstraction.
 //!
-//! The UI and orchestrator talk to an [`AgentBackend`], not to Codex
-//! directly, so another backend that can host threads, stream events and ask
-//! for approvals could be dropped in without touching the GPUI views.
+//! The UI and orchestrator talk to an [`AgentBackend`], not to Codex or
+//! Claude directly: both backends host threads, stream the same events and
+//! ask for approvals the same way, so the GPUI views do not care which one
+//! is connected.
 //! Futures are boxed and `'static` so the trait is object safe and any
 //! executor can drive them.
 
@@ -50,6 +51,9 @@ pub trait AgentBackend: Send + Sync + 'static {
     fn models(&self) -> BoxFuture<'static, Result<Vec<Model>>>;
     fn account(&self) -> BoxFuture<'static, Result<GetAccountResponse>>;
     fn login(&self, params: LoginParams) -> BoxFuture<'static, Result<LoginResponse>>;
+    /// The user says they signed in again after a turn was refused for
+    /// authentication; stop reporting the account as signed out.
+    fn forget_auth_failure(&self) {}
     fn shutdown(&self);
 }
 

@@ -19,10 +19,13 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement as _,
-    v_flex, ActiveTheme as _, IconName, Selectable as _, Sizable as _,
+    v_flex, IconName, Selectable as _, Sizable as _,
 };
 
-use crate::theme;
+use crate::{
+    chrome::{self, panel_header},
+    theme::{tokens, RADIUS, TEXT_MONO, TEXT_SMALL},
+};
 
 const DEBOUNCE: Duration = Duration::from_millis(200);
 const MAX_RESULTS: usize = 2000;
@@ -140,12 +143,13 @@ impl SearchPanel {
     }
 
     fn render_results(&self, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
+        let t = tokens(cx).clone();
         let highlight = HighlightStyle {
-            background_color: Some(cx.theme().warning.opacity(0.35)),
+            background_color: Some(t.accent.alpha(if t.dark { 0.35 } else { 0.2 })),
+            color: Some(t.fg),
             ..Default::default()
         };
-        let mut list = v_flex();
+        let mut list = v_flex().px(px(6.)).pb(px(8.));
         let mut current: Option<&PathBuf> = None;
         for (ix, found) in self.results.iter().enumerate() {
             if current != Some(&found.path) {
@@ -153,10 +157,13 @@ impl SearchPanel {
                 let count = self.results.iter().filter(|m| m.path == found.path).count();
                 list = list.child(
                     h_flex()
-                        .h(px(24.))
-                        .px_3()
+                        .h(px(28.))
+                        .mt(px(4.))
+                        .px(px(8.))
                         .gap_2()
-                        .text_sm()
+                        .font_family(t.mono.clone())
+                        .text_size(TEXT_MONO)
+                        .text_color(t.fg)
                         .child(
                             div()
                                 .flex_1()
@@ -164,7 +171,15 @@ impl SearchPanel {
                                 .truncate()
                                 .child(found.path.to_string_lossy().into_owned()),
                         )
-                        .child(div().text_xs().text_color(muted).child(count.to_string())),
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .rounded_full()
+                                .bg(t.raised)
+                                .text_size(px(10.5))
+                                .text_color(t.fg_muted)
+                                .child(count.to_string()),
+                        ),
                 );
             }
             // Trim leading whitespace but keep the highlight aligned.
@@ -175,19 +190,16 @@ impl SearchPanel {
             let line = found.line_number.saturating_sub(1) as u32;
             let column = found.line_text[..found.range.start.min(found.line_text.len())].chars().count() as u32;
             list = list.child(
-                h_flex()
-                    .id(("search-match", ix))
-                    .h(px(22.))
-                    .pl(px(28.))
-                    .pr_2()
-                    .gap_2()
-                    .text_xs()
-                    .cursor_pointer()
-                    .hover(|el| el.bg(theme::hover_overlay(cx)))
+                chrome::list_row(("search-match", ix), false, cx)
+                    .h(px(24.))
+                    .pl(px(12.))
+                    .font_family(t.mono.clone())
+                    .text_size(TEXT_SMALL)
+                    .text_color(t.fg_muted)
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(SearchPanelEvent::OpenMatch { path: path.clone(), line, column });
                     }))
-                    .child(div().w(px(32.)).flex_none().text_color(muted).child(found.line_number.to_string()))
+                    .child(div().w(px(30.)).flex_none().text_color(t.fg_subtle).child(found.line_number.to_string()))
                     .child(
                         div()
                             .flex_1()
@@ -219,7 +231,7 @@ fn clip_line(line: &str, range: std::ops::Range<usize>) -> (SharedString, std::o
 
 impl Render for SearchPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
+        let t = tokens(cx).clone();
         let option = |id: &'static str, label: &'static str, tooltip: &'static str, on: bool| {
             Button::new(id).label(label).ghost().xsmall().selected(on).tooltip(tooltip)
         };
@@ -241,21 +253,19 @@ impl Render for SearchPanel {
 
         v_flex()
             .size_full()
-            .child(
-                h_flex()
-                    .h(px(30.))
-                    .px_3()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(muted)
-                    .child("SEARCH"),
-            )
+            .child(panel_header("Search", cx))
             .child(
                 v_flex()
-                    .px_3()
-                    .pb_2()
-                    .gap_1()
-                    .child(Input::new(&self.query).small().cleanable(true).prefix(IconName::Search))
+                    .px(px(12.))
+                    .pb(px(8.))
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .rounded(RADIUS)
+                            .border_1()
+                            .border_color(t.border_strong)
+                            .child(Input::new(&self.query).small().appearance(false).cleanable(true).prefix(IconName::Search)),
+                    )
                     .child(
                         h_flex()
                             .gap_1()
@@ -272,7 +282,7 @@ impl Render for SearchPanel {
                                     .on_click(cx.listener(|this, _, _, cx| this.toggle_option(|o| &mut o.regex, cx))),
                             )
                             .child(div().flex_1())
-                            .child(div().text_xs().text_color(muted).truncate().child(summary)),
+                            .child(div().text_size(TEXT_SMALL).text_color(t.fg_subtle).truncate().child(summary)),
                     ),
             )
             .child(
@@ -280,6 +290,8 @@ impl Render for SearchPanel {
                     v_flex()
                         .id("search-results")
                         .size_full()
+                        .border_t_1()
+                        .border_color(t.border)
                         .overflow_y_scrollbar()
                         .child(self.render_results(cx)),
                 ),

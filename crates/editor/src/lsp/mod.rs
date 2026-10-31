@@ -31,7 +31,7 @@ use lsp_types::{
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
-pub use registry::{server_for_language, server_key, ServerConfig};
+pub use registry::{install_hint, resolve_server, server_for_language, server_key, ServerConfig};
 
 /// Something the server told us without being asked.
 #[derive(Clone, Debug)]
@@ -40,6 +40,22 @@ pub enum ServerEvent {
     Message {
         kind: lsp_types::MessageType,
         text: String,
+    },
+    /// Work the server reports progress on (`$/progress`), such as
+    /// rust-analyzer's indexing and `cargo check` runs.
+    Progress {
+        token: String,
+        title: Option<String>,
+        message: Option<String>,
+        percentage: Option<u32>,
+        done: bool,
+    },
+    /// rust-analyzer's `experimental/serverStatus`: whether it has finished
+    /// loading the workspace, and whether that went well.
+    Status {
+        quiescent: bool,
+        healthy: bool,
+        message: Option<String>,
     },
     /// The server process went away.
     Exited,
@@ -62,6 +78,7 @@ pub struct LspClient {
     pending: Pending,
     next_id: AtomicI64,
     capabilities: OnceLock<ServerCapabilities>,
+    settings: OnceLock<Value>,
     child: Mutex<Option<Child>>,
 }
 
@@ -84,6 +101,9 @@ impl LspClient {
         let stdout = child.stdout.take().context("no stdout")?;
         let (client, events) = Self::connect(config.name.clone(), stdout, stdin);
         *client.child.lock() = Some(child);
+        if let Some(settings) = &config.settings {
+            let _ = client.settings.set(settings.clone());
+        }
         client.initialize(root).await?;
         Ok((client, events))
     }
@@ -101,6 +121,7 @@ impl LspClient {
             pending: Arc::new(Mutex::new(Some(HashMap::new()))),
             next_id: AtomicI64::new(1),
             capabilities: OnceLock::new(),
+            settings: OnceLock::new(),
             child: Mutex::new(None),
         });
         let weak = Arc::downgrade(&client);
@@ -201,6 +222,7 @@ impl LspClient {
                     .unwrap_or_default(),
             }]),
             capabilities: client_capabilities(),
+            initialization_options: self.settings.get().cloned(),
             client_info: Some(lsp_types::ClientInfo {
                 name: "Cockpit".into(),
                 version: Some(env!("CARGO_PKG_VERSION").into()),
@@ -315,6 +337,53 @@ impl LspClient {
         async move { request?.await }
     }
 
+    /// `textDocument/references`, including the declaration itself.
+    pub fn references(
+        &self,
+        path: &Path,
+        position: lsp_types::Position,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<lsp_types::Location>>>> + Send + 'static {
+        let request = path_to_uri(path).map(|uri| {
+            self.request::<request::References>(lsp_types::ReferenceParams {
+                text_document_position: lsp_types::TextDocumentPositionParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri },
+                    position,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: lsp_types::ReferenceContext {
+                    include_declaration: true,
+                },
+            })
+        });
+        async move { request?.await }
+    }
+
+    /// `textDocument/codeAction` for `range`, passing the diagnostics there so
+    /// servers can offer their fixes.
+    pub fn code_actions(
+        &self,
+        path: &Path,
+        range: lsp_types::Range,
+        diagnostics: Vec<lsp_types::Diagnostic>,
+    ) -> impl std::future::Future<Output = Result<Option<lsp_types::CodeActionResponse>>> + Send + 'static
+    {
+        let request = path_to_uri(path).map(|uri| {
+            self.request::<request::CodeActionRequest>(lsp_types::CodeActionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                range,
+                context: lsp_types::CodeActionContext {
+                    diagnostics,
+                    only: None,
+                    trigger_kind: Some(lsp_types::CodeActionTriggerKind::INVOKED),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+        });
+        async move { request?.await }
+    }
+
     /// Asks the server to shut down and exit.
     pub async fn shutdown(&self) -> Result<()> {
         let _ = self.request::<request::Shutdown>(()).await;
@@ -370,8 +439,22 @@ fn dispatch(
             let Some(client) = client.upgrade() else { return };
             let response = match method.as_str() {
                 "workspace/configuration" => {
-                    let items = message["params"]["items"].as_array().map_or(0, Vec::len);
-                    json!({"jsonrpc": "2.0", "id": id, "result": vec![Value::Null; items]})
+                    let result: Vec<Value> = message["params"]["items"]
+                        .as_array()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .map(|item| {
+                                    registry::settings_section(
+                                        &client.name,
+                                        client.settings.get(),
+                                        item.get("section").and_then(Value::as_str),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    json!({"jsonrpc": "2.0", "id": id, "result": result})
                 }
                 "window/workDoneProgress/create"
                 | "client/registerCapability"
@@ -397,6 +480,12 @@ fn dispatch(
                 notification::PublishDiagnostics::METHOD => {
                     serde_json::from_value(params).ok().map(ServerEvent::Diagnostics)
                 }
+                notification::Progress::METHOD => progress_event(&params),
+                "experimental/serverStatus" => Some(ServerEvent::Status {
+                    quiescent: params["quiescent"].as_bool().unwrap_or(true),
+                    healthy: params["health"].as_str().is_none_or(|h| h != "error"),
+                    message: params["message"].as_str().map(str::to_string),
+                }),
                 notification::ShowMessage::METHOD | notification::LogMessage::METHOD => {
                     serde_json::from_value::<lsp_types::ShowMessageParams>(params)
                         .ok()
@@ -415,6 +504,24 @@ fn dispatch(
     }
 }
 
+/// Reads a `$/progress` notification for work-done progress.
+fn progress_event(params: &Value) -> Option<ServerEvent> {
+    let token = match &params["token"] {
+        Value::String(token) => token.clone(),
+        Value::Number(token) => token.to_string(),
+        _ => return None,
+    };
+    let value = &params["value"];
+    let text = |key: &str| value[key].as_str().map(str::to_string);
+    Some(ServerEvent::Progress {
+        token,
+        title: text("title"),
+        message: text("message"),
+        percentage: value["percentage"].as_u64().map(|p| p.min(100) as u32),
+        done: value["kind"].as_str()? == "end",
+    })
+}
+
 fn client_capabilities() -> ClientCapabilities {
     serde_json::from_value(json!({
         "textDocument": {
@@ -429,11 +536,27 @@ fn client_capabilities() -> ClientCapabilities {
             },
             "hover": { "contentFormat": ["markdown", "plaintext"] },
             "definition": { "linkSupport": true },
+            "references": {},
+            "codeAction": {
+                "codeActionLiteralSupport": {
+                    "codeActionKind": {
+                        "valueSet": ["", "quickfix", "refactor", "refactor.extract",
+                                     "refactor.inline", "refactor.rewrite", "source",
+                                     "source.organizeImports"]
+                    }
+                },
+                "isPreferredSupport": true
+            },
             "publishDiagnostics": { "relatedInformation": false, "versionSupport": true }
         },
         "window": { "workDoneProgress": true },
         "workspace": { "configuration": true, "workspaceFolders": true },
-        "general": { "positionEncodings": ["utf-16"] }
+        // The editor counts columns in characters, which is UTF-32. Servers
+        // that only know UTF-16 (the protocol default) differ only on lines
+        // with characters outside the BMP, such as emoji.
+        "general": { "positionEncodings": ["utf-32", "utf-16"] },
+        // rust-analyzer: report when the workspace has finished loading.
+        "experimental": { "serverStatusNotification": true }
     }))
     .expect("static capabilities are valid")
 }
@@ -552,6 +675,36 @@ mod tests {
         // And requests made afterwards fail at once instead of hanging.
         let later = client.hover(Path::new("/tmp/x.rs"), lsp_types::Position::new(0, 0));
         assert!(futures::executor::block_on(later).is_err());
+    }
+
+    #[test]
+    fn progress_and_status_notifications_are_read() {
+        let begin = progress_event(&json!({
+            "token": "rustAnalyzer/Indexing",
+            "value": {"kind": "begin", "title": "Indexing", "percentage": 0}
+        }));
+        let Some(ServerEvent::Progress { token, title, done, .. }) = begin else { panic!() };
+        assert_eq!((token.as_str(), title.as_deref(), done), ("rustAnalyzer/Indexing", Some("Indexing"), false));
+
+        let end = progress_event(&json!({"token": 7, "value": {"kind": "end"}}));
+        assert!(matches!(end, Some(ServerEvent::Progress { done: true, ref token, .. }) if token == "7"));
+        assert!(progress_event(&json!({"token": null})).is_none());
+    }
+
+    #[test]
+    fn configuration_requests_get_the_server_settings() {
+        let (client_reader, mut server_writer) = std::io::pipe().unwrap();
+        let (server_reader, client_writer) = std::io::pipe().unwrap();
+        let (client, _events) = LspClient::connect("rust-analyzer", client_reader, client_writer);
+        client.settings.set(json!({"check": {"command": "clippy"}})).unwrap();
+        codec::write_message(&mut server_writer, &json!({
+            "jsonrpc": "2.0", "id": 1, "method": "workspace/configuration",
+            "params": {"items": [{"section": "rust-analyzer"}, {"section": "rust-analyzer.check"}, {}]}
+        })).unwrap();
+        let reply = codec::read_message(&mut BufReader::new(server_reader)).unwrap().unwrap();
+        assert_eq!(reply["result"][0]["check"]["command"], "clippy");
+        assert_eq!(reply["result"][1]["command"], "clippy");
+        assert_eq!(reply["result"][2]["check"]["command"], "clippy");
     }
 
     #[test]

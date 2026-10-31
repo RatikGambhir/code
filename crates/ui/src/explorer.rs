@@ -15,9 +15,12 @@ use gpui::{
     div, prelude::*, px, uniform_list, App, Context, ElementId, EventEmitter, FocusHandle,
     Focusable, Hsla, MouseButton, SharedString, UniformListScrollHandle, Window,
 };
-use gpui_component::{h_flex, v_flex, ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_component::{v_flex, Icon, IconName};
 
-use crate::theme;
+use crate::{
+    chrome::{self, panel_header},
+    theme::{self, tokens, TEXT_BODY, TEXT_MONO},
+};
 
 pub enum ExplorerEvent {
     OpenFile(PathBuf),
@@ -208,56 +211,77 @@ impl Explorer {
     }
 
     fn render_rows(&mut self, range: Range<usize>, _window: &mut Window, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let theme = cx.theme();
-        let (muted, foreground, selection) = (theme.muted_foreground, theme.foreground, theme.list_active);
+        let t = tokens(cx).clone();
         range
             .filter_map(|ix| self.rows.get(ix).cloned().map(|row| (ix, row)))
             .map(|(ix, row)| {
                 let selected = self.selected.as_ref() == Some(&row.path);
-                let color = self
-                    .git_color(&row.path, cx)
-                    .unwrap_or(if row.ignored { muted } else { foreground });
+                let git = self.git_color(&row.path, cx);
                 let badge = self.git.get(&row.path).filter(|_| !row.is_dir).map(|s| s.badge());
-                let path = row.path.clone();
-                let icon = if row.is_dir {
-                    Icon::new(if row.expanded { IconName::FolderOpen } else { IconName::Folder })
+                let deleted = matches!(self.git.get(&row.path), Some(FileState::Deleted));
+                let color = if row.ignored || deleted {
+                    t.fg_subtle
+                } else if row.is_dir {
+                    t.fg_muted
+                } else if selected {
+                    t.accent_text
                 } else {
-                    Icon::new(IconName::File)
+                    t.fg
                 };
-                h_flex()
-                    .id(ElementId::NamedInteger("explorer-row".into(), ix as u64))
-                    .w_full()
-                    .h(px(24.))
-                    .pl(px(8. + row.depth as f32 * 14.))
-                    .pr_2()
-                    .gap_1()
-                    .text_sm()
-                    .text_color(color)
-                    .when(selected, |el| el.bg(selection))
-                    .hover(|el| el.bg(theme::hover_overlay(cx)))
+                let path = row.path.clone();
+                // Files line up with their folder's name, past the chevron.
+                let indent = 6. + row.depth as f32 * 12.;
+                div()
+                    .h(px(26.))
+                    .px(px(6.))
                     .child(
-                        div().w(px(12.)).flex_none().when(row.is_dir, |el| {
-                            el.child(
-                                Icon::new(if row.expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                                    .xsmall()
-                                    .text_color(muted),
+                        chrome::list_row(ElementId::NamedInteger("explorer-row".into(), ix as u64), selected, cx)
+                            .h_full()
+                            .pl(px(indent))
+                            .pr(px(8.))
+                            .gap(px(4.))
+                            .child(
+                                div().w(px(14.)).flex_none().flex().justify_center().when(row.is_dir, |el| {
+                                    el.child(
+                                        Icon::new(if row.expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+                                            .size(px(12.))
+                                            .text_color(t.fg_subtle),
+                                    )
+                                }),
                             )
-                        }),
-                    )
-                    .child(icon.small().text_color(if row.is_dir { muted } else { color }))
-                    .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_ellipsis().child(row.name.clone()))
-                    .when_some(badge, |el, badge| el.child(div().text_xs().text_color(color).child(badge)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &gpui::MouseDownEvent, _window, cx| {
-                            this.selected = Some(path.clone());
-                            if row.is_dir {
-                                this.toggle(&path, cx);
-                            } else if event.click_count >= 1 {
-                                cx.emit(ExplorerEvent::OpenFile(path.clone()));
-                            }
-                            cx.notify();
-                        }),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_color(color)
+                                    .map(|el| {
+                                        if row.is_dir {
+                                            el.text_size(TEXT_BODY)
+                                        } else {
+                                            el.font_family(t.mono.clone()).text_size(TEXT_MONO)
+                                        }
+                                    })
+                                    .when(selected && !row.is_dir, |el| el.font_weight(gpui::FontWeight::MEDIUM))
+                                    .child(row.name.clone()),
+                            )
+                            .when(row.is_dir && git.is_some(), |el| {
+                                el.child(chrome::status_dot(git.unwrap_or(t.fg_subtle).alpha(0.7)))
+                            })
+                            .when_some(badge.zip(git), |el, (badge, color)| el.child(chrome::status_badge(badge, color, cx)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, _window, cx| {
+                                    this.selected = Some(path.clone());
+                                    if row.is_dir {
+                                        this.toggle(&path, cx);
+                                    } else if event.click_count >= 1 {
+                                        cx.emit(ExplorerEvent::OpenFile(path.clone()));
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
                     )
                     .into_any_element()
             })
@@ -267,27 +291,29 @@ impl Explorer {
 
 impl Render for Explorer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let title: SharedString = self
+        let root: SharedString = self
             .root
             .file_name()
-            .map(|n| n.to_string_lossy().to_uppercase())
+            .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default()
             .into();
         v_flex()
             .size_full()
             .track_focus(&self.focus_handle)
             .child(
-                h_flex()
-                    .h(px(30.))
-                    .px_3()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().muted_foreground)
-                    .child(title),
+                panel_header("Explorer", cx).child(
+                    div()
+                        .max_w(px(140.))
+                        .truncate()
+                        .text_size(theme::TEXT_SMALL)
+                        .text_color(tokens(cx).fg_subtle)
+                        .child(root),
+                ),
             )
             .child(
                 uniform_list("explorer-rows", self.rows.len(), cx.processor(Self::render_rows))
                     .track_scroll(self.scroll.clone())
+                    .pb(px(8.))
                     .flex_1(),
             )
     }

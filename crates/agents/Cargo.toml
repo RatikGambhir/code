@@ -1,6 +1,6 @@
 [package]
 name = "cockpit-agents"
-description = "Codex App Server client: JSON-RPC transport, typed protocol, normalized events and transcripts"
+description = "Agent backends (Codex App Server, Claude Code): transports, typed protocol, normalized events and transcripts"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,6 +10,7 @@ publish = false
 anyhow.workspace = true
 async-channel.workspace = true
 cockpit-common.workspace = true
+dirs.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
@@ -20,4 +21,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 futures = { workspace = true, features = ["executor"] }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

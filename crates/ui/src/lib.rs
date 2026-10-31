@@ -2,8 +2,10 @@
 
 pub mod actions;
 pub mod agent;
+mod appearance;
 mod assets;
 pub mod browser_view;
+mod chrome;
 pub mod editor_view;
 pub mod explorer;
 pub mod lsp;
@@ -102,6 +104,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Toggle Codex", actions::ToggleAgentPanel),
                 MenuItem::action("Split Editor", actions::SplitPane),
                 MenuItem::separator(),
+                MenuItem::action("Customize Theme…", actions::CustomizeTheme),
                 MenuItem::action("Toggle Light/Dark", actions::ToggleTheme),
             ],
         },
@@ -215,7 +218,7 @@ pub fn open_welcome(cx: &mut App) {
     let mut options = window_options(cx);
     options.window_bounds = Some(WindowBounds::centered(size(px(760.), px(520.)), cx));
     let opened = cx.open_window(options, |window, cx| {
-        let welcome = cx.new(Welcome::new);
+        let welcome = cx.new(|cx| Welcome::new(window, cx));
         window.focus(&welcome.focus_handle(cx));
         cx.new(|cx| Root::new(welcome, window, cx))
     });

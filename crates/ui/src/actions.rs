@@ -25,6 +25,10 @@ actions!(
         NewAgentThread,
         InterruptAgent,
         ToggleTheme,
+        CustomizeTheme,
+        NavigateBack,
+        NavigateForward,
+        RestartLanguageServers,
         About,
         Quit,
     ]
@@ -52,6 +56,8 @@ actions!(
     ]
 );
 
+actions!(editor, [GoToDefinition, FindReferences]);
+
 actions!(
     terminal,
     [TerminalPaste, TerminalClear, TerminalCopyScreen, TerminalTab, TerminalBackTab]
@@ -61,6 +67,8 @@ actions!(
 pub const BROWSER_CONTEXT: &str = "BrowserView";
 /// Key context of a terminal.
 pub const TERMINAL_CONTEXT: &str = "Terminal";
+/// Key context of a code editor tab.
+pub const CODE_EDITOR_CONTEXT: &str = "CodeEditor";
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys(key_bindings());
@@ -88,6 +96,11 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-n", NewAgentThread, None),
         KeyBinding::new("ctrl-c", InterruptAgent, Some("AgentComposer")),
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("ctrl--", NavigateBack, None),
+        KeyBinding::new("ctrl-shift--", NavigateForward, None),
+        // Code editor (⌘-click and ⌘. come from the editor itself)
+        KeyBinding::new("f12", GoToDefinition, Some(CODE_EDITOR_CONTEXT)),
+        KeyBinding::new("shift-f12", FindReferences, Some(CODE_EDITOR_CONTEXT)),
         // The agent composer sends on Enter, so Shift-Enter is its newline.
         KeyBinding::new(
             "shift-enter",

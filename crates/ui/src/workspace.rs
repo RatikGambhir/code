@@ -18,41 +18,46 @@ use cockpit_browser::{
 use cockpit_editor::watcher::{FsChange, WorkspaceWatcher};
 use cockpit_persistence::{TabKind, TabRecord, WorkspaceRecord};
 use futures::channel::oneshot;
+use cockpit_agents::protocol::PlanStepStatus;
 use gpui::{
     deferred, div, prelude::*, px, AnyElement, App, AsyncWindowContext, Context, Entity,
-    FocusHandle, Focusable, PathPromptOptions, PromptLevel, SharedString, Subscription, Task,
-    WeakEntity, Window,
+    FocusHandle, Focusable, FontWeight, Hsla, PathPromptOptions, PromptLevel, SharedString,
+    Subscription, Task, WeakEntity, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     notification::Notification,
     resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
-    v_flex, ActiveTheme as _, IconName, Root, Selectable as _, Sizable as _, TitleBar, WindowExt as _,
+    v_flex, ActiveTheme as _, IconName, Root, Sizable as _, TitleBar, WindowExt as _,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
     actions,
     agent::{AgentController, AgentControllerEvent, AgentPanel, AgentPanelEvent, ConnectionState},
+    appearance::{AppearanceEvent, AppearancePanel},
     assets::icon,
+    chrome,
     browser_view::{BrowserEvent, BrowserView},
-    editor_view::{EditorEvent, EditorView},
+    editor_view::{EditorEvent, EditorView, LocationKind},
     explorer::{Explorer, ExplorerEvent},
-    lsp::{LspEvent, LspManager},
-    palette::{Palette, PaletteEvent},
+    lsp::{LspEvent, LspManager, Target},
+    palette::{LocationItem, Palette, PaletteEvent},
     pane::{Pane, PaneEvent, PaneItem},
     search_panel::{SearchPanel, SearchPanelEvent},
     source_control::{SourceControl, SourceControlEvent},
     state::{AppState, ThemePreference},
     terminal_view::{TerminalPanel, TerminalPanelEvent},
-    theme,
+    theme::{self, RADIUS_LG, TEXT_BODY, TEXT_CAPTION, TEXT_SMALL},
 };
 
 /// How long a page may take to load before an agent action returns anyway.
 const AGENT_LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 const PAGE_TEXT_LIMIT: usize = 20_000;
 const CONSOLE_LIMIT: usize = 50;
+/// How many places Go Back remembers.
+const NAV_HISTORY: usize = 100;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,6 +114,10 @@ pub struct Workspace {
     palette: Option<Entity<Palette>>,
     /// Where focus was before the palette opened.
     palette_return: Option<FocusHandle>,
+    appearance: Option<Entity<AppearancePanel>>,
+    /// Where go-to-definition and friends jumped from, for Go Back (⌃-).
+    nav_back: Vec<Target>,
+    nav_forward: Vec<Target>,
 
     save_tabs: Option<Task<()>>,
     restoring: bool,
@@ -209,6 +218,8 @@ impl Workspace {
             }));
         }
 
+        subscriptions.push(theme::follow_system_appearance(window, cx));
+
         let mut tasks = Vec::new();
         let watcher = match WorkspaceWatcher::watch(&root) {
             Ok((watcher, changes)) => {
@@ -250,6 +261,9 @@ impl Workspace {
             panel_sizes: HashMap::new(),
             palette: None,
             palette_return: None,
+            appearance: None,
+            nav_back: Vec::new(),
+            nav_forward: Vec::new(),
             save_tabs: None,
             restoring: false,
             _watcher: watcher,
@@ -451,15 +465,132 @@ impl Workspace {
         if !diagnostics.is_empty() {
             editor.update(cx, |editor, cx| editor.set_diagnostics(&diagnostics, cx));
         }
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |this, _, event: &EditorEvent, _, cx| {
-            if let EditorEvent::Saved(_) = event {
-                this.source_control.update(cx, |scm, cx| scm.refresh(cx));
+        self._subscriptions.push(cx.subscribe_in(&editor, window, |this, _, event: &EditorEvent, window, cx| {
+            match event {
+                EditorEvent::Saved(_) => this.source_control.update(cx, |scm, cx| scm.refresh(cx)),
+                EditorEvent::Locations { kind, symbol, origin, targets } => {
+                    this.show_locations(*kind, symbol, origin.clone(), targets.clone(), window, cx);
+                }
+                EditorEvent::Notify(message) => {
+                    window.push_notification(Notification::info(message.clone()), cx);
+                }
+                EditorEvent::Changed => {}
             }
         }));
         let pane = self.active_pane().clone();
         pane.update(cx, |pane, cx| pane.add_item(PaneItem::Editor(editor.clone()), focus, window, cx));
         self.explorer.update(cx, |e, cx| e.reveal(&path, cx));
         Some(editor)
+    }
+
+    // --- code navigation ---------------------------------------------------
+
+    /// Opens `target` and puts the cursor there.
+    fn jump_to(&mut self, target: &Target, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(editor) = self.open_file(target.path.clone(), true, window, cx) else {
+            return false;
+        };
+        let (line, column) = (target.line, target.column);
+        editor.update(cx, |editor, cx| editor.go_to(line, column, window, cx));
+        true
+    }
+
+    /// Jumps to `target`, remembering `origin` for Go Back.
+    fn navigate(&mut self, origin: Target, target: &Target, window: &mut Window, cx: &mut Context<Self>) {
+        if self.jump_to(target, window, cx) && origin != *target {
+            push_bounded(&mut self.nav_back, origin);
+            self.nav_forward.clear();
+        }
+    }
+
+    /// The cursor of the active editor, if it shows a file.
+    fn current_location(&self, cx: &App) -> Option<Target> {
+        let editor = self.active_pane().read(cx).active_editor()?.read(cx);
+        if editor.is_read_only() {
+            return None;
+        }
+        let cursor = editor.cursor(cx);
+        Some(Target {
+            path: editor.path().to_path_buf(),
+            line: cursor.line,
+            column: cursor.character,
+        })
+    }
+
+    fn navigate_history(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.current_location(cx);
+        let (from, to) = if back {
+            (&mut self.nav_back, &mut self.nav_forward)
+        } else {
+            (&mut self.nav_forward, &mut self.nav_back)
+        };
+        let Some(target) = from.pop() else { return };
+        if let Some(current) = current {
+            push_bounded(to, current);
+        }
+        self.jump_to(&target, window, cx);
+    }
+
+    /// The language server's answer to go-to-definition or find-references:
+    /// jump straight to a single definition, list anything else.
+    fn show_locations(
+        &mut self,
+        kind: LocationKind,
+        symbol: &str,
+        origin: Target,
+        mut targets: Vec<Target>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        targets.dedup();
+        let symbol = if symbol.is_empty() { "this symbol".to_string() } else { format!("`{symbol}`") };
+        if targets.is_empty() {
+            let mut message = match kind {
+                LocationKind::Definition => format!("No definition found for {symbol}."),
+                LocationKind::References => format!("No references found for {symbol}."),
+            };
+            if self.lsp.read(cx).status().is_some_and(|s| s.contains('…')) {
+                message.push_str(" The language server is still loading; try again in a moment.");
+            }
+            window.push_notification(Notification::info(message), cx);
+            return;
+        }
+        if kind == LocationKind::Definition && targets.len() == 1 {
+            self.navigate(origin, &targets[0], window, cx);
+            return;
+        }
+        let title = match kind {
+            LocationKind::Definition => format!("{} definitions of {symbol}", targets.len()),
+            LocationKind::References if targets.len() == 1 => format!("1 reference to {symbol}"),
+            LocationKind::References => format!("{} references to {symbol}", targets.len()),
+        };
+        let root = self.root.clone();
+        let items = cx.background_spawn(async move { location_items(&root, targets) });
+        cx.spawn_in(window, async move |this, cx| {
+            let items = items.await;
+            this.update_in(cx, |this, window, cx| {
+                let palette = cx.new(|cx| Palette::locations(title, items, window, cx));
+                this.show_palette(palette, Some(origin), window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Stops every language server and reconnects the open editors, which
+    /// starts them again.
+    fn restart_language_servers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editors = self.all_editors(cx);
+        for editor in &editors {
+            editor.update(cx, |editor, cx| editor.detach_lsp(cx));
+        }
+        self.lsp.update(cx, |lsp, cx| lsp.restart(cx));
+        let lsp = self.lsp.clone();
+        for editor in &editors {
+            editor.update(cx, |editor, cx| editor.connect_lsp(&lsp, cx));
+        }
+        window.push_notification(Notification::info("Restarting language servers…"), cx);
+        cx.notify();
     }
 
     fn open_read_only(&mut self, title: &str, extension: &str, text: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -557,6 +688,17 @@ impl Workspace {
             }
             AgentControllerEvent::RunBrowserAction { call, action } => {
                 self.run_browser_action((**call).clone(), action.clone(), window, cx);
+            }
+            AgentControllerEvent::RunInTerminal { program, args } => {
+                let terminal = self.ensure_terminal(window, cx);
+                let program = Some((program.clone(), args.clone()));
+                terminal.update(cx, |t, cx| {
+                    t.add_terminal(program, cx);
+                    t.focus_active(window, cx);
+                });
+                self.layout.terminal_visible = true;
+                self.save_layout(cx);
+                cx.notify();
             }
         }
     }
@@ -832,6 +974,45 @@ impl Workspace {
         cx.notify();
     }
 
+    fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.layout.sidebar_visible = !self.layout.sidebar_visible;
+        if !self.layout.sidebar_visible {
+            self.focus_center(window, cx);
+        }
+        self.save_layout(cx);
+        cx.notify();
+    }
+
+    /// Shows source control with the commit message focused.
+    fn start_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.layout.sidebar = SidebarView::SourceControl;
+        self.layout.sidebar_visible = true;
+        self.source_control.update(cx, |scm, cx| scm.focus_message(window, cx));
+        self.save_layout(cx);
+        cx.notify();
+    }
+
+    fn toggle_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.appearance.take().is_some() {
+            self.focus_center(window, cx);
+            cx.notify();
+            return;
+        }
+        let panel = cx.new(|cx| AppearancePanel::new(window, cx));
+        self._subscriptions.push(cx.subscribe_in(&panel, window, |this, _, event: &AppearanceEvent, window, cx| {
+            match event {
+                AppearanceEvent::Dismissed => {
+                    this.appearance = None;
+                    this.focus_center(window, cx);
+                    cx.notify();
+                }
+            }
+        }));
+        window.focus(&panel.focus_handle(cx));
+        self.appearance = Some(panel);
+        cx.notify();
+    }
+
     fn focus_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.layout.agent_visible {
             self.layout.agent_visible = true;
@@ -923,13 +1104,30 @@ impl Workspace {
         } else {
             cx.new(|cx| Palette::commands(window, cx))
         };
+        self.show_palette(palette, None, window, cx);
+    }
+
+    /// Shows `palette`; `origin` is where a chosen location is jumped from.
+    fn show_palette(&mut self, palette: Entity<Palette>, origin: Option<Target>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            self.close_palette(window, cx);
+        }
         self.palette_return = window.focused(cx);
-        self._subscriptions.push(cx.subscribe_in(&palette, window, |this, _, event: &PaletteEvent, window, cx| {
+        self._subscriptions.push(cx.subscribe_in(&palette, window, move |this, _, event: &PaletteEvent, window, cx| {
             match event {
                 PaletteEvent::Dismissed => this.close_palette(window, cx),
                 PaletteEvent::OpenFile(path) => {
                     this.close_palette(window, cx);
                     this.open_file(path.clone(), true, window, cx);
+                }
+                PaletteEvent::OpenLocation(target) => {
+                    this.close_palette(window, cx);
+                    match origin.clone() {
+                        Some(origin) => this.navigate(origin, target, window, cx),
+                        None => {
+                            this.jump_to(target, window, cx);
+                        }
+                    }
                 }
                 PaletteEvent::Run(action) => {
                     let action = action.boxed_clone();
@@ -957,63 +1155,184 @@ impl Workspace {
 
     // --- rendering ---------------------------------------------------------
 
+    /// Workspace name, then the active file's path inside it.
+    fn breadcrumb(&self, cx: &App) -> Vec<SharedString> {
+        let mut crumbs: Vec<SharedString> = vec![self.name.clone()];
+        match self.active_pane().read(cx).active_item() {
+            Some(PaneItem::Editor(editor)) => {
+                let editor = editor.read(cx);
+                if editor.is_read_only() {
+                    crumbs.push(editor.title());
+                } else {
+                    let path = editor.path();
+                    let relative = path.strip_prefix(&self.root).unwrap_or(path);
+                    crumbs.extend(
+                        relative
+                            .components()
+                            .map(|c| SharedString::from(c.as_os_str().to_string_lossy().into_owned())),
+                    );
+                }
+            }
+            Some(item) => crumbs.push(item.title(cx)),
+            None => {}
+        }
+        // Long paths keep the root and the last two parts.
+        if crumbs.len() > 4 {
+            let tail = crumbs.split_off(crumbs.len() - 2);
+            crumbs.truncate(1);
+            crumbs.push("…".into());
+            crumbs.extend(tail);
+        }
+        crumbs
+    }
+
+    /// What Codex is doing, for the pill in the title bar.
+    fn agent_pill(&self, cx: &App) -> Option<(SharedString, Hsla, Hsla)> {
+        let t = theme::tokens(cx);
+        let agent = self.agent.read(cx);
+        if !agent.pending_tools().is_empty() {
+            return Some(("Needs approval".into(), t.warning, t.warning.alpha(0.12)));
+        }
+        if !agent.is_running() {
+            return None;
+        }
+        let progress = agent.active_thread().and_then(|thread| {
+            let steps = thread.transcript.plan().0;
+            if steps.is_empty() {
+                return None;
+            }
+            let done = steps.iter().filter(|s| s.status == PlanStepStatus::Completed).count();
+            let current = steps
+                .iter()
+                .position(|s| s.status == PlanStepStatus::InProgress)
+                .map(|ix| ix + 1)
+                .unwrap_or((done + 1).min(steps.len()));
+            Some((current, steps.len()))
+        });
+        let label = match progress {
+            Some((current, total)) => format!("Working · step {current} of {total}"),
+            None => "Working".to_string(),
+        };
+        Some((label.into(), t.accent_text, t.accent_soft))
+    }
+
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_title = self
-            .active_pane()
-            .read(cx)
-            .active_item()
-            .map(|item| item.title(cx));
-        let title: SharedString = match active_title {
-            Some(item) => format!("{} — {item}", self.name).into(),
-            None => self.name.clone(),
-        };
-        let toggle = |id: &'static str, name: IconName, tooltip: &'static str, on: bool| {
-            Button::new(id)
-                .icon(name)
-                .ghost()
-                .xsmall()
-                .tooltip(tooltip)
-                .when(on, |b| b.selected(true))
-        };
+        let t = theme::tokens(cx).clone();
+        let crumbs = self.breadcrumb(cx);
+        let last = crumbs.len() - 1;
+        let mut breadcrumb = h_flex().min_w_0().gap(px(6.)).text_size(TEXT_BODY).overflow_hidden();
+        for (ix, crumb) in crumbs.into_iter().enumerate() {
+            if ix > 0 {
+                breadcrumb = breadcrumb.child(div().flex_none().text_color(t.fg_subtle).child("/"));
+            }
+            breadcrumb = breadcrumb.child(
+                div()
+                    .when(ix < last, |el| el.flex_none().text_color(t.frame_muted))
+                    .when(ix == last, |el| el.min_w_0().truncate().text_color(t.fg).font_weight(FontWeight::MEDIUM))
+                    .child(crumb),
+            );
+        }
+
+        let pill = self.agent_pill(cx).map(|(label, color, bg)| {
+            h_flex()
+                .id("agent-pill")
+                .flex_none()
+                .h(px(20.))
+                .px(px(8.))
+                .gap(px(6.))
+                .rounded_full()
+                .bg(bg)
+                .text_color(color)
+                .text_size(TEXT_CAPTION)
+                .font_weight(FontWeight::SEMIBOLD)
+                .cursor_pointer()
+                .child(chrome::status_dot(color))
+                .child(SharedString::from(label.to_uppercase()))
+                .on_click(cx.listener(|this, _, window, cx| this.focus_agent(window, cx)))
+        });
+
+        let running = self.agent.read(cx).is_running();
+        let changes = self.source_control.read(cx).change_count();
+        let (hover, surface, border) = (t.raised, t.surface, t.border_strong);
+
         TitleBar::new().child(
             h_flex()
                 .w_full()
-                .pr_2()
-                .gap_1()
+                .h_full()
+                .pr(px(10.))
+                .gap(px(10.))
+                .child(chrome::logo_mark(16., cx))
+                .child(breadcrumb)
+                .children(pill)
                 .child(div().flex_1())
-                .child(div().text_sm().text_color(cx.theme().muted_foreground).child(title))
-                .child(div().flex_1())
                 .child(
-                    toggle("toggle-sidebar", IconName::PanelLeft, "Toggle Sidebar (⌘B)", self.layout.sidebar_visible)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.layout.sidebar_visible = !this.layout.sidebar_visible;
-                            if !this.layout.sidebar_visible {
-                                this.focus_center(window, cx);
-                            }
-                            this.save_layout(cx);
-                            cx.notify();
-                        })),
+                    h_flex()
+                        .flex_none()
+                        .gap(px(2.))
+                        .child(
+                            chrome::frame_button("customize-theme", IconName::Palette, self.appearance.is_some(), cx)
+                                .tooltip(chrome::tooltip("Appearance"))
+                                .on_click(cx.listener(|this, _, window, cx| this.toggle_appearance(window, cx))),
+                        )
+                        .child(
+                            chrome::frame_button("toggle-sidebar", IconName::PanelLeft, false, cx)
+                                .tooltip(chrome::tooltip("Toggle sidebar (⌘B)"))
+                                .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx))),
+                        )
+                        .child(
+                            chrome::frame_button("toggle-terminal", IconName::PanelBottom, false, cx)
+                                .tooltip(chrome::tooltip("Toggle terminal (⌘J)"))
+                                .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))),
+                        )
+                        .child(
+                            chrome::frame_button("toggle-agent", IconName::PanelRight, false, cx)
+                                .tooltip(chrome::tooltip("Toggle Codex (⌥⌘B)"))
+                                .on_click(cx.listener(|this, _, window, cx| this.toggle_agent(window, cx))),
+                        ),
                 )
-                .child(
-                    toggle("toggle-terminal", IconName::PanelBottom, "Toggle Terminal (⌘J)", self.layout.terminal_visible)
-                        .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))),
-                )
-                .child(
-                    toggle("toggle-agent", IconName::PanelRight, "Toggle Codex (⌥⌘B)", self.layout.agent_visible)
-                        .on_click(cx.listener(|this, _, window, cx| this.toggle_agent(window, cx))),
-                ),
+                .when(running, |el| {
+                    el.child(
+                        div()
+                            .id("title-stop")
+                            .flex_none()
+                            .h(px(26.))
+                            .px(px(10.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(7.))
+                            .border_1()
+                            .border_color(border)
+                            .bg(surface)
+                            .text_size(TEXT_BODY)
+                            .font_weight(FontWeight::MEDIUM)
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover))
+                            .tooltip(chrome::tooltip("Stop the running turn (⌃C in the composer)"))
+                            .child("Stop")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.agent.update(cx, |agent, cx| agent.interrupt(cx));
+                            })),
+                    )
+                })
+                .when(changes > 0, |el| {
+                    el.child(
+                        Button::new("title-commit")
+                            .label(if changes == 1 { "Commit 1 file".to_string() } else { format!("Commit {changes} files") })
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| this.start_commit(window, cx))),
+                    )
+                }),
         )
     }
 
     fn render_activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme::tokens(cx).clone();
         let current = self.layout.sidebar_visible.then_some(self.layout.sidebar);
         let changes = self.source_control.read(cx).change_count();
-        let item = |id: &'static str, view: SidebarView, element: gpui_component::Icon, tooltip: &'static str| {
-            Button::new(id)
-                .icon(element)
-                .ghost()
-                .selected(current == Some(view))
-                .tooltip(tooltip)
+        let item = |id: &'static str, view: SidebarView, icon: gpui_component::Icon, tooltip: &'static str, cx: &mut Context<Self>| {
+            chrome::frame_button(id, icon, current == Some(view), cx)
+                .tooltip(chrome::tooltip(tooltip))
                 .on_click(cx.listener(move |this, _, window, cx| this.show_sidebar(view, window, cx)))
         };
         v_flex()
@@ -1021,56 +1340,47 @@ impl Workspace {
             .h_full()
             .flex_none()
             .items_center()
-            .py_2()
-            .gap_1()
-            .border_r_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().sidebar)
-            .child(item("activity-explorer", SidebarView::Explorer, icon("files"), "Explorer (⇧⌘E)"))
+            .pt(px(2.))
+            .pb(px(8.))
+            .gap(px(4.))
+            .child(item("activity-explorer", SidebarView::Explorer, icon("files"), "Explorer (⇧⌘E)", cx))
+            .child(item("activity-search", SidebarView::Search, gpui_component::Icon::new(IconName::Search), "Search (⇧⌘F)", cx))
             .child(
                 div()
                     .relative()
-                    .child(item(
-                        "activity-scm",
-                        SidebarView::SourceControl,
-                        icon("git-branch"),
-                        "Source Control (⇧⌘G)",
-                    ))
+                    .child(item("activity-scm", SidebarView::SourceControl, icon("git-branch"), "Source control (⇧⌘G)", cx))
                     .when(changes > 0, |el| {
                         el.child(
                             div()
                                 .absolute()
-                                .top(px(-2.))
-                                .right(px(-4.))
-                                .px_1()
+                                .top(px(-3.))
+                                .right(px(-5.))
+                                .min_w(px(15.))
+                                .h(px(15.))
+                                .px(px(4.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .rounded_full()
-                                .bg(cx.theme().primary)
-                                .text_color(cx.theme().primary_foreground)
+                                .border_2()
+                                .border_color(t.frame)
+                                .bg(t.accent)
+                                .text_color(t.accent_fg)
                                 .text_size(px(9.))
+                                .font_weight(FontWeight::SEMIBOLD)
                                 .child(if changes > 99 { "99+".to_string() } else { changes.to_string() }),
                         )
                     }),
             )
-            .child(item(
-                "activity-search",
-                SidebarView::Search,
-                gpui_component::Icon::new(IconName::Search),
-                "Search (⇧⌘F)",
-            ))
             .child(div().flex_1())
             .child(
-                Button::new("activity-browser")
-                    .icon(IconName::Globe)
-                    .ghost()
-                    .tooltip("New Browser Tab (⌘T)")
+                chrome::frame_button("activity-browser", IconName::Globe, false, cx)
+                    .tooltip(chrome::tooltip("New browser tab (⌘T)"))
                     .on_click(cx.listener(|this, _, window, cx| this.new_browser_tab(window, cx))),
             )
             .child(
-                Button::new("activity-codex")
-                    .icon(icon("sparkles"))
-                    .ghost()
-                    .selected(self.layout.agent_visible)
-                    .tooltip("Codex (⌥⌘B)")
+                chrome::frame_button("activity-codex", icon("sparkles"), self.layout.agent_visible, cx)
+                    .tooltip(chrome::tooltip("Codex (⌥⌘B)"))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_agent(window, cx))),
             )
     }
@@ -1099,12 +1409,16 @@ impl Workspace {
             return self.panes[0].clone().into_any_element();
         }
         let sizes = self.panel_sizes("panes", cx);
-        let border = cx.theme().border;
+        let marker = theme::tokens(cx).accent.alpha(0.6);
         let pane = |ix: usize| {
             div()
+                .relative()
                 .size_full()
-                .when(ix == self.active_pane, |el| el.border_t_1().border_color(border))
                 .child(self.panes[ix].clone())
+                // The pane that takes new tabs.
+                .when(ix == self.active_pane, |el| {
+                    el.child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(marker))
+                })
         };
         h_resizable("workspace-panes")
             .with_state(&sizes)
@@ -1125,15 +1439,9 @@ impl Workspace {
             .child(resizable_panel().child(center))
             .child(
                 resizable_panel()
-                    .size(px(280.))
+                    .size(px(260.))
                     .size_range(px(80.)..px(1600.))
-                    .child(
-                        div()
-                            .size_full()
-                            .border_t_1()
-                            .border_color(cx.theme().border)
-                            .child(terminal),
-                    ),
+                    .child(div().size_full().child(terminal)),
             )
             .into_any_element()
     }
@@ -1150,39 +1458,31 @@ impl Workspace {
             _ => "columns-agent",
         };
         let sizes = self.panel_sizes(key, cx);
-        let sidebar_bg = cx.theme().sidebar;
-        let border = cx.theme().border;
         h_resizable(key)
             .with_state(&sizes)
             .when(sidebar, |group| {
                 group.child(
                     resizable_panel()
-                        .size(px(260.))
+                        .size(px(248.))
                         .size_range(px(160.)..px(640.))
-                        .child(div().size_full().bg(sidebar_bg).child(self.render_sidebar())),
+                        .child(div().size_full().child(self.render_sidebar())),
                 )
             })
             .child(resizable_panel().child(middle))
             .when(agent, |group| {
                 group.child(
                     resizable_panel()
-                        .size(px(420.))
+                        .size(px(380.))
                         .size_range(px(300.)..px(1000.))
-                        .child(
-                            div()
-                                .size_full()
-                                .border_l_1()
-                                .border_color(border)
-                                .child(self.agent_panel.clone()),
-                        ),
+                        .child(div().size_full().child(self.agent_panel.clone())),
                 )
             })
             .into_any_element()
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
+        let t = theme::tokens(cx).clone();
+        let muted = t.frame_muted;
         let scm = self.source_control.read(cx);
         let branch = scm.branch().map(str::to_string);
         let changes = scm.change_count();
@@ -1200,34 +1500,41 @@ impl Workspace {
             )
         });
         let agent = self.agent.read(cx);
-        let agent_status: Option<(SharedString, gpui::Hsla)> = match agent.state() {
-            ConnectionState::Connected { .. } if agent.is_running() => Some(("Codex working…".into(), theme.warning)),
-            ConnectionState::Connected { .. } => Some(("Codex ready".into(), muted)),
-            ConnectionState::Connecting => Some(("Codex starting…".into(), muted)),
-            ConnectionState::NotInstalled => Some(("Codex not installed".into(), theme.danger)),
-            ConnectionState::Failed(_) => Some(("Codex stopped".into(), theme.danger)),
+        let name = agent.agent_name();
+        let agent_status: Option<(SharedString, Hsla)> = match agent.state() {
+            ConnectionState::Connected { .. } if agent.is_running() => Some((format!("{name} working").into(), t.accent_text)),
+            ConnectionState::Connected { .. } => Some((format!("{name} ready").into(), muted)),
+            ConnectionState::Connecting => Some((format!("{name} starting…").into(), muted)),
+            ConnectionState::NotInstalled => Some((format!("{name} not installed").into(), t.danger)),
+            ConnectionState::Failed(_) => Some((format!("{name} stopped").into(), t.danger)),
             ConnectionState::Idle => None,
+        };
+        let hover = t.frame_hover;
+        let clickable = move |id: &'static str| {
+            h_flex()
+                .id(id)
+                .h(px(20.))
+                .px(px(6.))
+                .gap(px(5.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
         };
 
         h_flex()
-            .h(px(24.))
+            .h(px(26.))
             .flex_none()
-            .px_2()
-            .gap_3()
-            .text_xs()
+            .pl(px(8.))
+            .pr(px(12.))
+            .gap(px(6.))
+            .text_size(TEXT_SMALL)
             .text_color(muted)
-            .border_t_1()
-            .border_color(theme.border)
-            .bg(theme.title_bar)
             .when_some(branch, |el, branch| {
                 el.child(
-                    h_flex()
-                        .id("status-branch")
-                        .gap_1()
-                        .cursor_pointer()
-                        .child(icon("git-branch").xsmall())
+                    clickable("status-branch")
+                        .child(icon("git-branch").size(px(12.)))
                         .child(branch)
-                        .when(changes > 0, |el| el.child(format!("· {changes}")))
+                        .when(changes > 0, |el| el.child(div().text_color(t.fg_subtle).child(format!("· {changes}"))))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.layout.sidebar_visible = false;
                             this.show_sidebar(SidebarView::SourceControl, window, cx);
@@ -1236,25 +1543,57 @@ impl Workspace {
             })
             .child(
                 h_flex()
-                    .gap_2()
-                    .child(div().text_color(if errors > 0 { theme.danger } else { muted }).child(format!("✕ {errors}")))
-                    .child(div().text_color(if warnings > 0 { theme.warning } else { muted }).child(format!("⚠ {warnings}"))),
+                    .px(px(6.))
+                    .gap(px(10.))
+                    .child(
+                        h_flex()
+                            .gap(px(4.))
+                            .text_color(if errors > 0 { t.danger } else { muted })
+                            .child(gpui_component::Icon::new(IconName::CircleX).size(px(12.)))
+                            .child(errors.to_string()),
+                    )
+                    .child(
+                        h_flex()
+                            .gap(px(4.))
+                            .text_color(if warnings > 0 { t.warning } else { muted })
+                            .child(gpui_component::Icon::new(IconName::TriangleAlert).size(px(12.)))
+                            .child(warnings.to_string()),
+                    ),
             )
             .when_some(lsp_status, |el, status| el.child(div().truncate().max_w(px(320.)).child(status)))
             .child(div().flex_1())
             .when_some(editor_info, |el, (position, language, ending)| {
-                el.child(position).child(language).child(ending)
+                el.child(div().px(px(6.)).child(position))
+                    .child(div().px(px(6.)).child(language))
+                    .child(div().px(px(6.)).child(ending))
             })
             .when_some(agent_status, |el, (text, color)| {
                 el.child(
-                    div()
-                        .id("status-codex")
-                        .cursor_pointer()
+                    clickable("status-codex")
                         .text_color(color)
+                        .child(chrome::status_dot(color))
                         .child(text)
                         .on_click(cx.listener(|this, _, window, cx| this.focus_agent(window, cx))),
                 )
             })
+    }
+
+    /// The content card: every panel lives inside it.
+    fn render_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let columns = self.render_columns(cx);
+        let t = theme::tokens(cx);
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .mr(px(8.))
+            .rounded(RADIUS_LG)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.surface)
+            .overflow_hidden()
+            .when(!t.dark, |el| el.shadow_xs())
+            .child(columns)
     }
 }
 
@@ -1262,15 +1601,16 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dialogs = Root::render_dialog_layer(window, cx);
         let notifications = Root::render_notification_layer(window, cx);
-        let columns = self.render_columns(cx);
+        let card = self.render_card(cx);
+        let t = theme::tokens(cx).clone();
 
         v_flex()
             .id("workspace")
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .size_full()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
+            .bg(t.frame)
+            .text_color(t.fg)
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(|this, _: &actions::Save, window, cx| this.save(window, cx)))
             .on_action(cx.listener(|this, _: &actions::CloseTab, window, cx| {
@@ -1288,14 +1628,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &actions::SplitPane, window, cx| this.toggle_split(window, cx)))
             .on_action(cx.listener(|this, _: &actions::NewBrowserTab, window, cx| this.new_browser_tab(window, cx)))
             .on_action(cx.listener(|this, _: &actions::NewTerminal, window, cx| this.new_terminal(window, cx)))
-            .on_action(cx.listener(|this, _: &actions::ToggleSidebar, window, cx| {
-                this.layout.sidebar_visible = !this.layout.sidebar_visible;
-                if !this.layout.sidebar_visible {
-                    this.focus_center(window, cx);
-                }
-                this.save_layout(cx);
-                cx.notify();
-            }))
+            .on_action(cx.listener(|this, _: &actions::ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
             .on_action(cx.listener(|this, _: &actions::ToggleTerminal, window, cx| this.toggle_terminal(window, cx)))
             .on_action(cx.listener(|this, _: &actions::ToggleAgentPanel, window, cx| this.toggle_agent(window, cx)))
             .on_action(cx.listener(|this, _: &actions::ShowExplorer, window, cx| {
@@ -1318,16 +1651,48 @@ impl Render for Workspace {
                 this.agent.update(cx, |agent, cx| agent.interrupt(cx));
             }))
             .on_action(cx.listener(|this, _: &actions::ToggleTheme, window, cx| this.toggle_theme(window, cx)))
+            .on_action(cx.listener(|this, _: &actions::CustomizeTheme, window, cx| this.toggle_appearance(window, cx)))
             .on_action(cx.listener(|this, _: &actions::About, window, cx| this.about(window, cx)))
+            .on_action(cx.listener(|this, _: &actions::NavigateBack, window, cx| this.navigate_history(true, window, cx)))
+            .on_action(cx.listener(|this, _: &actions::NavigateForward, window, cx| {
+                this.navigate_history(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &actions::RestartLanguageServers, window, cx| {
+                this.restart_language_servers(window, cx)
+            }))
             .child(self.render_title_bar(cx))
             .child(
                 h_flex()
                     .flex_1()
                     .min_h_0()
                     .child(self.render_activity_bar(cx))
-                    .child(div().flex_1().min_w_0().h_full().child(columns)),
+                    .child(card),
             )
             .child(self.render_status_bar(cx))
+            .when_some(self.appearance.clone(), |el, panel| {
+                el.child(
+                    deferred(
+                        div()
+                            .id("appearance-backdrop")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .occlude()
+                            .on_click(cx.listener(|this, _, window, cx| this.toggle_appearance(window, cx)))
+                            .child(
+                                div()
+                                    .id("appearance-frame")
+                                    .absolute()
+                                    .top(px(40.))
+                                    .right(px(12.))
+                                    .on_click(|_, _, cx| cx.stop_propagation())
+                                    .child(panel),
+                            ),
+                    )
+                    .with_priority(1),
+                )
+            })
             .when_some(self.palette.clone(), |el, palette| {
                 el.child(
                     deferred(
@@ -1356,4 +1721,34 @@ impl Render for Workspace {
             .children(dialogs)
             .children(notifications)
     }
+}
+
+fn push_bounded(stack: &mut Vec<Target>, target: Target) {
+    if stack.last() != Some(&target) {
+        stack.push(target);
+    }
+    if stack.len() > NAV_HISTORY {
+        stack.remove(0);
+    }
+}
+
+/// Palette rows for `targets`, with each line's text as its preview. Each
+/// file is read once.
+fn location_items(root: &Path, targets: Vec<Target>) -> Vec<LocationItem> {
+    let mut files: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    targets
+        .into_iter()
+        .map(|target| {
+            let lines = files.entry(target.path.clone()).or_insert_with(|| {
+                std::fs::read_to_string(&target.path)
+                    .map(|text| text.lines().map(str::to_string).collect())
+                    .unwrap_or_default()
+            });
+            let preview = lines
+                .get(target.line as usize)
+                .map(|line| cockpit_common::truncate_chars(line.trim(), 200).to_string())
+                .unwrap_or_default();
+            LocationItem::new(target, root, preview)
+        })
+        .collect()
 }

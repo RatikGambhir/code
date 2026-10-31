@@ -33,7 +33,12 @@ use gpui_component::{
 };
 use smallvec::smallvec;
 
-use crate::{actions, assets::icon, state::AppState};
+use crate::{
+    actions,
+    assets::icon,
+    state::AppState,
+    theme::{tokens, RADIUS, TEXT_BODY, TEXT_SMALL, TEXT_TITLE},
+};
 
 pub enum BrowserEvent {
     /// The page asked to open a URL in a new window.
@@ -326,13 +331,14 @@ impl BrowserView {
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let loading = self.state.loading;
+        let t = tokens(cx).clone();
         h_flex()
-            .h(px(36.))
-            .px_2()
-            .gap_1()
+            .h(px(40.))
+            .flex_none()
+            .px(px(8.))
+            .gap(px(2.))
             .border_b_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().tab_bar)
+            .border_color(t.border)
             .child(
                 Button::new("back")
                     .icon(IconName::ArrowLeft)
@@ -360,9 +366,15 @@ impl BrowserView {
                     .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
             )
             .child(
-                div()
+                h_flex()
                     .flex_1()
-                    .child(Input::new(&self.address).small().cleanable(false)),
+                    .mx(px(6.))
+                    .h(px(28.))
+                    .pl(px(4.))
+                    .rounded(RADIUS)
+                    .bg(t.raised)
+                    .text_size(TEXT_BODY)
+                    .child(Input::new(&self.address).small().appearance(false).cleanable(false)),
             )
             .when(self.zoom_level != 0.0, |el| {
                 el.child(
@@ -377,15 +389,16 @@ impl BrowserView {
             .when(self.agent_driven, |el| {
                 el.child(
                     h_flex()
-                        .gap_1()
-                        .px_2()
-                        .py_0p5()
-                        .rounded_md()
-                        .text_xs()
-                        .bg(cx.theme().accent)
-                        .text_color(cx.theme().accent_foreground)
-                        .child(Icon::new(IconName::Bot).xsmall())
-                        .child("Agent"),
+                        .h(px(22.))
+                        .gap(px(5.))
+                        .px(px(8.))
+                        .mr(px(4.))
+                        .rounded_full()
+                        .text_size(TEXT_SMALL)
+                        .bg(t.accent_soft)
+                        .text_color(t.accent_text)
+                        .child(Icon::new(IconName::Bot).size(px(12.)))
+                        .child("Codex"),
                 )
             })
             .child(
@@ -422,10 +435,16 @@ impl BrowserView {
             .justify_center()
             .gap_3()
             .p_8()
-            .text_color(cx.theme().muted_foreground)
-            .child(Icon::new(IconName::Globe).large())
-            .child(div().text_lg().text_color(cx.theme().foreground).child("The embedded browser is not available"))
-            .child(div().max_w(px(520.)).text_sm().text_center().child(reason.clone()))
+            .text_color(tokens(cx).fg_muted)
+            .child(Icon::new(IconName::Globe).size(px(28.)).text_color(tokens(cx).fg_subtle))
+            .child(
+                div()
+                    .text_size(TEXT_TITLE)
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(tokens(cx).fg)
+                    .child("The embedded browser is not available"),
+            )
+            .child(div().max_w(px(460.)).text_size(TEXT_BODY).text_center().child(reason.clone()))
     }
 }
 

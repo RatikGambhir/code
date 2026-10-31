@@ -6,16 +6,20 @@ use std::path::PathBuf;
 use cockpit_editor::{fs_tree, fuzzy};
 use gpui::{
     div, prelude::*, px, uniform_list, Action, AnyElement, App, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, Subscription, UniformListScrollHandle, Window,
+    FocusHandle, Focusable, SharedString, Subscription, UniformListScrollHandle, Window,
 };
 use gpui_component::{
     h_flex,
     input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp},
     kbd::Kbd,
-    v_flex, ActiveTheme as _, Icon, IconName, Sizable as _,
+    v_flex, Icon, IconName,
 };
 
-use crate::actions;
+use crate::{
+    actions,
+    lsp::Target,
+    theme::{tokens, RADIUS, RADIUS_LG, TEXT_BODY, TEXT_MONO, TEXT_SMALL, TEXT_TITLE},
+};
 
 const MAX_FILES: usize = 50_000;
 const MAX_SHOWN: usize = 200;
@@ -24,6 +28,27 @@ pub enum PaletteEvent {
     Dismissed,
     Run(Box<dyn Action>),
     OpenFile(PathBuf),
+    OpenLocation(Target),
+}
+
+/// A row of a location list (references, several definitions).
+pub struct LocationItem {
+    pub target: Target,
+    /// `src/main.rs:12`, relative to the workspace when inside it.
+    pub label: String,
+    /// The line's text, trimmed.
+    pub preview: String,
+    /// What the query is matched against.
+    search: String,
+}
+
+impl LocationItem {
+    pub fn new(target: Target, root: &std::path::Path, preview: String) -> Self {
+        let path = target.path.strip_prefix(root).unwrap_or(&target.path);
+        let label = format!("{}:{}", path.display(), target.line + 1);
+        let search = format!("{label} {preview}");
+        Self { target, label, preview, search }
+    }
 }
 
 struct Command {
@@ -36,6 +61,7 @@ enum Source {
     Commands(Vec<Command>),
     /// Paths relative to the root.
     Files { root: PathBuf, paths: Vec<String>, loading: bool },
+    Locations(Vec<LocationItem>),
 }
 
 pub struct Palette {
@@ -74,9 +100,15 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Show Explorer", Box::new(actions::ShowExplorer)),
         ("Show Source Control", Box::new(actions::ShowSourceControl)),
         ("Find in Files", Box::new(actions::ShowSearch)),
+        ("Go to Definition", Box::new(actions::GoToDefinition)),
+        ("Find All References", Box::new(actions::FindReferences)),
+        ("Go Back", Box::new(actions::NavigateBack)),
+        ("Go Forward", Box::new(actions::NavigateForward)),
+        ("Restart Language Servers", Box::new(actions::RestartLanguageServers)),
         ("Codex: Focus Composer", Box::new(actions::FocusAgent)),
         ("Codex: New Thread", Box::new(actions::NewAgentThread)),
         ("Codex: Stop Turn", Box::new(actions::InterruptAgent)),
+        ("Customize Theme…", Box::new(actions::CustomizeTheme)),
         ("Toggle Light/Dark Theme", Box::new(actions::ToggleTheme)),
         ("About Cockpit", Box::new(actions::About)),
         ("Quit", Box::new(actions::Quit)),
@@ -120,7 +152,12 @@ impl Palette {
         )
     }
 
-    fn new(source: Source, placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// A list of places to jump to; `title` is the query's placeholder.
+    pub fn locations(title: String, items: Vec<LocationItem>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new(Source::Locations(items), title, window, cx)
+    }
+
+    fn new(source: Source, placeholder: impl Into<SharedString>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let subscriptions = vec![cx.subscribe(&query, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Change => this.filter(cx),
@@ -143,6 +180,7 @@ impl Palette {
         match &self.source {
             Source::Commands(commands) => commands.len(),
             Source::Files { paths, .. } => paths.len(),
+            Source::Locations(items) => items.len(),
         }
     }
 
@@ -161,6 +199,11 @@ impl Palette {
                 Source::Files { paths, .. } => fuzzy::rank(
                     query,
                     paths.iter().enumerate().map(|(ix, p)| (p.as_str(), ix)),
+                    MAX_SHOWN,
+                ),
+                Source::Locations(items) => fuzzy::rank(
+                    query,
+                    items.iter().enumerate().map(|(ix, item)| (item.search.as_str(), ix)),
                     MAX_SHOWN,
                 ),
             }
@@ -188,12 +231,13 @@ impl Palette {
         match &self.source {
             Source::Commands(commands) => cx.emit(PaletteEvent::Run(commands[index].action.boxed_clone())),
             Source::Files { root, paths, .. } => cx.emit(PaletteEvent::OpenFile(root.join(&paths[index]))),
+            Source::Locations(items) => cx.emit(PaletteEvent::OpenLocation(items[index].target.clone())),
         }
     }
 
     fn render_rows(&mut self, range: std::ops::Range<usize>, _: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let theme = cx.theme();
-        let (muted, selection) = (theme.muted_foreground, theme.list_active);
+        let t = tokens(cx).clone();
+        let (muted, selection, hover) = (t.fg_subtle, t.accent_soft, t.hover);
         range
             .filter_map(|row| self.matches.get(row).map(|&ix| (row, ix)))
             .map(|(row, ix)| {
@@ -219,21 +263,52 @@ impl Palette {
                         h_flex()
                             .flex_1()
                             .gap_2()
-                            .child(Icon::new(IconName::File).small().text_color(muted))
-                            .child(div().flex_none().child(name))
-                            .child(div().flex_1().min_w_0().truncate().text_xs().text_color(muted).child(dir))
+                            .child(Icon::new(IconName::File).size(px(14.)).text_color(muted))
+                            .child(div().flex_none().font_family(t.mono.clone()).text_size(TEXT_MONO).child(name))
+                            .child(div().flex_1().min_w_0().truncate().text_size(TEXT_SMALL).text_color(muted).child(dir))
+                    }
+                    Source::Locations(items) => {
+                        let item = &items[ix];
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family(t.mono.clone())
+                                    .text_size(TEXT_MONO)
+                                    .child(item.preview.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .max_w(px(240.))
+                                    .truncate()
+                                    .text_size(TEXT_SMALL)
+                                    .text_color(muted)
+                                    .child(item.label.clone()),
+                            )
                     }
                 };
-                h_flex()
-                    .id(("palette-row", row))
-                    .w_full()
-                    .h(px(28.))
-                    .px_3()
-                    .text_sm()
-                    .cursor_pointer()
-                    .when(selected, |el| el.bg(selection))
-                    .on_click(cx.listener(move |this, _, _, cx| this.confirm(row, cx)))
-                    .child(content)
+                div()
+                    .h(px(32.))
+                    .px(px(6.))
+                    .child(
+                        h_flex()
+                            .id(("palette-row", row))
+                            .size_full()
+                            .px(px(10.))
+                            .rounded(RADIUS)
+                            .text_size(TEXT_BODY)
+                            .cursor_pointer()
+                            .when(selected, |el| el.bg(selection))
+                            .when(!selected, |el| el.hover(move |s| s.bg(hover)))
+                            .on_click(cx.listener(move |this, _, _, cx| this.confirm(row, cx)))
+                            .child(content),
+                    )
                     .into_any_element()
             })
             .collect()
@@ -250,18 +325,18 @@ fn workspace_files(root: &std::path::Path) -> Vec<String> {
 
 impl Render for Palette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+        let t = tokens(cx).clone();
         let loading = matches!(self.source, Source::Files { loading: true, .. });
         let empty = self.matches.is_empty();
         v_flex()
             .key_context("Palette")
-            .w(px(560.))
-            .max_h(px(440.))
-            .rounded_lg()
+            .w(px(580.))
+            .max_h(px(460.))
+            .rounded(RADIUS_LG)
             .border_1()
-            .border_color(theme.border)
-            .bg(theme.popover)
-            .text_color(theme.popover_foreground)
+            .border_color(t.border)
+            .bg(if t.dark { t.raised } else { t.surface })
+            .text_color(t.fg)
             .shadow_lg()
             .overflow_hidden()
             .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
@@ -278,27 +353,30 @@ impl Render for Palette {
             }))
             .child(
                 div()
-                    .p_2()
+                    .px(px(8.))
+                    .py(px(6.))
                     .border_b_1()
-                    .border_color(theme.border)
+                    .border_color(t.border)
+                    .text_size(TEXT_TITLE)
                     .child(Input::new(&self.query).appearance(false)),
             )
             .map(|el| {
                 if empty {
                     el.child(
                         div()
-                            .p_3()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
+                            .px(px(16.))
+                            .py(px(14.))
+                            .text_size(TEXT_BODY)
+                            .text_color(t.fg_muted)
                             .child(if loading { "Indexing files…" } else { "No matches" }),
                     )
                 } else {
                     el.child(
-                        div().py_1().child(
+                        div().py(px(6.)).child(
                             uniform_list("palette-rows", self.matches.len(), cx.processor(Self::render_rows))
                                 .track_scroll(self.scroll.clone())
                                 .w_full()
-                                .h(px(28. * self.matches.len().min(12) as f32)),
+                                .h(px(32. * self.matches.len().min(12) as f32)),
                         ),
                     )
                 }

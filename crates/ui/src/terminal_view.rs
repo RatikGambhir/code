@@ -21,7 +21,13 @@ use gpui_component::{
     h_flex, v_flex, ActiveTheme as _, IconName, Sizable as _,
 };
 
-use crate::{actions, assets::icon, state::AppState, theme};
+use crate::{
+    actions,
+    assets::icon,
+    chrome,
+    state::AppState,
+    theme::{self, tokens, TEXT_BODY, TEXT_SMALL},
+};
 
 const PADDING: f32 = 8.0;
 
@@ -294,8 +300,9 @@ impl Render for TerminalView {
                 .top(px(PADDING) + line_height * row as f32)
                 .w(cell_width)
                 .h(line_height)
-                .when(focused, |el| el.bg(cx.theme().caret.opacity(0.7)))
-                .when(!focused, |el| el.border_1().border_color(cx.theme().caret))
+                .rounded(px(1.))
+                .when(focused, |el| el.bg(tokens(cx).accent.opacity(0.75)))
+                .when(!focused, |el| el.border_1().border_color(tokens(cx).accent.opacity(0.6)))
         });
 
         let lines = self.render_lines(&font, font_size, line_height, cx);
@@ -309,7 +316,6 @@ impl Render for TerminalView {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .bg(cx.theme().background)
                     .font_family(font.family.clone())
                     .track_focus(&self.focus_handle)
                     .key_context(actions::TERMINAL_CONTEXT)
@@ -337,12 +343,12 @@ impl Render for TerminalView {
                 el.child(
                     h_flex()
                         .gap_2()
-                        .px_2()
-                        .py_1()
+                        .px(px(10.))
+                        .py(px(4.))
                         .border_t_1()
-                        .border_color(cx.theme().border)
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
+                        .border_color(tokens(cx).border)
+                        .text_size(TEXT_SMALL)
+                        .text_color(tokens(cx).fg_muted)
                         .when_some(self.exited, |el, code| {
                             el.child(SharedString::from(match code {
                                 Some(code) => format!("Process exited with code {code}"),
@@ -437,44 +443,45 @@ impl TerminalPanel {
 
 impl Render for TerminalPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tabs = self.terminals.iter().enumerate().map(|(ix, terminal)| {
-            let active = ix == self.active;
-            let title = terminal.read(cx).title();
-            h_flex()
-                .id(("terminal-tab", ix))
-                .gap_1()
-                .px_2()
-                .h_full()
-                .text_xs()
-                .cursor_pointer()
-                .when(active, |el| el.bg(cx.theme().tab_active).text_color(cx.theme().tab_active_foreground))
-                .when(!active, |el| el.text_color(cx.theme().muted_foreground))
-                .child(icon("terminal").xsmall())
-                .child(div().max_w(px(160.)).overflow_hidden().whitespace_nowrap().text_ellipsis().child(title))
-                .child(
-                    Button::new(("close-terminal", ix))
-                        .icon(IconName::Close)
-                        .ghost()
-                        .xsmall()
-                        .on_click(cx.listener(move |this, _, _, cx| this.close(ix, cx))),
-                )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.active = ix;
-                    this.focus_active(window, cx);
-                    cx.notify();
-                }))
-        });
+        let t = tokens(cx).clone();
+        let tabs: Vec<_> = self
+            .terminals
+            .iter()
+            .enumerate()
+            .map(|(ix, terminal)| {
+                let active = ix == self.active;
+                let title = terminal.read(cx).title();
+                chrome::underline_tab(("terminal-tab", ix), active, cx)
+                    .group("terminal-tab")
+                    .pr(px(4.))
+                    .text_size(TEXT_BODY)
+                    .child(icon("terminal").size(px(13.)).text_color(t.fg_subtle))
+                    .child(div().max_w(px(160.)).overflow_hidden().whitespace_nowrap().text_ellipsis().child(title))
+                    .child(
+                        Button::new(("close-terminal", ix))
+                            .icon(IconName::Close)
+                            .ghost()
+                            .xsmall()
+                            .when(!active, |b| b.invisible().group_hover("terminal-tab", |s| s.visible()))
+                            .on_click(cx.listener(move |this, _, _, cx| this.close(ix, cx))),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.active = ix;
+                        this.focus_active(window, cx);
+                        cx.notify();
+                    }))
+            })
+            .collect();
 
         v_flex()
             .size_full()
             .child(
                 h_flex()
-                    .h(px(30.))
+                    .h(px(34.))
                     .flex_none()
+                    .px(px(4.))
                     .border_b_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().tab_bar)
-                    .child(div().px_3().text_xs().text_color(cx.theme().muted_foreground).child("TERMINAL"))
+                    .border_color(t.border)
                     .children(tabs)
                     .child(div().flex_1())
                     .child(
@@ -482,7 +489,7 @@ impl Render for TerminalPanel {
                             .icon(icon("plus"))
                             .ghost()
                             .xsmall()
-                            .tooltip("New terminal")
+                            .tooltip("New terminal (⌃`)")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.add_terminal(None, cx);
                                 this.focus_active(window, cx);
@@ -496,9 +503,12 @@ impl Render for TerminalPanel {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("No terminals. Press ctrl-` to open one.")
+                    .gap(px(8.))
+                    .text_size(TEXT_BODY)
+                    .text_color(t.fg_muted)
+                    .child("No terminals open.")
+                    .child(chrome::key_chip("⌃`", cx))
+                    .child("opens one.")
                     .into_any_element(),
             })
     }
