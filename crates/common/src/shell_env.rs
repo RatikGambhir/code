@@ -28,13 +28,14 @@ pub fn login_shell_path() -> Option<String> {
         .spawn()
         .ok()?;
 
-    // A broken rc file must not hang startup.
+    // A broken rc file must not hang startup. Poll finely: this runs before
+    // the window opens, so every millisecond of overshoot is startup time.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20))
+                std::thread::sleep(Duration::from_millis(1))
             }
             _ => {
                 let _ = child.kill();
@@ -69,6 +70,12 @@ pub fn merge_paths(shell_path: &str, current: &str) -> String {
 /// of `main`, before any thread is spawned (`set_var` is not thread safe).
 pub fn adopt_login_shell_path() {
     if std::env::var_os("HANGAR_SKIP_SHELL_ENV").is_some() {
+        return;
+    }
+    // Started from a terminal, the environment already is the shell's
+    // (interactive, so a superset of what `-l -c` would report): skip the
+    // round trip. Apps opened from Finder or `open` have neither variable.
+    if std::env::var_os("SHLVL").is_some() && std::env::var_os("TERM").is_some() {
         return;
     }
     let Some(shell_path) = login_shell_path() else {

@@ -38,6 +38,7 @@ use crate::{welcome::Welcome, workspace::Workspace};
 /// Sets up the UI once `AppState` is installed as a global.
 pub fn init(cx: &mut App) {
     gpui_component::init(cx);
+    theme::load_fonts(cx);
     theme::apply(None, cx);
     actions::bind_keys(cx);
     cx.on_action(|_: &actions::Quit, cx| cx.quit());
@@ -232,6 +233,7 @@ pub fn open_folder(path: PathBuf, cx: &mut App) {
         }
     };
     let opened = cx.open_window(window_options(cx), |window, cx| {
+        log_first_frame(window);
         let workspace = cx.new(|cx| Workspace::new(record, window, cx));
         window.focus(&workspace.focus_handle(cx));
         cx.new(|cx| Root::new(workspace, window, cx))
@@ -242,10 +244,18 @@ pub fn open_folder(path: PathBuf, cx: &mut App) {
     cx.activate(true);
 }
 
+/// Logs how long after launch the window's first frame reached the screen.
+fn log_first_frame(window: &gpui::Window) {
+    window.on_next_frame(|_, _| {
+        tracing::info!("window ready {:.0?} after launch", cockpit_common::startup::elapsed());
+    });
+}
+
 pub fn open_welcome(cx: &mut App) {
     let mut options = window_options(cx);
     options.window_bounds = Some(WindowBounds::centered(size(px(760.), px(520.)), cx));
     let opened = cx.open_window(options, |window, cx| {
+        log_first_frame(window);
         let welcome = cx.new(|cx| Welcome::new(window, cx));
         window.focus(&welcome.focus_handle(cx));
         cx.new(|cx| Root::new(welcome, window, cx))

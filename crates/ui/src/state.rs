@@ -18,6 +18,17 @@ pub enum ThemePreference {
     Dark,
 }
 
+/// Whose ChatGPT sign-in Codex uses.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenAiSignIn {
+    /// Codex's own (`~/.codex/auth.json`, shared with the ChatGPT app).
+    #[default]
+    Codex,
+    /// Hangar's, kept in the Keychain; Codex asks Hangar for each token.
+    Hangar,
+}
+
 /// User preferences, stored as JSON under the `app_settings` key.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -36,9 +47,14 @@ pub struct Settings {
     pub agent_provider: Provider,
     /// Overrides where `codex` is looked for.
     pub codex_path: Option<String>,
+    pub openai_sign_in: OpenAiSignIn,
     /// Codex's model and effort for new turns (`None` = its default).
     pub default_model: Option<String>,
     pub default_effort: Option<String>,
+    /// The model and effort for `@chatgpt` threads (`None` = the first
+    /// model OpenAI lists for the account).
+    pub chatgpt_model: Option<String>,
+    pub chatgpt_effort: Option<String>,
     /// Overrides where `claude` is looked for.
     pub claude_path: Option<String>,
     /// Claude's model and effort for new turns (`None` = Claude Opus 5.5 at
@@ -63,8 +79,11 @@ impl Default for Settings {
             terminal_font_size: 13.0,
             agent_provider: Provider::OpenAi,
             codex_path: None,
+            openai_sign_in: OpenAiSignIn::Codex,
             default_model: None,
             default_effort: None,
+            chatgpt_model: None,
+            chatgpt_effort: None,
             claude_path: None,
             claude_model: None,
             claude_effort: None,
@@ -97,12 +116,20 @@ impl AppState {
         cx.global::<AppState>()
     }
 
-    /// Where to find `codex`: the configured path, else discovery.
+    /// Where to find `codex`: the configured path, else discovery. With
+    /// Hangar's ChatGPT sign-in, Codex gets its tokens from Hangar.
     pub fn codex_launch(&self) -> Option<CodexLaunch> {
-        match &self.settings.codex_path {
-            Some(path) if !path.is_empty() => Some(CodexLaunch::new(path)),
-            _ => CodexLaunch::discover(),
+        let mut launch = match &self.settings.codex_path {
+            Some(path) if !path.is_empty() => CodexLaunch::new(path),
+            _ => CodexLaunch::discover()?,
+        };
+        if self.settings.openai_sign_in == OpenAiSignIn::Hangar {
+            match std::env::current_exe() {
+                Ok(helper) => launch.config_overrides.extend(cockpit_agents::chatgpt::codex_overrides(&helper)),
+                Err(err) => tracing::warn!("finding Hangar's executable for Codex's token helper: {err}"),
+            }
         }
+        Some(launch)
     }
 
     /// Where to find `claude`: the configured path, else discovery.

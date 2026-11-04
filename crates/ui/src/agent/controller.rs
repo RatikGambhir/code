@@ -2,14 +2,25 @@
 //! turns, approvals, browser tool calls and usage accounting. The panel
 //! renders it.
 
-use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use chrono::Local;
 use cockpit_agents::{
     protocol::{
-        ApprovalDecision, DynamicToolCallResponse, GetAccountResponse, LoginParams, LoginResponse,
-        Model, ThreadItem, UserInput,
+        Account, ApprovalDecision, DynamicToolCallResponse, GetAccountResponse, LoginParams, LoginResponse,
+        Model, ThreadItem, TurnStatus, UserInput,
     },
+    chatgpt,
+    claude::login::{ClaudeLogin, LoginEvent},
     AgentBackend, AgentEvent, ApprovalState, Connection, Prompt, Provider, ToolCall, Transcript,
 };
 use cockpit_browser::BrowserAction;
@@ -20,7 +31,7 @@ use cockpit_orchestrator::{
 use cockpit_persistence::{now_ts, AgentThreadRecord, TokenCounts, UsageFilter, UsageRecord};
 use gpui::{App, AppContext as _, Context, EventEmitter, SharedString, Task};
 
-use crate::state::AppState;
+use crate::state::{AppState, OpenAiSignIn};
 
 /// The key the global agent policy is stored under.
 const POLICY_KEY: &str = "global";
@@ -40,11 +51,18 @@ pub struct ThreadSession {
     pub title: SharedString,
     pub model: Option<String>,
     pub transcript: Transcript,
+    /// Seconds since the epoch; the feed lists threads in this order.
+    pub created_at: i64,
+    /// Breaks ties between threads created in the same second (0 for
+    /// threads loaded from disk).
+    pub seq: u64,
     /// Last activity, in seconds since the epoch, for ordering and labels.
     pub updated_at: i64,
     /// The transcript reflects the server's history (started here or resumed).
     pub loaded: bool,
     pub loading: bool,
+    /// An `@chatgpt` conversation (ChatGPT on the plan, not Codex).
+    pub chatgpt: bool,
 }
 
 /// A browser tool call waiting for the user's go-ahead.
@@ -65,6 +83,33 @@ pub enum AgentControllerEvent {
     /// sign-in, which owns the credentials).
     RunInTerminal { program: String, args: Vec<String> },
 }
+
+/// Hangar's own ChatGPT sign-in (tokens in the Keychain).
+#[derive(Clone, Debug, PartialEq)]
+pub enum HangarSignIn {
+    /// Not read from the Keychain yet.
+    Unknown,
+    SignedOut,
+    SignedIn(chatgpt::AccountInfo),
+}
+
+/// Claude Code's sign-in, running in the background.
+#[derive(Clone)]
+pub struct ClaudeLoginState {
+    login: Arc<ClaudeLogin>,
+    /// The fallback link, whose page shows a code to paste.
+    pub url: Option<String>,
+}
+
+/// A Hangar sign-in waiting for the browser.
+#[derive(Clone)]
+pub struct HangarLogin {
+    pub auth_url: Option<String>,
+    cancel: Arc<AtomicBool>,
+}
+
+/// The stored provider key of `@chatgpt` threads.
+const CHATGPT_KEY: &str = "chatgpt";
 
 type Connecting = Pin<Box<dyn Future<Output = anyhow::Result<Connection>> + Send>>;
 
@@ -94,12 +139,30 @@ pub struct AgentController {
     /// The URL of the browser tab the agent drives, for tool policy.
     agent_browser_url: Option<String>,
     usage_today: i64,
-    /// A prompt typed before any thread existed; sent once one is created.
-    first_prompt: Option<String>,
+    /// The next [`ThreadSession::seq`].
+    next_seq: u64,
     /// Claude Code's sign-in is running in a terminal.
     terminal_login: bool,
+    /// The panel has been shown, so the agent should be connected. Until
+    /// then no agent process is started (the panel may never be opened).
+    wanted: bool,
+    /// Saved threads and policy have been read.
+    loaded: bool,
+    /// Codex uses Hangar's ChatGPT sign-in, not its own.
+    hangar_sign_in: bool,
+    hangar_account: HangarSignIn,
+    hangar_login: Option<HangarLogin>,
+    claude_login: Option<ClaudeLoginState>,
+    /// `@chatgpt` threads' backend, made the first time one is needed.
+    chat: Option<Arc<dyn AgentBackend>>,
+    chat_models: Vec<Model>,
+    chat_model: Option<String>,
+    chat_effort: Option<String>,
     _events: Option<Task<()>>,
+    _chat_events: Option<Task<()>>,
     _login_poll: Option<Task<()>>,
+    _hangar_login: Option<Task<()>>,
+    _claude_login: Option<Task<()>>,
 }
 
 impl EventEmitter<AgentControllerEvent> for AgentController {}
@@ -132,10 +195,23 @@ impl AgentController {
             browser_tools: settings.agent_browser_tools,
             agent_browser_url: None,
             usage_today: 0,
-            first_prompt: None,
+            next_seq: 1,
             terminal_login: false,
+            wanted: false,
+            loaded: false,
+            hangar_sign_in: settings.openai_sign_in == OpenAiSignIn::Hangar,
+            hangar_account: HangarSignIn::Unknown,
+            hangar_login: None,
+            claude_login: None,
+            chat: None,
+            chat_models: Vec::new(),
+            chat_model: settings.chatgpt_model.clone(),
+            chat_effort: settings.chatgpt_effort.clone(),
             _events: None,
+            _chat_events: None,
             _login_poll: None,
+            _hangar_login: None,
+            _claude_login: None,
         };
         controller.load_saved_state(cx);
         controller
@@ -162,6 +238,7 @@ impl AgentController {
                             if this.threads.iter().chain(&this.parked_threads).any(|t| t.id == record.thread_id) {
                                 continue;
                             }
+                            let chatgpt = record.provider.as_deref() == Some(CHATGPT_KEY);
                             let list = if Provider::from_key(record.provider.as_deref()) == this.provider {
                                 &mut this.threads
                             } else {
@@ -176,19 +253,35 @@ impl AgentController {
                                 id: record.thread_id,
                                 model: record.model,
                                 transcript: Transcript::new(),
+                                created_at: record.created_at,
+                                seq: 0,
                                 updated_at: record.updated_at,
                                 loaded: false,
                                 loading: false,
+                                chatgpt,
                             });
                         }
                     }
                     Err(err) => tracing::warn!("loading agent state: {err:#}"),
                 }
+                this.loaded = true;
                 this.refresh_usage(cx);
-                this.connect(cx);
+                if this.wanted {
+                    this.connect(cx);
+                }
             })
         })
         .detach();
+    }
+
+    /// The panel is showing: connect to the agent if that never happened.
+    /// Starting `codex app-server` or `claude` is deferred to here so that a
+    /// window with the panel closed does not run (or pay for) either.
+    pub fn activate(&mut self, cx: &mut Context<Self>) {
+        self.wanted = true;
+        if self.loaded && self.state == ConnectionState::Idle {
+            self.connect(cx);
+        }
     }
 
     // --- accessors ---------------------------------------------------------
@@ -215,23 +308,38 @@ impl AgentController {
         &self.cwd
     }
 
+    /// The open thread is an `@chatgpt` conversation: the model pickers
+    /// are ChatGPT's.
+    pub fn chat_active(&self) -> bool {
+        self.active_thread().is_some_and(|t| t.chatgpt)
+    }
+
     pub fn models(&self) -> &[Model] {
-        &self.models
+        if self.chat_active() { &self.chat_models } else { &self.models }
     }
 
     pub fn model(&self) -> Option<&str> {
-        self.model.as_deref()
+        if self.chat_active() { self.chat_model.as_deref() } else { self.model.as_deref() }
     }
 
     pub fn effort(&self) -> Option<&str> {
-        self.effort.as_deref()
+        if self.chat_active() { self.chat_effort.as_deref() } else { self.effort.as_deref() }
     }
 
     /// The model new turns will use: the chosen one or the server default.
     pub fn effective_model(&self) -> Option<&Model> {
-        match &self.model {
-            Some(id) => self.models.iter().find(|m| &m.id == id),
-            None => self.models.iter().find(|m| m.is_default),
+        let models = self.models();
+        match self.model() {
+            Some(id) => models.iter().find(|m| m.id == id),
+            None => models.iter().find(|m| m.is_default),
+        }
+    }
+
+    /// "ChatGPT" for `@chatgpt` threads, else the provider's agent.
+    pub fn thread_agent_name(&self, thread_id: &str) -> &'static str {
+        match self.threads.iter().find(|t| t.id == thread_id) {
+            Some(thread) if thread.chatgpt => "ChatGPT",
+            _ => self.agent_name(),
         }
     }
 
@@ -244,7 +352,23 @@ impl AgentController {
     }
 
     pub fn needs_login(&self) -> bool {
+        if self.uses_hangar_sign_in() {
+            return self.hangar_account == HangarSignIn::SignedOut;
+        }
         matches!(&self.account, Some(account) if account.requires_openai_auth && account.account.is_none())
+    }
+
+    /// Codex is running on Hangar's ChatGPT sign-in.
+    pub fn uses_hangar_sign_in(&self) -> bool {
+        self.provider == Provider::OpenAi && self.hangar_sign_in
+    }
+
+    pub fn claude_login(&self) -> Option<&ClaudeLoginState> {
+        self.claude_login.as_ref()
+    }
+
+    pub fn hangar_login(&self) -> Option<&HangarLogin> {
+        self.hangar_login.as_ref()
     }
 
     pub fn login_state(&self) -> Option<&LoginResponse> {
@@ -272,15 +396,28 @@ impl AgentController {
         self.usage_today
     }
 
+    /// Some thread has a turn running.
     pub fn is_running(&self) -> bool {
+        self.threads.iter().any(|t| t.transcript.is_running())
+    }
+
+    /// How many threads have a turn running.
+    pub fn running_count(&self) -> usize {
+        self.threads.iter().filter(|t| t.transcript.is_running()).count()
+    }
+
+    /// The open thread has a turn running.
+    pub fn active_is_running(&self) -> bool {
         self.active_thread().is_some_and(|t| t.transcript.is_running())
     }
 
     pub fn queued(&self) -> usize {
-        self.active
-            .as_deref()
-            .map(|id| self.orchestrator.queued_for(id))
-            .unwrap_or(0)
+        self.active.as_deref().map_or(0, |id| self.queued_for(id))
+    }
+
+    /// Prompts waiting for a free slot in `thread_id`.
+    pub fn queued_for(&self, thread_id: &str) -> usize {
+        self.orchestrator.queued_for(thread_id)
     }
 
     // --- connection --------------------------------------------------------
@@ -357,17 +494,15 @@ impl AgentController {
             })
         })
         .detach();
-
-        // Reopen the most recent thread so the panel is not empty.
-        if self.active.is_none() {
-            if let Some(id) = self.threads.first().map(|t| t.id.clone()) {
-                self.select_thread(&id, cx);
-            }
-        }
+        // Saved threads stay closed in the feed: each is read from disk
+        // only when its card is opened.
         cx.notify();
     }
 
     fn refresh_account(&mut self, cx: &mut Context<Self>) {
+        if self.provider == Provider::OpenAi {
+            self.refresh_hangar_account(cx);
+        }
         let Some(backend) = self.backend.clone() else { return };
         let account = backend.account();
         let provider = self.provider;
@@ -430,7 +565,6 @@ impl AgentController {
         self.models.clear();
         self.account = None;
         self.login = None;
-        self.first_prompt = None;
         std::mem::swap(&mut self.threads, &mut self.parked_threads);
         self.active = None;
         let settings = &AppState::global(cx).settings;
@@ -441,6 +575,198 @@ impl AgentController {
         AppState::save_settings(cx, |settings| settings.agent_provider = provider);
         self.connect(cx);
         cx.notify();
+    }
+
+    /// Who the agent is signed in as, for the header menu, e.g.
+    /// "you@example.com · Plus". `None` while signed out or unknown.
+    pub fn account_label(&self) -> Option<String> {
+        if self.uses_hangar_sign_in() {
+            let HangarSignIn::SignedIn(account) = &self.hangar_account else { return None };
+            let who = account.email.clone().unwrap_or_else(|| "Signed in".into());
+            return Some(format!("{who} · ChatGPT plan"));
+        }
+        let account = self.account.as_ref()?.account.as_ref()?;
+        let (who, plan) = match account {
+            Account::Chatgpt { email, plan_type } => (email.clone(), plan_type.as_str().map(str::to_string)),
+            Account::ApiKey => (Some("OpenAI API key".into()), None),
+            Account::Claude { email, method, plan } => (email.clone().or_else(|| method.clone()), plan.clone()),
+            Account::Other => (None, None),
+        };
+        let who = who.unwrap_or_else(|| "Signed in".into());
+        Some(match plan.filter(|p| !p.is_empty()) {
+            Some(plan) => format!("{who} · {}", capitalize(&plan)),
+            None => who,
+        })
+    }
+
+    /// Signing out is offered when the agent's CLI holds the credentials:
+    /// not for Claude on Bedrock, Vertex or Foundry, which use the cloud's.
+    pub fn can_sign_out(&self) -> bool {
+        if self.uses_hangar_sign_in() {
+            return matches!(self.hangar_account, HangarSignIn::SignedIn(_));
+        }
+        let Some(account) = self.account.as_ref().and_then(|a| a.account.as_ref()) else {
+            return false;
+        };
+        self.backend.is_some()
+            && !matches!(account, Account::Claude { method: Some(m), .. }
+                if matches!(m.as_str(), "bedrock" | "vertex" | "foundry"))
+    }
+
+    pub fn sign_out(&mut self, cx: &mut Context<Self>) {
+        if self.uses_hangar_sign_in() {
+            return self.sign_out_of_hangar(cx);
+        }
+        let Some(backend) = self.backend.clone() else { return };
+        let logout = backend.logout();
+        let name = self.agent_name();
+        cx.spawn(async move |this, cx| {
+            let result = logout.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.login = None;
+                        cx.emit(AgentControllerEvent::Notify(format!("Signed out of {name}.").into()));
+                    }
+                    Err(err) => cx.emit(AgentControllerEvent::Notify(format!("Sign-out failed: {err:#}").into())),
+                }
+                this.refresh_account(cx);
+                cx.notify();
+            })
+        })
+        .detach();
+    }
+
+    /// Reads Hangar's ChatGPT sign-in from the Keychain (off the UI thread:
+    /// macOS may ask the user first).
+    fn refresh_hangar_account(&mut self, cx: &mut Context<Self>) {
+        let read = cx.background_spawn(async { chatgpt::signed_in_account() });
+        cx.spawn(async move |this, cx| {
+            let account = read.await;
+            this.update(cx, |this, cx| {
+                this.hangar_account = match account {
+                    Ok(Some(account)) => HangarSignIn::SignedIn(account),
+                    Ok(None) => HangarSignIn::SignedOut,
+                    Err(err) => {
+                        tracing::warn!("reading the ChatGPT sign-in: {err:#}");
+                        cx.emit(AgentControllerEvent::Notify(format!("Couldn't read the ChatGPT sign-in: {err:#}").into()));
+                        HangarSignIn::SignedOut
+                    }
+                };
+                cx.notify();
+            })
+        })
+        .detach();
+    }
+
+    /// Hangar's own Sign in with ChatGPT: the browser signs in, Hangar keeps
+    /// the tokens in the Keychain, and Codex is restarted to use them.
+    pub fn sign_in_with_hangar(&mut self, cx: &mut Context<Self>) {
+        self.sign_in_with_hangar_for(true, cx);
+    }
+
+    /// `codex`: also switch Codex to this sign-in (else it is for
+    /// `@chatgpt` only).
+    fn sign_in_with_hangar_for(&mut self, codex: bool, cx: &mut Context<Self>) {
+        if self.hangar_login.is_some() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (url_tx, url_rx) = async_channel::bounded::<String>(1);
+        let (done_tx, done_rx) = async_channel::bounded(1);
+        let thread_cancel = cancel.clone();
+        let spawned = std::thread::Builder::new().name("chatgpt-sign-in".into()).spawn(move || {
+            let result = chatgpt::begin_sign_in().and_then(|pending| {
+                let _ = url_tx.send_blocking(pending.auth_url().to_string());
+                pending.finish(&thread_cancel)
+            });
+            let _ = done_tx.send_blocking(result);
+        });
+        if let Err(err) = spawned {
+            cx.emit(AgentControllerEvent::Notify(format!("Sign-in failed: {err}").into()));
+            return;
+        }
+        self.hangar_login = Some(HangarLogin { auth_url: None, cancel: cancel.clone() });
+        cx.notify();
+        self._hangar_login = Some(cx.spawn(async move |this, cx| {
+            if let Ok(url) = url_rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    cx.open_url(&url);
+                    if let Some(login) = &mut this.hangar_login {
+                        login.auth_url = Some(url);
+                    }
+                    cx.notify();
+                });
+            }
+            let result = done_rx.recv().await.unwrap_or_else(|_| Err(anyhow::anyhow!("the sign-in stopped")));
+            let _ = this.update(cx, |this, cx| {
+                this.hangar_login = None;
+                match result {
+                    Ok(account) => {
+                        let who = account.email.clone().unwrap_or_else(|| "your ChatGPT account".into());
+                        this.hangar_account = HangarSignIn::SignedIn(account);
+                        if codex {
+                            cx.emit(AgentControllerEvent::Notify(
+                                format!("Signed in to ChatGPT as {who}. Codex now uses this sign-in.").into(),
+                            ));
+                            this.set_hangar_sign_in(true, cx);
+                        } else {
+                            cx.emit(AgentControllerEvent::Notify(
+                                format!("Signed in to ChatGPT as {who}. Send your @chatgpt message again.").into(),
+                            ));
+                        }
+                    }
+                    Err(_) if cancel.load(Ordering::Relaxed) => {}
+                    Err(err) => cx.emit(AgentControllerEvent::Notify(format!("Sign-in failed: {err:#}").into())),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    pub fn cancel_hangar_sign_in(&mut self, cx: &mut Context<Self>) {
+        if let Some(login) = self.hangar_login.take() {
+            login.cancel.store(true, Ordering::Relaxed);
+        }
+        cx.notify();
+    }
+
+    /// Switches Codex between Hangar's ChatGPT sign-in and its own, and
+    /// restarts it so the change takes effect.
+    pub fn set_hangar_sign_in(&mut self, hangar: bool, cx: &mut Context<Self>) {
+        let changed = self.hangar_sign_in != hangar;
+        self.hangar_sign_in = hangar;
+        AppState::save_settings(cx, |settings| {
+            settings.openai_sign_in = if hangar { OpenAiSignIn::Hangar } else { OpenAiSignIn::Codex };
+        });
+        if changed && self.provider == Provider::OpenAi {
+            self.account = None;
+            self.login = None;
+            if self.wanted {
+                self.reconnect(cx);
+            }
+        }
+        if hangar {
+            self.refresh_hangar_account(cx);
+        }
+        cx.notify();
+    }
+
+    fn sign_out_of_hangar(&mut self, cx: &mut Context<Self>) {
+        let sign_out = cx.background_spawn(async { chatgpt::sign_out() });
+        cx.spawn(async move |this, cx| {
+            let result = sign_out.await;
+            this.update(cx, |this, cx| {
+                let message = match result {
+                    Ok(chatgpt::SignOut::Revoked) => "Signed out of ChatGPT.".to_string(),
+                    Ok(chatgpt::SignOut::LocalOnly) => "Signed out of ChatGPT on this Mac, but OpenAI didn't confirm it. You can also disconnect Hangar in ChatGPT's settings.".to_string(),
+                    Err(err) => format!("Sign-out failed: {err:#}"),
+                };
+                cx.emit(AgentControllerEvent::Notify(message.into()));
+                this.refresh_hangar_account(cx);
+            })
+        })
+        .detach();
     }
 
     pub fn login_with_chatgpt(&mut self, cx: &mut Context<Self>) {
@@ -463,10 +789,82 @@ impl AgentController {
         .detach();
     }
 
-    /// Starts Claude Code's own sign-in in a terminal tab: claude.ai (a
+    /// Starts Claude Code's own sign-in in the background: claude.ai (a
     /// Claude plan) or, with `console`, an Anthropic Console account billed
-    /// per API use. Claude Code keeps the credentials.
+    /// per API use. Claude Code opens the browser and keeps the credentials;
+    /// the panel waits, and takes a code if the sign-in page shows one.
     pub fn login_with_claude(&mut self, console: bool, cx: &mut Context<Self>) {
+        let Some(launch) = AppState::global(cx).claude_launch() else {
+            self.state = ConnectionState::NotInstalled;
+            cx.notify();
+            return;
+        };
+        self.cancel_terminal_login(cx);
+        let (login, events) = match ClaudeLogin::start(&launch, console) {
+            Ok(started) => started,
+            Err(err) => {
+                cx.emit(AgentControllerEvent::Notify(format!("Claude sign-in failed: {err:#}").into()));
+                return;
+            }
+        };
+        self.claude_login = Some(ClaudeLoginState { login: Arc::new(login), url: None });
+        cx.notify();
+        // Replacing the task drops any earlier sign-in's events.
+        self._claude_login = Some(cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                let finished = this
+                    .update(cx, |this, cx| {
+                        let finished = matches!(event, LoginEvent::Finished(_));
+                        match event {
+                            LoginEvent::Url(url) => {
+                                if let Some(state) = &mut this.claude_login {
+                                    state.url = Some(url);
+                                }
+                            }
+                            LoginEvent::Finished(result) => {
+                                // Cancelled sign-ins have already been cleared.
+                                let cancelled = this.claude_login.take().is_none();
+                                match result {
+                                    Ok(()) => {
+                                        cx.emit(AgentControllerEvent::Notify("Signed in to Claude.".into()));
+                                        this.check_login(cx);
+                                    }
+                                    Err(err) if !cancelled => cx.emit(AgentControllerEvent::Notify(
+                                        format!("Claude sign-in failed: {err}").into(),
+                                    )),
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                        cx.notify();
+                        finished
+                    })
+                    .unwrap_or(true);
+                if finished {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Sends the code the Claude sign-in page showed.
+    pub fn submit_claude_code(&mut self, code: String, cx: &mut Context<Self>) {
+        let Some(state) = &self.claude_login else { return };
+        if let Err(err) = state.login.submit_code(&code) {
+            cx.emit(AgentControllerEvent::Notify(format!("Claude sign-in failed: {err:#}").into()));
+        }
+    }
+
+    pub fn cancel_claude_login(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.claude_login.take() {
+            state.login.cancel();
+        }
+        cx.notify();
+    }
+
+    /// The older way: `claude auth login` in a terminal tab.
+    pub fn login_with_claude_in_terminal(&mut self, console: bool, cx: &mut Context<Self>) {
+        self.cancel_claude_login(cx);
         let Some(launch) = AppState::global(cx).claude_launch() else {
             self.state = ConnectionState::NotInstalled;
             cx.notify();
@@ -533,6 +931,16 @@ impl AgentController {
     // --- settings ----------------------------------------------------------
 
     pub fn set_model(&mut self, model: Option<String>, cx: &mut Context<Self>) {
+        if self.chat_active() {
+            self.chat_model = model.clone();
+            self.chat_effort = None;
+            AppState::save_settings(cx, |settings| {
+                settings.chatgpt_model = model;
+                settings.chatgpt_effort = None;
+            });
+            cx.notify();
+            return;
+        }
         self.model = model.clone();
         // The previous effort may not exist for the new model.
         self.effort = None;
@@ -551,6 +959,12 @@ impl AgentController {
     }
 
     pub fn set_effort(&mut self, effort: Option<String>, cx: &mut Context<Self>) {
+        if self.chat_active() {
+            self.chat_effort = effort.clone();
+            AppState::save_settings(cx, |settings| settings.chatgpt_effort = effort);
+            cx.notify();
+            return;
+        }
         self.effort = effort.clone();
         let provider = self.provider;
         AppState::save_settings(cx, |settings| match provider {
@@ -589,19 +1003,95 @@ impl AgentController {
 
     // --- threads -----------------------------------------------------------
 
-    pub fn new_thread(&mut self, cx: &mut Context<Self>) {
-        self.start_thread(self.browser_tools, cx);
+    /// Starts a new thread (for Claude, its own Claude Code process), opens
+    /// it and sends `text` as its first prompt. Threads started this way run
+    /// side by side, up to the policy's concurrency limit.
+    pub fn spawn(&mut self, text: String, cx: &mut Context<Self>) {
+        self.spawn_as(text, false, cx);
     }
 
-    fn start_thread(&mut self, with_tools: bool, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else {
+    /// Starts a new Codex (or Claude) thread, or with `chatgpt` an
+    /// `@chatgpt` conversation on Hangar's ChatGPT sign-in.
+    pub fn spawn_as(&mut self, text: String, chatgpt: bool, cx: &mut Context<Self>) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        // Check before creating a thread that would only hold the error.
+        if let Err(reason) = self.orchestrator.check_prompt(&text) {
+            cx.emit(AgentControllerEvent::Notify(reason.into()));
+            return;
+        }
+        if chatgpt {
+            if self.hangar_account == HangarSignIn::SignedOut {
+                cx.emit(AgentControllerEvent::Notify(
+                    "@chatgpt needs Hangar's ChatGPT sign-in. Finish it in your browser, then send again.".into(),
+                ));
+                self.sign_in_with_hangar_for(false, cx);
+                return;
+            }
+            self.start_thread_on(true, false, text, cx);
+        } else {
+            self.start_thread(self.browser_tools, text, cx);
+        }
+    }
+
+    /// The backend for `@chatgpt` threads, made on first use.
+    fn chat_backend(&mut self, cx: &mut Context<Self>) -> Arc<dyn AgentBackend> {
+        if let Some(chat) = &self.chat {
+            return chat.clone();
+        }
+        let connection = AppState::global(cx).agents.connect_chatgpt();
+        let backend = connection.backend.clone();
+        let events = connection.events;
+        self._chat_events = Some(cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                if this.update(cx, |this, cx| this.handle_event(event, cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+        let models = backend.models();
+        cx.spawn(async move |this, cx| {
+            let models = models.await;
+            this.update(cx, |this, cx| match models {
+                Ok(models) => {
+                    this.chat_models = models;
+                    cx.notify();
+                }
+                Err(err) => tracing::warn!("listing ChatGPT models: {err:#}"),
+            })
+        })
+        .detach();
+        self.chat = Some(backend.clone());
+        backend
+    }
+
+    /// The backend that runs `thread_id`.
+    fn backend_for(&mut self, thread_id: &str, cx: &mut Context<Self>) -> Option<Arc<dyn AgentBackend>> {
+        if self.threads.iter().any(|t| t.id == thread_id && t.chatgpt) {
+            Some(self.chat_backend(cx))
+        } else {
+            self.backend.clone()
+        }
+    }
+
+    /// `first_prompt` is sent once the thread exists; each call carries its
+    /// own, so several threads can be starting at once.
+    fn start_thread(&mut self, with_tools: bool, first_prompt: String, cx: &mut Context<Self>) {
+        self.start_thread_on(false, with_tools, first_prompt, cx);
+    }
+
+    fn start_thread_on(&mut self, chatgpt: bool, with_tools: bool, first_prompt: String, cx: &mut Context<Self>) {
+        let backend = if chatgpt { Some(self.chat_backend(cx)) } else { self.backend.clone() };
+        let Some(backend) = backend else {
             cx.emit(AgentControllerEvent::Notify(format!("{} is not connected.", self.agent_name()).into()));
             return;
         };
         let config = self.orchestrator.thread_config(
             Some(self.cwd.to_string_lossy().into_owned()),
-            self.model.clone(),
-            with_tools,
+            if chatgpt { self.chat_model.clone() } else { self.model.clone() },
+            with_tools && !chatgpt,
         );
         let request = backend.start_thread(config);
         cx.spawn(async move |this, cx| {
@@ -609,6 +1099,8 @@ impl AgentController {
             this.update(cx, |this, cx| match response {
                 Ok(response) => {
                     let thread = response.thread;
+                    let seq = this.next_seq;
+                    this.next_seq += 1;
                     this.threads.insert(
                         0,
                         ThreadSession {
@@ -616,9 +1108,12 @@ impl AgentController {
                             title: "New thread".into(),
                             model: Some(response.model.clone()),
                             transcript: Transcript::new(),
+                            created_at: now_ts(),
+                            seq,
                             updated_at: now_ts(),
                             loaded: true,
                             loading: false,
+                            chatgpt,
                         },
                     );
                     this.active = Some(thread.id.clone());
@@ -630,27 +1125,24 @@ impl AgentController {
                         cwd: Some(this.cwd.to_string_lossy().into_owned()),
                         created_at: now_ts(),
                         updated_at: now_ts(),
-                        provider: Some(this.provider.key().into()),
+                        provider: Some(if chatgpt { CHATGPT_KEY.into() } else { this.provider.key().into() }),
                     };
                     AppState::global(cx)
                         .db
                         .write_detached("agent thread", move |w| w.upsert_agent_thread(&record));
-                    if let Some(prompt) = this.first_prompt.take() {
-                        this.send(prompt, cx);
-                    }
+                    this.send_to(thread.id, first_prompt, cx);
                     cx.notify();
                 }
-                Err(err) if with_tools && format!("{err:#}").contains("dynamic") => {
+                Err(err) if with_tools && !chatgpt && format!("{err:#}").contains("dynamic") => {
                     // An app server without dynamic tool support: run without
                     // the browser tools rather than not at all.
                     tracing::warn!("thread/start rejected dynamic tools: {err:#}");
                     cx.emit(AgentControllerEvent::Notify(
                         "This Codex version does not support IDE browser tools; continuing without them.".into(),
                     ));
-                    this.start_thread(false, cx);
+                    this.start_thread(false, first_prompt, cx);
                 }
                 Err(err) => {
-                    this.first_prompt = None;
                     cx.emit(AgentControllerEvent::Notify(format!("Could not start a thread: {err:#}").into()));
                 }
             })
@@ -658,11 +1150,10 @@ impl AgentController {
         .detach();
     }
 
-    /// Clears the active thread so the next prompt starts a new one. Unlike
-    /// [`Self::new_thread`], nothing is created until the user sends.
+    /// Closes the open thread so the next prompt starts a new one. Nothing
+    /// is created until the user sends.
     pub fn start_draft(&mut self, cx: &mut Context<Self>) {
         self.active = None;
-        self.first_prompt = None;
         cx.notify();
     }
 
@@ -678,7 +1169,7 @@ impl AgentController {
     }
 
     fn resume_thread(&mut self, id: String, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else { return };
+        let Some(backend) = self.backend_for(&id, cx) else { return };
         if let Some(thread) = self.thread_mut(&id) {
             thread.loading = true;
         }
@@ -706,7 +1197,17 @@ impl AgentController {
                         thread.loaded = true;
                     }
                     Err(err) => {
-                        thread.transcript.push_error(format!("Could not resume this thread: {err:#}"));
+                        let text = format!("{err:#}");
+                        // Codex ties a thread to the sign-in that started it.
+                        let message = if !text.contains(chatgpt::CODEX_PROVIDER_ID) {
+                            format!("Could not resume this thread: {text}")
+                        } else if this.hangar_sign_in {
+                            "This thread was started with Codex's own sign-in. To continue it, choose \"Use Codex's own sign-in\" in the Codex menu above.".into()
+                        } else {
+                            "This thread was started with Hangar's ChatGPT sign-in. To continue it, choose \"Use Hangar's ChatGPT sign-in\" in the Codex menu above.".into()
+                        };
+                        let Some(thread) = this.thread_mut(&id) else { return };
+                        thread.transcript.push_error(message);
                     }
                 }
                 cx.notify();
@@ -718,7 +1219,7 @@ impl AgentController {
     pub fn archive_thread(&mut self, id: &str, cx: &mut Context<Self>) {
         self.threads.retain(|t| t.id != id);
         if self.active.as_deref() == Some(id) {
-            self.active = self.threads.first().map(|t| t.id.clone());
+            self.active = None;
         }
         let id = id.to_string();
         AppState::global(cx)
@@ -729,22 +1230,26 @@ impl AgentController {
 
     // --- turns -------------------------------------------------------------
 
-    /// Sends a prompt to the active thread (creating one if needed), through
-    /// policy, budget admission and the scheduler.
+    /// Sends a prompt to the open thread, or starts a new one when none is
+    /// open.
     pub fn send(&mut self, text: String, cx: &mut Context<Self>) {
+        match self.active.clone() {
+            Some(thread_id) => self.send_to(thread_id, text, cx),
+            None => self.spawn(text, cx),
+        }
+    }
+
+    /// Sends a prompt to `thread_id` through policy, budget admission and
+    /// the scheduler.
+    pub fn send_to(&mut self, thread_id: String, text: String, cx: &mut Context<Self>) {
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
         }
-        if self.backend.is_none() {
+        if self.backend_for(&thread_id, cx).is_none() {
             cx.emit(AgentControllerEvent::Notify(format!("{} is not connected.", self.agent_name()).into()));
             return;
         }
-        let Some(thread_id) = self.active.clone() else {
-            self.first_prompt = Some(text);
-            self.new_thread(cx);
-            return;
-        };
         if let Err(reason) = self.orchestrator.check_prompt(&text) {
             if let Some(thread) = self.thread_mut(&thread_id) {
                 thread.transcript.push_error(reason);
@@ -789,11 +1294,12 @@ impl AgentController {
                 )
             })
         };
+        let chatgpt = self.threads.iter().any(|t| t.id == thread_id && t.chatgpt);
         let prompt = QueuedPrompt {
             thread_id: thread_id.clone(),
             text: text.clone(),
-            model: self.model.clone(),
-            effort: self.effort.clone(),
+            model: if chatgpt { self.chat_model.clone() } else { self.model.clone() },
+            effort: if chatgpt { self.chat_effort.clone() } else { self.effort.clone() },
         };
         cx.spawn(async move |this, cx| {
             let admission = admission.await.unwrap_or_else(|err| {
@@ -829,7 +1335,7 @@ impl AgentController {
     }
 
     fn start_turn(&mut self, prompt: QueuedPrompt, cx: &mut Context<Self>) {
-        let Some(backend) = self.backend.clone() else { return };
+        let Some(backend) = self.backend_for(&prompt.thread_id, cx) else { return };
         let thread_id = prompt.thread_id.clone();
         // The current preset applies to every turn, so changing it in the
         // panel also changes threads that started under another one.
@@ -846,7 +1352,7 @@ impl AgentController {
             let result = request.await;
             this.update(cx, |this, cx| {
                 if let Err(err) = result {
-                    let name = this.provider.agent_name();
+                    let name = this.thread_agent_name(&thread_id);
                     if let Some(thread) = this.thread_mut(&thread_id) {
                         thread.transcript.push_error(format!("{name} did not start the turn: {err:#}"));
                     }
@@ -861,8 +1367,16 @@ impl AgentController {
         .detach();
     }
 
+    /// Stops the open thread's turn and drops its queued prompts.
     pub fn interrupt(&mut self, cx: &mut Context<Self>) {
-        let Some(thread) = self.active_thread() else { return };
+        if let Some(id) = self.active.clone() {
+            self.interrupt_thread(&id, cx);
+        }
+    }
+
+    /// Stops `thread_id`'s turn and drops its queued prompts.
+    pub fn interrupt_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let Some(thread) = self.threads.iter().find(|t| t.id == thread_id) else { return };
         let thread_id = thread.id.clone();
         let turn_id = thread.transcript.active_turn().map(str::to_string);
         let cancelled = self.orchestrator.cancel_queued(&thread_id);
@@ -871,7 +1385,7 @@ impl AgentController {
                 thread.transcript.push_notice(format!("Dropped {cancelled} queued prompt(s)."));
             }
         }
-        if let (Some(backend), Some(turn_id)) = (self.backend.clone(), turn_id) {
+        if let (Some(backend), Some(turn_id)) = (self.backend_for(&thread_id, cx), turn_id) {
             let request = backend.interrupt(thread_id, turn_id);
             cx.background_spawn(async move {
                 if let Err(err) = request.await {
@@ -1038,7 +1552,12 @@ impl AgentController {
                     }
                 }
             }
-            AgentEvent::TurnCompleted { thread_id, .. } => {
+            AgentEvent::TurnCompleted { thread_id, turn } => {
+                // A failed turn may mean the Hangar sign-in ended (revoked
+                // or expired): look again, so the sign-in card comes back.
+                if self.uses_hangar_sign_in() && turn.status == TurnStatus::Failed {
+                    self.refresh_hangar_account(cx);
+                }
                 if let Some(next) = self.orchestrator.turn_finished(thread_id) {
                     self.start_turn(next, cx);
                 }
@@ -1168,5 +1687,14 @@ impl AgentController {
         if let Some(backend) = self.backend.take() {
             backend.shutdown();
         }
+    }
+}
+
+/// "plus" → "Plus", for plan names.
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }

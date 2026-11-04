@@ -19,7 +19,7 @@ use gpui_component::{v_flex, Icon, IconName};
 
 use crate::{
     chrome::{self, panel_header},
-    theme::{self, tokens, TEXT_BODY, TEXT_MONO},
+    theme::{self, tokens, TEXT_BODY},
 };
 
 pub enum ExplorerEvent {
@@ -256,13 +256,8 @@ impl Explorer {
                                     .whitespace_nowrap()
                                     .text_ellipsis()
                                     .text_color(color)
-                                    .map(|el| {
-                                        if row.is_dir {
-                                            el.text_size(TEXT_BODY)
-                                        } else {
-                                            el.font_family(t.mono.clone()).text_size(TEXT_MONO)
-                                        }
-                                    })
+                                    // Files and folders share the interface font.
+                                    .text_size(TEXT_BODY)
                                     .when(selected && !row.is_dir, |el| el.font_weight(gpui::FontWeight::MEDIUM))
                                     .child(row.name.clone()),
                             )

@@ -54,8 +54,10 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 futures = "0.3"
+getrandom = "0.3"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2"
 log = "0.4"
 lsp-types = "0.97"
 notify = "8"
@@ -65,6 +67,8 @@ regex = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+security-framework = "3.7"
+sha2 = "0.10"
 smallvec = "1"
 tempfile = "3"
 thiserror = "2"
@@ -72,6 +76,7 @@ thiserror = "2"
 toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
 tracing = "0.1"
+ureq = "3.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 vt100 = "0.16"
@@ -85,8 +90,11 @@ split-debuginfo = "unpacked"
 opt-level = 2
 
 [profile.release]
-lto = "thin"
-codegen-units = 16
+# Whole-program optimization in one codegen unit: the fastest and smallest
+# binary (less code to page in at launch), for a slower release build.
+# Cargo already strips debug info from release builds without `debug`.
+lto = "fat"
+codegen-units = 1
 
 # gpui-component with a small patch for code editor gutter and line decorations
 # (breakpoints, run icons, the paused line, inline values). See

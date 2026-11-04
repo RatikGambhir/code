@@ -218,10 +218,15 @@ impl InputState {
 
     pub(super) fn indent_inline(
         &mut self,
-        _: &IndentInline,
+        action: &IndentInline,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // cockpit patch: with the completion list open, Tab accepts the
+        // selected item (replacing the word), as in IntelliJ.
+        if self.handle_action_for_context_menu(Box::new(action.clone()), window, cx) {
+            return;
+        }
         // First, try to accept inline completion if present
         if self.accept_inline_completion(window, cx) {
             return;

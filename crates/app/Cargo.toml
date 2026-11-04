@@ -18,8 +18,15 @@ name = "hangar-helper"
 path = "src/bin/helper.rs"
 
 [features]
+default = ["runtime-shaders"]
 # Type-check the macOS build from another host (see cockpit-browser).
 cef-typecheck = ["cockpit-browser/cef-typecheck"]
+# Compile GPUI's Metal shaders when the app starts, so building does not
+# require the Metal compiler (the Command Line Tools have none). macOS caches
+# the result, but the first launch after an install or OS update spends
+# ~300 ms on it. `cargo xtask bundle --release` turns this off, shipping
+# precompiled shaders, whenever `xcrun` can find the compiler.
+runtime-shaders = ["gpui/runtime_shaders"]
 
 [dependencies]
 anyhow.workspace = true
@@ -33,8 +40,3 @@ gpui.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
-
-# Compile Metal shaders at run time, so building does not require the full
-# Xcode (the Command Line Tools have no `metal` compiler).
-[target.'cfg(target_os = "macos")'.dependencies]
-gpui = { workspace = true, features = ["runtime_shaders"] }

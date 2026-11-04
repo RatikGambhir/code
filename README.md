@@ -20,14 +20,25 @@ turn stream, approve commands and edits, and interrupt.
 - Rust 1.88+ (`rustup` recommended)
 - Xcode Command Line Tools (`xcode-select --install`)
 - CMake and Ninja, used to build the Chromium wrapper: `brew install cmake ninja`
-- At least one agent CLI (credentials stay with the CLI; Hangar never
-  stores them):
-  - Codex: `npm install -g @openai/codex` or `brew install codex`, then sign
-    in from the agent panel (ChatGPT or an OpenAI API key).
+- At least one agent CLI:
+  - Codex: `npm install -g @openai/codex` or `brew install codex` (or the
+    copy inside the ChatGPT desktop app, which Hangar finds on its own), then
+    sign in from the agent panel. *Continue with ChatGPT* is Hangar's own
+    Sign in with ChatGPT: Hangar keeps the tokens in the macOS Keychain and
+    Codex asks Hangar for an access token when it needs one
+    (`Hangar --chatgpt-access-token`). Codex's own sign-in (ChatGPT or an
+    OpenAI API key, kept by Codex in `~/.codex`) is still offered; switch
+    between them from the Codex menu in the panel header. Codex ties each
+    thread to the sign-in that started it.
+  - `@chatgpt` in the Codex panel asks ChatGPT itself (no Codex, no tools)
+    on your ChatGPT plan, with Hangar's sign-in: answers stream from
+    `api.openai.com/v1/responses`, and conversations are kept in Hangar's
+    data directory (`chatgpt-threads/`). `@codex` starts a Codex agent.
   - Claude Code: `curl -fsSL https://claude.ai/install.sh | bash` or
     `npm install -g @anthropic-ai/claude-code`, then sign in from the agent
     panel (a Claude plan, an Anthropic Console account, or
     `ANTHROPIC_API_KEY` / Bedrock / Vertex configured for Claude Code).
+    Claude Code keeps its own credentials; Hangar never stores them.
 - For Rust IDE features (completion, go to definition, references, hover,
   quick fixes, `cargo check` diagnostics): `rustup component add
   rust-analyzer`. The `rust-analyzer` in `~/.cargo/bin` is only rustup's
@@ -54,6 +65,17 @@ The first build downloads the Chromium Embedded Framework (~500 MB) into
 `.cef/` (see `.cargo/config.toml`; export `CEF_PATH` to share one download
 between checkouts). The app is assembled at
 `target/<profile>/bundle/Hangar.app`.
+
+Release builds use whole-program LTO in a single codegen unit, so they take
+a few minutes longer to link. When `xcrun` finds the Metal compiler (Xcode,
+or its downloadable Metal toolchain), they also ship precompiled shaders;
+otherwise the shaders compile on the first launch (the `runtime-shaders`
+feature, on by default).
+
+Startup does only what the first frame needs. Chromium starts when the
+first browser tab opens, and the agent (`codex app-server`, `claude`)
+starts when its panel is first shown. The log records
+`window ready … after launch`.
 
 Chromium only works from the app bundle — it locates its framework and the
 `Hangar Helper*.app` processes through the bundle layout. A plain
@@ -104,6 +126,7 @@ against the installed rust-analyzer.
 | ⇧F12 | Find all references |
 | ⌃- / ⌃⇧- | Go back / forward after a jump |
 | ⌘. | Quick fixes and refactors (e.g. add a missing `use`) |
+| Tab / ↩ | In the completion list (it opens as you type): Tab replaces the word under the cursor, ↩ inserts before it; ↑↓ choose, Esc closes. Picking a name that is not imported yet adds its `use`. |
 | `(` `[` `{` `"` | Closed for you; typing the closer steps over it, ⌫ removes an empty pair, ↩ between a pair opens an indented line, and with text selected it is wrapped |
 | ⌘L | Ask the agent (Enter sends, ⇧Enter newline, ⌃C stops the turn) |
 | ⇧⌘N | New agent thread |
@@ -277,7 +300,8 @@ header (Codex or Claude) is a menu that switches between them. The choice,
 and each provider's model and effort, are remembered globally, and each
 provider keeps its own threads.
 
-- *Codex*: each window starts `codex app-server` for its folder and talks
+- *Codex*: each window starts `codex app-server` for its folder (when the
+  agent panel is first shown) and talks
   JSON-RPC over stdio: threads, turns, streaming items, approvals, token
   usage, account and login.
 - *Claude*: each thread runs `claude -p --input-format stream-json
@@ -390,6 +414,10 @@ the app was renamed (`Cockpit/`, `cockpit.sqlite3`) is moved here on first launc
   run-loop pump, and text input handling.
 - Icons from [Lucide](https://lucide.dev) (ISC), see
   `assets/icons/LICENSE-lucide.txt`; the rest come with gpui-component.
+- Fonts, as in Zed: [IBM Plex Sans](https://github.com/IBM/plex) for the
+  interface and [Lilex](https://github.com/mishamyrt/Lilex) for code, both
+  SIL Open Font License 1.1 (`assets/fonts/*/LICENSE.txt`). A code font set
+  in the settings (`mono_font`) still takes precedence.
 - Chromium Embedded Framework (BSD) via [cef-rs](https://github.com/tauri-apps/cef-rs).
 
 ## License

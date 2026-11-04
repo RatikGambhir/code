@@ -754,7 +754,8 @@ impl TextElement {
                 diagnostics,
                 ..
             } => (highlighter.borrow(), diagnostics),
-            _ => return None,
+            // cockpit patch: plain inputs can color ranges too.
+            _ => return plain_text_highlights(state, visible_range, visible_byte_range),
         };
         let highlighter = highlighter.as_ref()?;
 
@@ -775,7 +776,10 @@ impl TextElement {
 
             let range = offset..offset + line_len;
             let line_styles = highlighter.styles(&range, &cx.theme().highlight_theme);
-            styles = gpui::combine_highlights(styles, line_styles).collect();
+            // cockpit patch: lines do not overlap, so combining each line on
+            // its own and appending gives what combining everything gives,
+            // without re-sorting all earlier lines once per line.
+            styles.extend(gpui::combine_highlights(line_styles, std::iter::empty()));
 
             offset = range.end;
         }
@@ -1744,4 +1748,42 @@ mod tests {
         assert_eq!(result[4].color, gpui::black());
         assert_eq!(result[5].color, gpui::blue());
     }
+}
+
+/// cockpit patch: runs for an input without a highlighter that has
+/// `text_highlights`: the visible text (newlines included, as the code
+/// editor path does) split into plain and colored ranges.
+fn plain_text_highlights(
+    state: &InputState,
+    visible_range: &Range<usize>,
+    visible_byte_range: Range<usize>,
+) -> Option<Vec<(Range<usize>, HighlightStyle)>> {
+    if state.text_highlights.is_empty() || state.masked {
+        return None;
+    }
+    let newline = usize::from(state.mode.is_multi_line());
+    let start = visible_byte_range.start;
+    let end = state
+        .text
+        .iter_lines()
+        .skip(visible_range.start)
+        .take(visible_range.len())
+        .fold(start, |end, line| end + line.len() + newline);
+    let mut styles = Vec::new();
+    let mut pos = start;
+    for (range, style) in &state.text_highlights {
+        let from = range.start.clamp(pos, end);
+        let to = range.end.clamp(from, end);
+        if from > pos {
+            styles.push((pos..from, HighlightStyle::default()));
+        }
+        if to > from {
+            styles.push((from..to, *style));
+        }
+        pos = pos.max(to);
+    }
+    if pos < end {
+        styles.push((pos..end, HighlightStyle::default()));
+    }
+    Some(styles)
 }

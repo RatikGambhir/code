@@ -19,6 +19,10 @@ pub struct FsChange {
     pub paths: BTreeSet<PathBuf>,
     /// Something inside `.git` changed (HEAD, index, refs) — refresh status.
     pub git_changed: bool,
+    /// `git status` may read differently: `.git` changed, or a path outside
+    /// the ignored directories did. A build churning through `target/`
+    /// changes many paths but never the status, so it need not be re-run.
+    pub affects_git: bool,
 }
 
 pub struct WorkspaceWatcher {
@@ -40,14 +44,15 @@ impl WorkspaceWatcher {
         std::thread::Builder::new()
             .name("cockpit-fs-watch".into())
             .spawn(move || {
+                let mut ignored = IgnoredDirs::new(&root);
                 while let Ok(first) = raw_rx.recv() {
                     let mut change = FsChange::default();
-                    absorb(&root, first, &mut change);
+                    absorb(&root, first, &mut ignored, &mut change);
                     let deadline = std::time::Instant::now() + BATCH_WINDOW;
                     loop {
                         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                         match raw_rx.recv_timeout(remaining) {
-                            Ok(event) => absorb(&root, event, &mut change),
+                            Ok(event) => absorb(&root, event, &mut ignored, &mut change),
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                         }
@@ -62,7 +67,7 @@ impl WorkspaceWatcher {
     }
 }
 
-fn absorb(root: &Path, event: notify::Result<notify::Event>, change: &mut FsChange) {
+fn absorb(root: &Path, event: notify::Result<notify::Event>, ignored: &mut IgnoredDirs, change: &mut FsChange) {
     let Ok(event) = event else { return };
     if matches!(event.kind, notify::EventKind::Access(_)) {
         return;
@@ -75,16 +80,89 @@ fn absorb(root: &Path, event: notify::Result<notify::Event>, change: &mut FsChan
             let name = relative.to_string_lossy();
             if !name.contains("/objects/") && !name.ends_with(".lock") {
                 change.git_changed = true;
+                change.affects_git = true;
+            }
+            if name.ends_with("info/exclude") {
+                ignored.reload(root);
             }
             continue;
         }
+        if relative == Path::new(".gitignore") {
+            ignored.reload(root);
+        }
+        if !change.affects_git && !ignored.contains(relative) {
+            change.affects_git = true;
+        }
         change.paths.insert(path);
+    }
+}
+
+/// The directories the workspace's top-level ignore rules exclude
+/// (`.gitignore`, `.git/info/exclude` and the user's global excludes).
+///
+/// Git never looks inside an ignored directory, so nothing changing there
+/// can alter `git status`. Files matched on their own are not trusted the
+/// same way, since a tracked file stays tracked whatever the rules say.
+/// Nested `.gitignore` files are not read: their directories only count as
+/// relevant, which costs a refresh, never a missed one.
+struct IgnoredDirs {
+    matcher: ignore::gitignore::Gitignore,
+}
+
+impl IgnoredDirs {
+    fn new(root: &Path) -> Self {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+        // Missing files are fine; a broken rule only makes fewer paths ignored.
+        let _ = builder.add(root.join(".gitignore"));
+        let _ = builder.add(root.join(".git/info/exclude"));
+        if let Some(global) = ignore::gitignore::gitconfig_excludes_path() {
+            let _ = builder.add(global);
+        }
+        let matcher = builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
+        Self { matcher }
+    }
+
+    fn reload(&mut self, root: &Path) {
+        *self = Self::new(root);
+    }
+
+    /// Whether `relative` lies inside an ignored directory.
+    fn contains(&self, relative: &Path) -> bool {
+        let mut dir = PathBuf::new();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            // The last component is the path itself, which may be a file.
+            if components.peek().is_none() {
+                break;
+            }
+            dir.push(component);
+            if self.matcher.matched(&dir, true).is_ignore() {
+                return true;
+            }
+        }
+        false
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paths_inside_ignored_directories_do_not_affect_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".gitignore"), "target/\n*.log\n/build\n").unwrap();
+        let ignored = IgnoredDirs::new(root);
+        assert!(ignored.contains(Path::new("target/debug/deps/x.o")));
+        assert!(ignored.contains(Path::new("crates/a/target/x")));
+        assert!(ignored.contains(Path::new("build/out.txt")));
+        assert!(!ignored.contains(Path::new("target")));
+        assert!(!ignored.contains(Path::new("src/main.rs")));
+        // A file matched on its own may still be tracked.
+        assert!(!ignored.contains(Path::new("debug.log")));
+        assert!(!ignored.contains(Path::new("crates/build/lib.rs")));
+    }
 
     #[test]
     fn reports_file_changes_and_git_changes_separately() {

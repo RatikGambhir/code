@@ -69,6 +69,11 @@ pub struct Palette {
     query: Entity<InputState>,
     /// Indices into the source with their score, best first.
     matches: Vec<usize>,
+    /// Every index that matched `pool_query`, in source order. A query that
+    /// extends it can only match among these, so typing on narrows this
+    /// list instead of scoring the whole source again.
+    pool: Vec<usize>,
+    pool_query: Option<String>,
     selected: usize,
     scroll: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
@@ -158,6 +163,7 @@ impl Palette {
                     *slot = paths;
                     *loading = false;
                 }
+                this.pool_query = None;
                 this.filter(cx);
             })
             .ok();
@@ -187,6 +193,8 @@ impl Palette {
             source,
             query,
             matches: Vec::new(),
+            pool: Vec::new(),
+            pool_query: None,
             selected: 0,
             scroll: UniformListScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -207,32 +215,31 @@ impl Palette {
         let query = self.query.read(cx).value().to_string();
         let query = query.trim();
         self.matches = if query.is_empty() {
+            self.pool_query = None;
             (0..self.len().min(MAX_SHOWN)).collect()
         } else {
-            match &self.source {
-                Source::Commands(commands) => fuzzy::rank(
-                    query,
-                    commands.iter().enumerate().map(|(ix, c)| (c.label, ix)),
-                    MAX_SHOWN,
-                ),
-                Source::Files { paths, .. } => fuzzy::rank(
-                    query,
-                    paths.iter().enumerate().map(|(ix, p)| (p.as_str(), ix)),
-                    MAX_SHOWN,
-                ),
-                Source::Locations(items) => fuzzy::rank(
-                    query,
-                    items.iter().enumerate().map(|(ix, item)| (item.search.as_str(), ix)),
-                    MAX_SHOWN,
-                ),
-            }
-            .into_iter()
-            .map(|(ix, _)| ix)
-            .collect()
+            let narrowing = self.pool_query.as_deref().is_some_and(|previous| query.starts_with(previous));
+            let pool = if narrowing { std::mem::take(&mut self.pool) } else { (0..self.len()).collect() };
+            let scored: Vec<(usize, i64)> = pool
+                .into_iter()
+                .filter_map(|ix| fuzzy::score(query, self.search_text(ix)).map(|score| (ix, score)))
+                .collect();
+            self.pool = scored.iter().map(|&(ix, _)| ix).collect();
+            self.pool_query = Some(query.to_string());
+            fuzzy::best(scored, MAX_SHOWN).into_iter().map(|(ix, _)| ix).collect()
         };
         self.selected = 0;
         self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
         cx.notify();
+    }
+
+    /// The text item `ix` is matched against.
+    fn search_text(&self, ix: usize) -> &str {
+        match &self.source {
+            Source::Commands(commands) => commands[ix].label,
+            Source::Files { paths, .. } => paths[ix].as_str(),
+            Source::Locations(items) => items[ix].search.as_str(),
+        }
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {

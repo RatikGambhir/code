@@ -11,23 +11,40 @@
 //! One timer serves every tab. After pumping it tells resized tabs and wakes
 //! the listeners of tabs with something new to show.
 //!
+//! The timer follows Chromium's own schedule
+//! (`OnScheduleMessagePumpWork`, which may arrive on any thread): work it
+//! asks for runs right away or after the delay it names, and otherwise the
+//! timer only fires every [`MAX_DELAY`], as in CEF's sample application.
+//! A fixed 60 Hz tick would cost CPU while nothing happens and add up to a
+//! frame of latency when something does.
+//!
 //! Approach from bokuweb/gpui-cef (MIT OR Apache-2.0).
 
 use std::{
     cell::{Cell, RefCell},
     ffi::c_void,
     rc::{Rc, Weak},
+    sync::atomic::{AtomicPtr, Ordering},
 };
 
 use core_foundation::{
+    base::TCFType as _,
     date::CFAbsoluteTimeGetCurrent,
-    runloop::{kCFRunLoopCommonModes, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, CFRunLoopTimerRef},
+    runloop::{
+        kCFRunLoopCommonModes, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, CFRunLoopTimerGetNextFireDate,
+        CFRunLoopTimerRef, CFRunLoopTimerSetNextFireDate,
+    },
 };
 
 use super::shared::TabShared;
 
-/// Seconds between pumps: 60 Hz.
-const INTERVAL: f64 = 1.0 / 60.0;
+/// Longest wait between pumps, in seconds (CEF's sample uses the same).
+const MAX_DELAY: f64 = 1.0 / 30.0;
+
+/// The pump's timer, for [`schedule`] calls from Chromium's threads. Set
+/// once; the timer lives (in the main thread's `PUMP`) until the process
+/// exits.
+static TIMER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 #[derive(Default)]
 struct PumpState {
@@ -74,10 +91,32 @@ impl Pump {
             release: None,
             copyDescription: None,
         };
+        // The first round runs straight away: initialization queues work.
         let now = unsafe { CFAbsoluteTimeGetCurrent() };
-        let timer = CFRunLoopTimer::new(now + INTERVAL, INTERVAL, 0, 0, on_tick, &mut context);
+        let timer = CFRunLoopTimer::new(now, MAX_DELAY, 0, 0, on_tick, &mut context);
         unsafe { CFRunLoop::get_main().add_timer(&timer, kCFRunLoopCommonModes) };
+        TIMER.store(timer.as_concrete_TypeRef() as *mut c_void, Ordering::Release);
         Self { _timer: timer, state }
+    }
+}
+
+/// Chromium asks for `cef_do_message_loop_work` in `delay_ms` (now, if not
+/// positive). Called from any thread; moves the timer's next firing earlier
+/// when needed. Before the pump starts there is nothing to move: it starts
+/// with a round.
+pub(crate) fn schedule(delay_ms: i64) {
+    let timer = TIMER.load(Ordering::Acquire) as CFRunLoopTimerRef;
+    if timer.is_null() || super::SHUT_DOWN.load(Ordering::SeqCst) {
+        return;
+    }
+    let delay = (delay_ms.max(0) as f64 / 1000.0).min(MAX_DELAY);
+    // SAFETY: the timer is never released (see `TIMER`), and Core
+    // Foundation's timer calls are thread safe.
+    unsafe {
+        let fire = CFAbsoluteTimeGetCurrent() + delay;
+        if fire < CFRunLoopTimerGetNextFireDate(timer) {
+            CFRunLoopTimerSetNextFireDate(timer, fire);
+        }
     }
 }
 

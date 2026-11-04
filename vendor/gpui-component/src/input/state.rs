@@ -289,6 +289,9 @@ pub struct InputState {
     pub(super) size: Size,
     pub(super) disabled: bool,
     pub(super) masked: bool,
+    /// cockpit patch: colored ranges for inputs without a highlighter
+    /// (sorted byte ranges); see `set_text_highlights`.
+    pub(super) text_highlights: Vec<(Range<usize>, gpui::HighlightStyle)>,
     pub(super) clean_on_escape: bool,
     pub(super) soft_wrap: bool,
     pub(super) pattern: Option<regex::Regex>,
@@ -387,6 +390,7 @@ impl InputState {
             selecting: false,
             disabled: false,
             masked: false,
+            text_highlights: Vec::new(),
             clean_on_escape: false,
             soft_wrap: true,
             loading: false,
@@ -701,6 +705,21 @@ impl InputState {
         debug_assert!(self.mode.is_single_line());
         self.masked = masked;
         cx.notify();
+    }
+
+    /// cockpit patch: colors byte ranges of the text in an input that is not
+    /// a code editor (an `@mention` in a chat box, say). Ranges are sorted,
+    /// do not overlap, and are clamped to the text when drawn; set them
+    /// again whenever the text changes.
+    pub fn set_text_highlights(
+        &mut self,
+        highlights: Vec<(Range<usize>, gpui::HighlightStyle)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.text_highlights != highlights {
+            self.text_highlights = highlights;
+            cx.notify();
+        }
     }
 
     /// Set true to clear the input by pressing Escape key.

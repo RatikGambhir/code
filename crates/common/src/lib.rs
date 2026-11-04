@@ -4,6 +4,7 @@
 pub mod ids;
 pub mod paths;
 pub mod shell_env;
+pub mod startup;
 
 pub use ids::*;
 pub use paths::AppPaths;

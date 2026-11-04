@@ -39,6 +39,9 @@ pub struct SourceControl {
     refreshing: Option<Task<()>>,
     /// Another refresh was asked for while one ran.
     refresh_again: bool,
+    /// The refresh button was last drawn spinning, so the end of a refresh
+    /// must redraw even when the status did not change.
+    spinner_shown: bool,
     busy: bool,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -73,6 +76,7 @@ impl SourceControl {
             confirm_discard: None,
             refreshing: None,
             refresh_again: false,
+            spinner_shown: false,
             busy: false,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -132,13 +136,21 @@ impl SourceControl {
         self.refreshing = Some(cx.spawn(async move |this, cx| {
             let status = task.await;
             this.update(cx, |this, cx| {
+                this.refreshing = None;
                 match status {
-                    Ok(status) => this.status = Some(status),
+                    // Most refreshes find what was already there; only a
+                    // real change is worth redrawing the tree and panels for.
+                    Ok(status) if this.status.as_ref() != Some(&status) => {
+                        this.status = Some(status);
+                        cx.emit(SourceControlEvent::StatusChanged);
+                        cx.notify();
+                    }
+                    Ok(_) => {}
                     Err(err) => tracing::warn!("git status: {err:#}"),
                 }
-                this.refreshing = None;
-                cx.emit(SourceControlEvent::StatusChanged);
-                cx.notify();
+                if this.spinner_shown {
+                    cx.notify();
+                }
                 if std::mem::take(&mut this.refresh_again) {
                     this.refresh(cx);
                 }
@@ -402,6 +414,7 @@ impl Render for SourceControl {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = tokens(cx).clone();
         let muted = t.fg_muted;
+        self.spinner_shown = self.refreshing.is_some();
         let header = panel_header("Source control", cx)
             .child(
                 Button::new("scm-refresh")

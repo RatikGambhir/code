@@ -18,7 +18,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use cockpit_editor::{
     fuzzy,
-    lsp::{resolve_server, server_key, uri_to_path, LspClient, ServerEvent},
+    lsp::{resolve_server, server_key, uri_to_path, LspClient, PositionEncoding, ServerEvent},
     lsp_language_id,
 };
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, SharedString, Task, WeakEntity, Window};
@@ -74,6 +74,9 @@ pub struct LspManager {
     root: PathBuf,
     servers: HashMap<String, Slot>,
     diagnostics: HashMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+    /// Errors and warnings across `diagnostics`, kept up to date as they
+    /// arrive: the status bar shows them on every redraw.
+    counts: (usize, usize),
     last_status: Option<String>,
 }
 
@@ -85,6 +88,7 @@ impl LspManager {
             root,
             servers: HashMap::new(),
             diagnostics: HashMap::new(),
+            counts: (0, 0),
             last_status: None,
         }
     }
@@ -95,16 +99,15 @@ impl LspManager {
 
     /// Counts of (errors, warnings) across the workspace.
     pub fn diagnostic_counts(&self) -> (usize, usize) {
-        let mut errors = 0;
-        let mut warnings = 0;
-        for diagnostic in self.diagnostics.values().flatten() {
-            match diagnostic.severity {
-                Some(lsp_types::DiagnosticSeverity::ERROR) => errors += 1,
-                Some(lsp_types::DiagnosticSeverity::WARNING) => warnings += 1,
-                _ => {}
-            }
-        }
-        (errors, warnings)
+        self.counts
+    }
+
+    fn count(diagnostics: &[lsp_types::Diagnostic]) -> (usize, usize) {
+        diagnostics.iter().fold((0, 0), |(errors, warnings), diagnostic| match diagnostic.severity {
+            Some(lsp_types::DiagnosticSeverity::ERROR) => (errors + 1, warnings),
+            Some(lsp_types::DiagnosticSeverity::WARNING) => (errors, warnings + 1),
+            _ => (errors, warnings),
+        })
     }
 
     /// One line for the status bar.
@@ -237,7 +240,12 @@ impl LspManager {
                     match event {
                         ServerEvent::Diagnostics(params) => {
                             if let Some(path) = uri_to_path(&params.uri) {
-                                this.diagnostics.insert(path.clone(), params.diagnostics);
+                                let added = Self::count(&params.diagnostics);
+                                let removed = this
+                                    .diagnostics
+                                    .insert(path.clone(), params.diagnostics)
+                                    .map_or((0, 0), |old| Self::count(&old));
+                                this.counts = (this.counts.0 + added.0 - removed.0, this.counts.1 + added.1 - removed.1);
                                 cx.emit(LspEvent::Diagnostics(path));
                             }
                         }
@@ -286,6 +294,7 @@ impl LspManager {
     pub fn restart(&mut self, cx: &mut Context<Self>) {
         self.shutdown(cx);
         let paths: Vec<PathBuf> = self.diagnostics.drain().map(|(path, _)| path).collect();
+        self.counts = (0, 0);
         for path in paths {
             cx.emit(LspEvent::Diagnostics(path));
         }
@@ -477,16 +486,45 @@ impl LspDocument {
     }
 
     /// Sends the text to the server if it changed since the last sync.
+    ///
+    /// Called on every keystroke, so servers that take edits get just the
+    /// one that happened (a few bytes) instead of the whole file, which
+    /// would be serialized, piped and re-read by the server each time.
     pub fn sync(&self, text: &Rope) {
-        if *self.synced.borrow() == *text {
-            return;
-        }
+        let edit = {
+            let synced = self.synced.borrow();
+            match rope_diff(&synced, text) {
+                None => return,
+                Some((old_range, new_range)) => self.incremental().then(|| {
+                    let encoding = self.client.position_encoding();
+                    let range = lsp_types::Range::new(
+                        self.shift.to_server(lsp_position(&synced, old_range.start, encoding)),
+                        self.shift.to_server(lsp_position(&synced, old_range.end, encoding)),
+                    );
+                    (range, text.slice(new_range).to_string())
+                }),
+            }
+        };
         let version = self.version.get() + 1;
         self.version.set(version);
-        if let Err(err) = self.client.did_change(&self.path, version, &self.server_text(text)) {
+        let sent = match edit {
+            Some((range, new_text)) => self.client.did_change_range(&self.path, version, range, &new_text),
+            None => self.client.did_change(&self.path, version, &self.server_text(text)),
+        };
+        if let Err(err) = sent {
             tracing::warn!("didChange {}: {err:#}", self.path.display());
         }
         *self.synced.borrow_mut() = text.clone();
+    }
+
+    /// Edits can be sent as ranges: the server takes them, and a cell's
+    /// surrounding text starts it on a line of its own (columns line up).
+    fn incremental(&self) -> bool {
+        self.client.incremental_sync()
+            && self
+                .surround
+                .as_ref()
+                .is_none_or(|(prefix, _)| prefix.is_empty() || prefix.ends_with('\n'))
     }
 
     pub fn saved(&self, text: &str) {
@@ -568,6 +606,107 @@ fn definition_targets(response: Option<GotoDefinitionResponse>) -> Vec<Target> {
     link_targets(&definition_links(response))
 }
 
+/// The one contiguous edit that turns `old` into `new`: the byte range it
+/// replaced in `old` and the range of the replacement in `new`. `None` when
+/// they are the same. Both ranges fall on character boundaries and never
+/// split a `\r\n`.
+fn rope_diff(old: &Rope, new: &Rope) -> Option<(Range<usize>, Range<usize>)> {
+    let mut prefix = common_len(old.chunks(), new.chunks());
+    if prefix == old.len() && prefix == new.len() {
+        return None;
+    }
+    let max_suffix = old.len().min(new.len()) - prefix;
+    fn reversed(rope: &Rope) -> impl Iterator<Item = &str> {
+        rope.chunks_at(rope.len()).0.reversed()
+    }
+    let mut suffix = common_len_reversed(reversed(old), reversed(new)).min(max_suffix);
+
+    let splits = |rope: &Rope, at: usize| {
+        !rope.is_char_boundary(at) || (at > 0 && at < rope.len() && rope.byte(at - 1) == b'\r' && rope.byte(at) == b'\n')
+    };
+    while prefix > 0 && (splits(old, prefix) || splits(new, prefix)) {
+        prefix -= 1;
+    }
+    while suffix > 0 && (splits(old, old.len() - suffix) || splits(new, new.len() - suffix)) {
+        suffix -= 1;
+    }
+    Some((prefix..old.len() - suffix, prefix..new.len() - suffix))
+}
+
+/// How many bytes two chunk streams share at their start.
+fn common_len<'a>(mut a: impl Iterator<Item = &'a str>, mut b: impl Iterator<Item = &'a str>) -> usize {
+    let (mut left, mut right): (&[u8], &[u8]) = (&[], &[]);
+    let mut total = 0;
+    loop {
+        if left.is_empty() {
+            match a.next() {
+                Some(chunk) => left = chunk.as_bytes(),
+                None => return total,
+            }
+            continue;
+        }
+        if right.is_empty() {
+            match b.next() {
+                Some(chunk) => right = chunk.as_bytes(),
+                None => return total,
+            }
+            continue;
+        }
+        let len = left.len().min(right.len());
+        if left[..len] != right[..len] {
+            return total + left.iter().zip(right).take_while(|(x, y)| x == y).count();
+        }
+        total += len;
+        left = &left[len..];
+        right = &right[len..];
+    }
+}
+
+/// How many bytes two chunk streams share at their end; the streams yield
+/// chunks back to front.
+fn common_len_reversed<'a>(mut a: impl Iterator<Item = &'a str>, mut b: impl Iterator<Item = &'a str>) -> usize {
+    let (mut left, mut right): (&[u8], &[u8]) = (&[], &[]);
+    let mut total = 0;
+    loop {
+        if left.is_empty() {
+            match a.next() {
+                Some(chunk) => left = chunk.as_bytes(),
+                None => return total,
+            }
+            continue;
+        }
+        if right.is_empty() {
+            match b.next() {
+                Some(chunk) => right = chunk.as_bytes(),
+                None => return total,
+            }
+            continue;
+        }
+        let len = left.len().min(right.len());
+        let (l, r) = (&left[left.len() - len..], &right[right.len() - len..]);
+        if l != r {
+            return total + l.iter().rev().zip(r.iter().rev()).take_while(|(x, y)| x == y).count();
+        }
+        total += len;
+        left = &left[..left.len() - len];
+        right = &right[..right.len() - len];
+    }
+}
+
+/// The LSP position of byte `offset` in `text`, its column counted the way
+/// the server asked.
+fn lsp_position(text: &Rope, offset: usize, encoding: PositionEncoding) -> lsp_types::Position {
+    // Offsets from `rope_diff` are character boundaries already.
+    let point = text.offset_to_point(offset);
+    let (line, start) = (point.row, offset - point.column);
+    let column = match encoding {
+        PositionEncoding::Utf8 => offset - start,
+        PositionEncoding::Utf16 => text.byte_to_utf16_idx(offset) - text.byte_to_utf16_idx(start),
+        PositionEncoding::Utf32 => text.slice(start..offset).chars().count(),
+    };
+    lsp_types::Position::new(line as u32, column as u32)
+}
+
 /// Completion through the language server.
 pub struct LspCompletion {
     doc: Rc<LspDocument>,
@@ -612,8 +751,14 @@ impl CompletionProvider for LspCompletion {
         let request = self.doc.client.completion(&self.doc.path, shift.to_server(position), Some(context));
         cx.background_spawn(async move {
             let response = request.await?.unwrap_or(CompletionResponse::Array(Vec::new()));
-            Ok(rank_completions(shift.completions(response), &word))
+            // Unranked: the menu narrows and orders it (`filter_completions`)
+            // for whatever has been typed by the time it is shown.
+            Ok(shift.completions(response))
         })
+    }
+
+    fn filter_completions(&self, items: &[&CompletionItem], word: &str) -> Vec<usize> {
+        rank_completions(items, word)
     }
 
     fn is_completion_trigger(&self, _offset: usize, new_text: &str, _cx: &mut Context<InputState>) -> bool {
@@ -637,44 +782,18 @@ fn typed_word(before_cursor: &str) -> &str {
     &before_cursor[start..]
 }
 
-/// The part of `label` the menu highlights as matching `word`: the label's
-/// own first characters when it starts with the word (ignoring case), else
-/// nothing.
-///
-/// The editor's completion menu highlights the first `filter_text.len()`
-/// bytes of the label (or the typed text's length when there is no
-/// `filter_text`), and GPUI panics when that is not a character boundary of
-/// the label, which servers' filter texts often are not. Built from the
-/// label itself, this always fits.
-fn highlight_prefix(label: &str, word: &str) -> String {
-    let mut prefix_len = 0;
-    let mut label_chars = label.char_indices();
-    for typed in word.chars() {
-        match label_chars.next() {
-            Some((ix, c)) if c.to_lowercase().eq(typed.to_lowercase()) => prefix_len = ix + c.len_utf8(),
-            _ => return String::new(),
-        }
-    }
-    label[..prefix_len].to_string()
-}
-
 /// The editor shows completions as given, without filtering or sorting, and
 /// servers such as rust-analyzer send everything in scope expecting the
 /// client to narrow it down. So: keep the items whose filter text fuzzily
 /// matches the typed `word`, put those that start with it first, then follow
 /// the server's relevance (`sortText`, preselected first), and keep the best.
-///
-/// `filter_text` is then replaced with what the menu should highlight (see
-/// [`highlight_prefix`]); the menu uses it for nothing else.
-fn rank_completions(response: CompletionResponse, word: &str) -> CompletionResponse {
-    let (items, incomplete) = match response {
-        CompletionResponse::Array(items) => (items, false),
-        CompletionResponse::List(list) => (list.items, list.is_incomplete),
-    };
-    let word_lower = word.to_lowercase();
+/// Returns indices into `items`. Runs on every keystroke over everything the
+/// server sent (thousands of items), so it allocates nothing per item.
+fn rank_completions(items: &[&CompletionItem], word: &str) -> Vec<usize> {
     let mut ranked: Vec<_> = items
-        .into_iter()
-        .filter_map(|item| {
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, item)| {
             let filter = item.filter_text.as_deref().unwrap_or(&item.label);
             let score = if word.is_empty() { 0 } else { fuzzy::score(word, filter)? };
             // 0: is the word, 1: starts with it as typed, 2: ignoring case,
@@ -683,7 +802,7 @@ fn rank_completions(response: CompletionResponse, word: &str) -> CompletionRespo
                 0
             } else if filter.starts_with(word) {
                 1
-            } else if filter.to_lowercase().starts_with(&word_lower) {
+            } else if starts_with_ignoring_case(filter, word) {
                 2
             } else {
                 3
@@ -691,18 +810,27 @@ fn rank_completions(response: CompletionResponse, word: &str) -> CompletionRespo
             let key = (
                 tier,
                 !item.preselect.unwrap_or(false),
-                item.sort_text.clone().unwrap_or_else(|| item.label.clone()),
+                item.sort_text.as_deref().unwrap_or(&item.label),
                 std::cmp::Reverse(score),
+                ix,
             );
-            Some((key, item))
+            Some(key)
         })
         .collect();
-    ranked.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let mut items: Vec<_> = ranked.into_iter().map(|(_, item)| item).take(MAX_COMPLETIONS).collect();
-    for item in &mut items {
-        item.filter_text = Some(highlight_prefix(&item.label, word));
+    if ranked.len() > MAX_COMPLETIONS {
+        ranked.select_nth_unstable(MAX_COMPLETIONS - 1);
+        ranked.truncate(MAX_COMPLETIONS);
     }
-    CompletionResponse::List(lsp_types::CompletionList { is_incomplete: incomplete, items })
+    ranked.sort_unstable();
+    ranked.into_iter().map(|key| key.4).collect()
+}
+
+fn starts_with_ignoring_case(text: &str, prefix: &str) -> bool {
+    if text.is_ascii() && prefix.is_ascii() {
+        return text.len() >= prefix.len() && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes());
+    }
+    let mut text = text.chars().flat_map(char::to_lowercase);
+    prefix.chars().flat_map(char::to_lowercase).all(|c| text.next() == Some(c))
 }
 
 /// Hover documentation through the language server.
@@ -961,6 +1089,64 @@ mod tests {
         }
     }
 
+    /// Applies the edit `rope_diff` reports and checks it rebuilds `new`.
+    fn diff(old: &str, new: &str) -> Option<(std::ops::Range<usize>, String)> {
+        let (old_rope, new_rope) = (Rope::from(old), Rope::from(new));
+        let (old_range, new_range) = rope_diff(&old_rope, &new_rope)?;
+        let replacement = new[new_range].to_string();
+        let mut rebuilt = old.to_string();
+        rebuilt.replace_range(old_range.clone(), &replacement);
+        assert_eq!(rebuilt, new);
+        Some((old_range, replacement))
+    }
+
+    #[test]
+    fn rope_diff_finds_the_single_edit() {
+        assert_eq!(diff("fn main() {}", "fn main() {}"), None);
+        assert_eq!(diff("let x = 1;", "let xy = 1;"), Some((5..5, "y".into())));
+        assert_eq!(diff("let xy = 1;", "let x = 1;"), Some((5..6, String::new())));
+        assert_eq!(diff("", "a"), Some((0..0, "a".into())));
+        assert_eq!(diff("a", ""), Some((0..1, String::new())));
+        assert_eq!(diff("abc", "xabc"), Some((0..0, "x".into())));
+        assert_eq!(diff("abc", "abcx"), Some((3..3, "x".into())));
+        // Repeated text: the edit is placed somewhere that rebuilds `new`.
+        assert!(diff("aaaa", "aaaaa").is_some());
+        // Never inside a character…
+        assert_eq!(diff("é", "è"), Some((0..2, "è".into())));
+        assert_eq!(diff("aéb", "aèb"), Some((1..3, "è".into())));
+        // …nor between \r and \n.
+        let (range, _) = diff("a\r\nb", "a\rx\nb").unwrap();
+        assert!(range.start <= 1);
+    }
+
+    #[test]
+    fn rope_diff_handles_text_longer_than_a_chunk() {
+        let old: String = (0..5000).map(|i| format!("line {i}\n")).collect();
+        let mut new = old.clone();
+        new.insert_str(20_000, "inserted");
+        assert_eq!(diff(&old, &new), Some((20_000..20_000, "inserted".into())));
+        // Repeated lines make where a deletion sits ambiguous; `diff` checks
+        // it rebuilds the text, so check the edit is the smallest one.
+        let mut shorter = old.clone();
+        shorter.replace_range(30_000..30_010, "");
+        let (range, replacement) = diff(&old, &shorter).unwrap();
+        assert_eq!((range.len(), replacement.as_str()), (10, ""));
+    }
+
+    #[test]
+    fn lsp_positions_count_columns_as_the_server_asked() {
+        // "😀" is 4 bytes, 2 UTF-16 units and 1 character.
+        let text = Rope::from("ab\n😀x\n");
+        let offset = "ab\n😀".len();
+        assert_eq!(lsp_position(&text, offset, PositionEncoding::Utf8), Position::new(1, 4));
+        assert_eq!(lsp_position(&text, offset, PositionEncoding::Utf16), Position::new(1, 2));
+        assert_eq!(lsp_position(&text, offset, PositionEncoding::Utf32), Position::new(1, 1));
+        assert_eq!(lsp_position(&text, 0, PositionEncoding::Utf16), Position::new(0, 0));
+        assert_eq!(lsp_position(&text, text.len(), PositionEncoding::Utf16), Position::new(2, 0));
+        let crlf = Rope::from("ab\r\ncd");
+        assert_eq!(lsp_position(&crlf, 5, PositionEncoding::Utf16), Position::new(1, 1));
+    }
+
     #[test]
     fn edits_apply_back_to_front_keeping_ties_in_order() {
         let ordered = order_edits(vec![edit(0, 0, "a"), edit(3, 1, "b"), edit(0, 0, "c"), edit(1, 0, "d")]);
@@ -1029,10 +1215,11 @@ mod tests {
         };
         let mut items = vec![item("zeta", Some("0001"), false), item("alpha", Some("0002"), false), item("pick", Some("9"), true)];
         items.extend((0..200).map(|i| item(&format!("x{i}"), Some("5"), false)));
-        let CompletionResponse::List(list) = rank_completions(CompletionResponse::Array(items), "") else { panic!() };
-        let labels: Vec<_> = list.items.iter().take(3).map(|i| i.label.as_str()).collect();
+        let refs: Vec<&CompletionItem> = items.iter().collect();
+        let ranked = rank_completions(&refs, "");
+        let labels: Vec<_> = ranked.iter().take(3).map(|&ix| items[ix].label.as_str()).collect();
         assert_eq!(labels, ["pick", "zeta", "alpha"]);
-        assert_eq!(list.items.len(), MAX_COMPLETIONS);
+        assert_eq!(ranked.len(), MAX_COMPLETIONS);
     }
 
     #[test]
@@ -1053,39 +1240,19 @@ mod tests {
             item("VerticalCenter", "1"),
             item("main", "1"),
         ];
-        let CompletionResponse::List(list) = rank_completions(CompletionResponse::Array(items), "Vec") else {
-            panic!()
-        };
-        let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+        let refs: Vec<&CompletionItem> = items.iter().collect();
+        let labels: Vec<_> = rank_completions(&refs, "Vec").into_iter().map(|ix| items[ix].label.as_str()).collect();
         // The exact match, then prefix matches as typed (in the server's
         // order), then ignoring case, then fuzzy; non-matches are gone.
         assert_eq!(labels, ["Vec", "VecDeque", "vec!", "VerticalCenter"]);
     }
 
     #[test]
-    fn highlights_always_fit_the_label() {
-        assert_eq!(highlight_prefix("greet()", "gre"), "gre");
-        assert_eq!(highlight_prefix("Greeter", "gree"), "Gree");
-        // Typed text longer than the label, or not its start: no highlight.
-        assert_eq!(highlight_prefix("as", "assert"), "");
-        assert_eq!(highlight_prefix("into", "nto"), "");
-        // Multi-byte characters are taken whole.
-        assert_eq!(highlight_prefix("éclair", "e"), "");
-        assert_eq!(highlight_prefix("éclair", "éc"), "éc");
-        assert_eq!(highlight_prefix("Some(…)", "Some"), "Some");
-
-        // Server filter texts that would cut a character are replaced.
-        let item = CompletionItem {
-            label: "café…".into(),
-            filter_text: Some("cafe_long_filter".into()),
-            ..Default::default()
-        };
-        let CompletionResponse::List(list) = rank_completions(CompletionResponse::Array(vec![item]), "caf") else {
-            panic!()
-        };
-        let label = &list.items[0].label;
-        let highlight = list.items[0].filter_text.as_deref().unwrap();
-        assert!(label.is_char_boundary(highlight.len()) && label.starts_with(highlight));
+    fn case_is_ignored_for_any_script() {
+        assert!(starts_with_ignoring_case("VecDeque", "vecd"));
+        assert!(starts_with_ignoring_case("Éclair", "éc"));
+        assert!(!starts_with_ignoring_case("as", "assert"));
+        assert!(starts_with_ignoring_case("anything", ""));
     }
 
     #[test]

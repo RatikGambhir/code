@@ -7,4 +7,5 @@ mod diff_panel;
 mod history;
 
 pub use diff_panel::{DiffPanel, DiffPanelEvent};
+pub(crate) use history::relative_time;
 pub use history::{ChatHistory, ChatHistoryEvent};

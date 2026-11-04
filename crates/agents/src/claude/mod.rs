@@ -13,6 +13,7 @@
 //! transcript, orchestrator and UI work for Claude exactly as for Codex.
 
 pub mod history;
+pub mod login;
 pub mod mapper;
 pub mod models;
 
@@ -24,7 +25,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -44,6 +45,12 @@ use crate::{
     protocol::*,
     rpc::RequestId,
 };
+
+/// Idle Claude Code processes kept running for quick follow-ups. Each one
+/// holds a few hundred MB, so once a turn ends the least recently used
+/// idle ones beyond this are stopped. The next prompt in such a thread
+/// starts it again with `--resume`.
+const MAX_IDLE_PROCESSES: usize = 2;
 
 /// How to launch Claude Code.
 #[derive(Clone, Debug)]
@@ -206,6 +213,23 @@ struct Session {
     /// Bumped whenever the process is replaced, so a dying process's reader
     /// cannot touch its successor's state.
     generation: u64,
+    /// When a turn last started or finished, to pick which idle processes
+    /// to stop first.
+    last_used: Instant,
+}
+
+impl Session {
+    /// The process is running but has no turn, so it can be stopped and
+    /// resumed later without losing anything.
+    fn is_idle(&self) -> bool {
+        self.process.is_some() && self.has_history && !self.mapper.is_running()
+    }
+
+    /// Stops the process; its reader sees the new generation and exits quietly.
+    fn stop_process(&mut self) {
+        self.generation += 1;
+        self.process = None;
+    }
 }
 
 struct Process {
@@ -304,6 +328,7 @@ impl ClaudeClient {
             has_history,
             process: None,
             generation: 0,
+            last_used: Instant::now(),
         }));
         sessions.insert(id, session.clone());
         session
@@ -388,6 +413,12 @@ impl ClaudeClient {
                 if session.mapper.take_auth_failure() {
                     client.inner.auth_failed.store(true, Ordering::Relaxed);
                 }
+                let turn_ended = outputs
+                    .iter()
+                    .any(|o| matches!(o, Output::Event(AgentEvent::TurnCompleted { .. })));
+                if turn_ended {
+                    session.last_used = Instant::now();
+                }
                 for output in outputs {
                     match output {
                         Output::Event(event) => client.publish([event]),
@@ -399,6 +430,11 @@ impl ClaudeClient {
                         }
                         Output::ControlResponse { .. } => {}
                     }
+                }
+                // Release this session before locking the others.
+                drop(session);
+                if turn_ended {
+                    client.stop_idle_processes();
                 }
             }
             // Give stderr a moment to deliver the reason.
@@ -437,6 +473,7 @@ impl ClaudeClient {
         if session.mapper.is_running() {
             bail!("a turn is already running in this thread");
         }
+        session.last_used = Instant::now();
         session.settings.model = prompt.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
         session.settings.effort = prompt.effort;
         if let Some(policy) = prompt.sandbox_policy {
@@ -485,6 +522,28 @@ impl ClaudeClient {
 
     fn sessions(&self) -> Vec<Arc<Mutex<Session>>> {
         self.inner.sessions.lock().values().cloned().collect()
+    }
+
+    /// Stops idle processes beyond [`MAX_IDLE_PROCESSES`], least recently
+    /// used first. Must be called without any session locked; a session that
+    /// is locked right now is busy and skipped.
+    fn stop_idle_processes(&self) {
+        let idle: Vec<(Instant, Arc<Mutex<Session>>)> = self
+            .sessions()
+            .into_iter()
+            .filter_map(|handle| {
+                let last_used = handle.try_lock().filter(|s| s.is_idle())?.last_used;
+                Some((last_used, handle))
+            })
+            .collect();
+        for handle in least_recent_beyond(idle, MAX_IDLE_PROCESSES) {
+            let mut session = handle.lock();
+            // It may have started a turn since it was looked at.
+            if session.is_idle() {
+                tracing::debug!(target: "claude", session = %session.id, "stopping idle Claude Code");
+                session.stop_process();
+            }
+        }
     }
 
     /// Runs a short-lived Claude Code to read its `initialize` response
@@ -708,17 +767,38 @@ impl AgentBackend for ClaudeClient {
         })
     }
 
+    fn logout(&self) -> BoxFuture<'static, Result<()>> {
+        let client = self.clone();
+        self.on_runtime(async move {
+            let mut command = client.inner.launch.command(&client.inner.cwd);
+            command.args(["auth", "logout"]).stdin(Stdio::null());
+            let output = tokio::time::timeout(Duration::from_secs(20), command.output())
+                .await
+                .context("`claude auth logout` did not answer within 20 seconds")??;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("`claude auth logout` failed: {}", stderr.trim());
+            }
+            client.inner.auth_failed.store(false, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
     fn forget_auth_failure(&self) {
         self.inner.auth_failed.store(false, Ordering::Relaxed);
     }
 
     fn shutdown(&self) {
         for handle in self.sessions() {
-            let mut session = handle.lock();
-            session.generation += 1;
-            session.process = None;
+            handle.lock().stop_process();
         }
     }
+}
+
+/// The items of `used` other than the `keep` most recently used ones.
+fn least_recent_beyond<T>(mut used: Vec<(Instant, T)>, keep: usize) -> impl Iterator<Item = T> {
+    used.sort_unstable_by_key(|(at, _)| std::cmp::Reverse(*at));
+    used.into_iter().skip(keep).map(|(_, item)| item)
 }
 
 #[cfg(test)]
@@ -733,6 +813,19 @@ mod tests {
             append_system_prompt: None,
             mcp_servers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn idle_processes_keep_only_the_most_recently_used() {
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let used = vec![(at(3), "c"), (at(1), "a"), (at(4), "d"), (at(2), "b")];
+
+        let mut stopped: Vec<_> = least_recent_beyond(used.clone(), 2).collect();
+        stopped.sort_unstable();
+
+        assert_eq!(stopped, ["a", "b"]);
+        assert_eq!(least_recent_beyond(used, 10).count(), 0, "under the limit nothing stops");
     }
 
     #[test]

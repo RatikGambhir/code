@@ -6,10 +6,16 @@ use gpui::{HighlightStyle, SharedString};
 
 use ropey::{ChunkCursor, Rope};
 use std::{
+    cell::RefCell,
     collections::{BTreeSet, HashMap},
     ops::Range,
+    rc::Rc,
     usize,
 };
+
+/// cockpit patch: how many line ranges' matches are kept before the cache
+/// starts over (scrolling through a long file without editing it).
+const MAX_CACHED_RANGES: usize = 4096;
 use sum_tree::Bias;
 use tree_sitter::{
     InputEdit, Node, Parser, Point, Query, QueryCursor, QueryMatch, StreamingIterator, Tree,
@@ -39,6 +45,10 @@ pub struct SyntaxHighlighter {
     parser: Parser,
     /// The last parsed tree.
     tree: Option<Tree>,
+    /// cockpit patch: query matches by byte range for the current `text`.
+    /// The editor asks for every visible line on every frame (cursor blinks,
+    /// hovers, other views redrawing); the matches only change with the text.
+    match_cache: RefCell<HashMap<Range<usize>, Rc<[HighlightItem]>>>,
 }
 
 struct TextProvider<'a>(&'a Rope);
@@ -302,6 +312,7 @@ impl SyntaxHighlighter {
             text: Rope::new(),
             parser,
             tree: None,
+            match_cache: RefCell::default(),
         })
     }
 
@@ -351,10 +362,26 @@ impl SyntaxHighlighter {
 
         self.tree = Some(new_tree);
         self.text = text.clone();
+        self.match_cache.get_mut().clear();
+    }
+
+    /// cockpit patch: [`Self::match_styles_uncached`], remembered until the
+    /// text changes.
+    fn match_styles(&self, range: Range<usize>) -> Rc<[HighlightItem]> {
+        if let Some(items) = self.match_cache.borrow().get(&range) {
+            return items.clone();
+        }
+        let items: Rc<[HighlightItem]> = self.match_styles_uncached(range.clone()).into();
+        let mut cache = self.match_cache.borrow_mut();
+        if cache.len() >= MAX_CACHED_RANGES {
+            cache.clear();
+        }
+        cache.insert(range, items.clone());
+        items
     }
 
     /// Match the visible ranges of nodes in the Tree for highlighting.
-    fn match_styles(&self, range: Range<usize>) -> Vec<HighlightItem> {
+    fn match_styles_uncached(&self, range: Range<usize>) -> Vec<HighlightItem> {
         let mut highlights = vec![];
         let Some(tree) = &self.tree else {
             return highlights;
@@ -599,7 +626,7 @@ impl SyntaxHighlighter {
         let highlights = self.match_styles(range.clone());
 
         // let mut iter_count = 0;
-        for item in highlights {
+        for item in highlights.iter() {
             // iter_count += 1;
             let node_range = &item.range;
             let name = &item.name;

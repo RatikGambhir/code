@@ -13,6 +13,7 @@
 //! owned by [`AgentRuntime`].
 
 pub mod backend;
+pub mod chatgpt;
 pub mod claude;
 pub mod client;
 pub mod events;
@@ -133,6 +134,22 @@ impl AgentRuntime {
     /// Checks that Claude Code runs and prepares a backend for `cwd`. Each
     /// thread starts its own Claude Code process when it first sends a
     /// prompt.
+    /// `@chatgpt`: ChatGPT on the user's plan, with Hangar's own sign-in.
+    /// Nothing to start or hand-shake; requests are made per turn.
+    pub fn connect_chatgpt(&self) -> Connection {
+        let (client, events) = chatgpt::chat::ChatGptClient::new(self.handle());
+        Connection {
+            backend: Arc::new(client),
+            client: None,
+            events,
+            server: protocol::InitializeResponse {
+                user_agent: "ChatGPT".into(),
+                codex_home: None,
+                platform_os: None,
+            },
+        }
+    }
+
     pub fn connect_claude(
         &self,
         launch: ClaudeLaunch,

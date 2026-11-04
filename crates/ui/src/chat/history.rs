@@ -284,7 +284,7 @@ fn local_date(ts: i64) -> NaiveDate {
 }
 
 /// "now", "5m", "3h", "2d", "6w".
-fn relative_time(now: i64, then: i64) -> String {
+pub(crate) fn relative_time(now: i64, then: i64) -> String {
     let secs = now.saturating_sub(then).max(0);
     match secs {
         0..60 => "now".into(),

@@ -146,6 +146,13 @@ fn bundle(options: BundleOptions) -> Result<()> {
         .args(["build", "--package", "hangar", "--bins"]);
     if options.release {
         cargo.arg("--release");
+        // Precompiled Metal shaders spare the first launch compiling them
+        // (the `runtime-shaders` feature); they need the Metal compiler.
+        if metal_compiler_available() {
+            cargo.arg("--no-default-features");
+        } else {
+            println!("No Metal compiler (`xcrun metal`): shaders will compile when the app first starts.");
+        }
     }
     if let Some(target) = &options.target {
         cargo.args(["--target", target]);
@@ -221,6 +228,17 @@ fn bundle(options: BundleOptions) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `xcrun` finds the Metal shader compiler and linker (Xcode, or its
+/// downloadable Metal toolchain).
+fn metal_compiler_available() -> bool {
+    ["metal", "metallib"].iter().all(|tool| {
+        Command::new("xcrun")
+            .args(["-sdk", "macosx", "-f", tool])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    })
 }
 
 /// Looks for the framework under `$CEF_PATH` (set in `.cargo/config.toml`),

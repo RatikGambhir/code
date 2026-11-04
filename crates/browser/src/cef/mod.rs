@@ -11,9 +11,12 @@
 //! 2. GPUI starts and creates `NSApp` as its own `GPUIApplication` class.
 //!    Initializing Chromium first would create a plain `NSApplication` and
 //!    GPUI would crash looking for its ivars.
-//! 3. [`CefRuntime::start`], inside GPUI's run callback, retrofits Chromium's
-//!    protocols onto NSApp ([`nsapp`]), calls `cef_initialize` with an
-//!    external message pump, and starts the run-loop timer ([`pump`]).
+//! 3. [`CefRuntime::start`], inside GPUI's run callback, hands out the
+//!    engine. Chromium itself starts with the first tab: retrofitting its
+//!    protocols onto NSApp ([`nsapp`]), `cef_initialize` with an external
+//!    message pump, and the run-loop pump ([`pump`]). A session that never
+//!    opens a page pays nothing for Chromium (its GPU, network and storage
+//!    processes take ~200 MB and slow the launch).
 //! 4. [`CefRuntime::shutdown`] after GPUI's run loop returns.
 //!
 //! # Packaging
@@ -66,6 +69,8 @@ struct Inner {
     app: RefCell<cef::App>,
     options: RuntimeOptions,
     started: Cell<bool>,
+    /// Why `cef_initialize` failed, if it did.
+    failed: RefCell<Option<String>>,
     /// Per-process secret that marks script results in console messages.
     secret: String,
 }
@@ -113,43 +118,15 @@ impl CefRuntime {
                 app: RefCell::new(app),
                 options,
                 started: Cell::new(false),
+                failed: RefCell::new(None),
                 secret: random_secret(),
             }),
         })
     }
 
-    /// Initializes Chromium. Call once GPUI has created NSApp.
+    /// Returns the engine. Call once GPUI has created NSApp; Chromium is
+    /// initialized when the engine creates its first tab.
     pub fn start(&self) -> Result<Rc<dyn BrowserEngine>> {
-        if !self.inner.started.get() {
-            nsapp::adopt_cef_app_protocol().map_err(|err| anyhow!(err))?;
-
-            let mut settings = cef::Settings {
-                windowless_rendering_enabled: 1,
-                // GPUI drives [NSApp run]; Chromium is pumped from a timer.
-                multi_threaded_message_loop: 0,
-                external_message_pump: 1,
-                persist_session_cookies: 1,
-                log_severity: cef::LogSeverity::WARNING,
-                ..Default::default()
-            };
-            if let Some(profile) = &self.inner.options.profile_dir {
-                std::fs::create_dir_all(profile).ok();
-                let path = profile.to_string_lossy();
-                settings.root_cache_path = path.as_ref().into();
-                settings.cache_path = path.as_ref().into();
-            }
-            if let Some(log) = &self.inner.options.log_file {
-                settings.log_file = log.to_string_lossy().as_ref().into();
-            }
-
-            let args = Args::new();
-            let mut app = self.inner.app.borrow_mut();
-            if cef::initialize(Some(args.as_main_args()), Some(&settings), Some(&mut *app), std::ptr::null_mut()) != 1 {
-                bail!("cef_initialize failed (see the Chromium log for details)");
-            }
-            self.inner.started.set(true);
-            pump::start();
-        }
         Ok(Rc::new(CefEngine {
             runtime: self.inner.clone(),
         }))
@@ -201,6 +178,58 @@ pub fn run_helper() -> i32 {
     cef::execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut())
 }
 
+impl Inner {
+    /// Initializes Chromium on first use. A failure is remembered, so every
+    /// later tab reports the same reason instead of trying again.
+    fn ensure_started(&self) -> Result<()> {
+        if self.started.get() {
+            return Ok(());
+        }
+        if let Some(reason) = self.failed.borrow().as_ref() {
+            bail!("{reason}");
+        }
+        let began = Instant::now();
+        let result = self.initialize();
+        match &result {
+            Ok(()) => tracing::debug!("Chromium started in {:.0?}", began.elapsed()),
+            Err(err) => *self.failed.borrow_mut() = Some(format!("{err:#}")),
+        }
+        result
+    }
+
+    fn initialize(&self) -> Result<()> {
+        nsapp::adopt_cef_app_protocol().map_err(|err| anyhow!(err))?;
+
+        let mut settings = cef::Settings {
+            windowless_rendering_enabled: 1,
+            // GPUI drives [NSApp run]; Chromium is pumped from a timer.
+            multi_threaded_message_loop: 0,
+            external_message_pump: 1,
+            persist_session_cookies: 1,
+            log_severity: cef::LogSeverity::WARNING,
+            ..Default::default()
+        };
+        if let Some(profile) = &self.options.profile_dir {
+            std::fs::create_dir_all(profile).ok();
+            let path = profile.to_string_lossy();
+            settings.root_cache_path = path.as_ref().into();
+            settings.cache_path = path.as_ref().into();
+        }
+        if let Some(log) = &self.options.log_file {
+            settings.log_file = log.to_string_lossy().as_ref().into();
+        }
+
+        let args = Args::new();
+        let mut app = self.app.borrow_mut();
+        if cef::initialize(Some(args.as_main_args()), Some(&settings), Some(&mut *app), std::ptr::null_mut()) != 1 {
+            bail!("cef_initialize failed (see the Chromium log for details)");
+        }
+        self.started.set(true);
+        pump::start();
+        Ok(())
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
         if self.started.get() {
@@ -223,6 +252,7 @@ impl BrowserEngine for CefEngine {
     }
 
     fn create_tab(&self, options: TabOptions) -> Result<Rc<dyn BrowserTab>> {
+        self.runtime.ensure_started()?;
         let tab = tab::CefTab::create(&options, &self.runtime.secret)?;
         Ok(Rc::new(tab))
     }

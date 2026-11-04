@@ -77,8 +77,21 @@ impl CodexLaunch {
         if let Some(home) = std::env::var_os("HOME") {
             dirs.push(Path::new(&home).join(".codex/bin"));
         }
-        cockpit_common::shell_env::find_executable("codex", &dirs).map(Self::new)
+        cockpit_common::shell_env::find_executable("codex", &dirs)
+            .or_else(chatgpt_app_codex)
+            .map(Self::new)
     }
+}
+
+/// The ChatGPT desktop app ships its own Codex CLI; use it when no
+/// standalone `codex` is installed.
+fn chatgpt_app_codex() -> Option<PathBuf> {
+    const BUNDLED: &str = "ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
+    let mut roots = vec![PathBuf::from("/Applications")];
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(Path::new(&home).join("Applications"));
+    }
+    roots.into_iter().map(|root| root.join(BUNDLED)).find(|path| path.is_file())
 }
 
 #[derive(Clone)]
@@ -366,6 +379,12 @@ impl CodexClient {
 
     pub fn login(&self, params: LoginParams) -> impl std::future::Future<Output = Result<LoginResponse>> + Send + 'static {
         self.request("account/login/start", params)
+    }
+
+    /// Signs out: Codex deletes its saved credentials (`~/.codex/auth.json`).
+    pub fn logout(&self) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
+        let request = self.request::<_, Value>("account/logout", ());
+        async move { request.await.map(|_| ()) }
     }
 
     pub fn resolve_approval(&self, request_id: &RequestId, decision: ApprovalDecision) -> Result<()> {

@@ -41,6 +41,10 @@ pub struct TerminalView {
     error: Option<SharedString>,
     title: SharedString,
     snapshot: Snapshot,
+    /// The terminal changed since `snapshot` was taken. The next render
+    /// takes a new one, so heavy output costs one copy of the screen per
+    /// frame rather than one per read from the PTY.
+    stale: bool,
     urls: Vec<String>,
     exited: Option<Option<u32>>,
     focus_handle: FocusHandle,
@@ -66,6 +70,7 @@ impl TerminalView {
             error: None,
             title: "Terminal".into(),
             snapshot: Snapshot::default(),
+            stale: false,
             urls: Vec::new(),
             exited: None,
             focus_handle: cx.focus_handle(),
@@ -97,30 +102,54 @@ impl TerminalView {
     fn on_event(&mut self, terminal: &Terminal, event: TerminalEvent, cx: &mut Context<Self>) {
         match event {
             TerminalEvent::Updated => {
-                self.snapshot = terminal.snapshot();
+                self.stale = true;
+                terminal.acknowledge();
+                // The panel draws the title before this view renders (and
+                // a background tab does not render), so it is read here
+                // rather than with the snapshot.
                 let title = terminal.title();
-                if !title.is_empty() {
+                if !title.is_empty() && title != self.title.as_ref() {
                     self.title = title.into();
-                }
-                let text: String = self
-                    .snapshot
-                    .lines
-                    .iter()
-                    .map(|line| line.text() + "\n")
-                    .collect();
-                for url in detect_local_urls(&text) {
-                    if !self.urls.contains(&url) {
-                        self.urls.push(url);
-                    }
-                }
-                if self.urls.len() > 3 {
-                    self.urls.drain(..self.urls.len() - 3);
                 }
             }
             TerminalEvent::Exited(code) => self.exited = Some(code),
-            TerminalEvent::Bell => {}
+            TerminalEvent::Bell => return,
         }
         cx.notify();
+    }
+
+    /// Takes a new snapshot if the terminal changed since the last one, and
+    /// picks up any dev-server URLs it now shows.
+    fn refresh_snapshot(&mut self) {
+        if !std::mem::take(&mut self.stale) {
+            return;
+        }
+        let Some(terminal) = &self.terminal else { return };
+        self.snapshot = terminal.snapshot();
+        // Only lines that could hold a URL are worth the regex.
+        let mut line_text = String::new();
+        let mut text = String::new();
+        for line in &self.snapshot.lines {
+            line_text.clear();
+            for run in &line.runs {
+                line_text.push_str(&run.text);
+            }
+            if line_text.contains("://") {
+                text.push_str(&line_text);
+                text.push('\n');
+            }
+        }
+        if text.is_empty() {
+            return;
+        }
+        for url in detect_local_urls(&text) {
+            if !self.urls.contains(&url) {
+                self.urls.push(url);
+            }
+        }
+        if self.urls.len() > 3 {
+            self.urls.drain(..self.urls.len() - 3);
+        }
     }
 
     pub fn title(&self) -> SharedString {
@@ -170,6 +199,7 @@ impl TerminalView {
     }
 
     fn copy_screen(&mut self, cx: &mut Context<Self>) {
+        self.refresh_snapshot();
         let text = self
             .snapshot
             .lines
@@ -188,7 +218,7 @@ impl TerminalView {
         };
         if lines != 0 {
             terminal.scroll(lines);
-            self.snapshot = terminal.snapshot();
+            self.stale = true;
             cx.notify();
         }
     }
@@ -255,6 +285,7 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.refresh_snapshot();
         if let Some(error) = &self.error {
             return div()
                 .size_full()

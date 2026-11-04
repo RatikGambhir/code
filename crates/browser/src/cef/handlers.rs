@@ -70,8 +70,10 @@ wrap_browser_process_handler! {
     pub(crate) struct HangarBrowserProcessHandler;
 
     impl BrowserProcessHandler {
-        /// The pump runs at 60 Hz regardless, so there is nothing to schedule.
-        fn on_schedule_message_pump_work(&self, _delay_ms: i64) {}
+        /// Chromium has work for the main thread; the pump runs it on time.
+        fn on_schedule_message_pump_work(&self, delay_ms: i64) {
+            super::pump::schedule(delay_ms);
+        }
     }
 }
 

@@ -51,6 +51,8 @@ pub trait AgentBackend: Send + Sync + 'static {
     fn models(&self) -> BoxFuture<'static, Result<Vec<Model>>>;
     fn account(&self) -> BoxFuture<'static, Result<GetAccountResponse>>;
     fn login(&self, params: LoginParams) -> BoxFuture<'static, Result<LoginResponse>>;
+    /// Signs out of the agent's account (its CLI forgets the credentials).
+    fn logout(&self) -> BoxFuture<'static, Result<()>>;
     /// The user says they signed in again after a turn was refused for
     /// authentication; stop reporting the account as signed out.
     fn forget_auth_failure(&self) {}
@@ -119,6 +121,10 @@ impl AgentBackend for CodexClient {
 
     fn login(&self, params: LoginParams) -> BoxFuture<'static, Result<LoginResponse>> {
         Box::pin(CodexClient::login(self, params))
+    }
+
+    fn logout(&self) -> BoxFuture<'static, Result<()>> {
+        Box::pin(CodexClient::logout(self))
     }
 
     fn shutdown(&self) {

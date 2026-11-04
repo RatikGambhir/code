@@ -19,7 +19,10 @@ use gpui_component::{
 };
 use serde_json::json;
 
-use crate::state::{AppState, ThemePreference};
+use crate::{
+    assets,
+    state::{AppState, ThemePreference},
+};
 
 // --- type scale ---------------------------------------------------------------
 
@@ -233,16 +236,29 @@ pub fn preset_color(hex: u32) -> Hsla {
 
 // --- applying -------------------------------------------------------------------
 
-/// The first installed monospace face from a short list of good ones.
+/// The code font when the settings name none: the bundled Lilex, or, if the
+/// bundled fonts failed to load, the first installed face from a short list.
 fn default_mono(cx: &App) -> &'static str {
     static MONO: OnceLock<&'static str> = OnceLock::new();
     MONO.get_or_init(|| {
+        if *BUNDLED_FONTS.get().unwrap_or(&false) {
+            // Listing every installed family takes a while; skip it.
+            return assets::MONO_FONT;
+        }
         let installed = cx.text_system().all_font_names();
         ["JetBrains Mono", "Geist Mono", "SF Mono", "Menlo", "DejaVu Sans Mono", "Consolas"]
             .into_iter()
             .find(|name| installed.iter().any(|font| font == name))
             .unwrap_or("Menlo")
     })
+}
+
+/// Whether the bundled UI and code fonts loaded (see [`load_fonts`]).
+static BUNDLED_FONTS: OnceLock<bool> = OnceLock::new();
+
+/// Loads the bundled fonts. Call once, before the first [`apply`].
+pub fn load_fonts(cx: &App) {
+    BUNDLED_FONTS.get_or_init(|| assets::load_fonts(cx));
 }
 
 fn is_dark(window: Option<&Window>, cx: &App) -> bool {
@@ -393,6 +409,9 @@ fn install(t: &Tokens, editor_font_size: f32, cx: &mut App) {
     theme.radius = RADIUS;
     theme.radius_lg = RADIUS_LG;
     theme.shadow = true;
+    if *BUNDLED_FONTS.get().unwrap_or(&false) {
+        theme.font_family = assets::UI_FONT.into();
+    }
     theme.mono_font_family = t.mono.clone();
     theme.mono_font_size = px(editor_font_size);
     if let Some(highlight) = highlight {

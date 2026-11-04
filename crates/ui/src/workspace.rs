@@ -21,9 +21,9 @@ use futures::channel::oneshot;
 use cockpit_agents::protocol::PlanStepStatus;
 use cockpit_debugger::{LineBreakpoint, RunConfig};
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, AnyElement, App, AsyncWindowContext, Context, Corner,
+    anchored, deferred, div, point, prelude::*, px, AnyElement, AnyView, App, AsyncWindowContext, Context, Corner,
     Entity, FocusHandle, Focusable, FontWeight, Hsla, MouseButton, PathPromptOptions, Pixels, Point,
-    PromptLevel, SharedString, Subscription, Task, WeakEntity, Window,
+    PromptLevel, SharedString, StyleRefinement, Subscription, Task, WeakEntity, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -68,6 +68,8 @@ const PAGE_TEXT_LIMIT: usize = 20_000;
 const CONSOLE_LIMIT: usize = 50;
 /// How many places Go Back remembers.
 const NAV_HISTORY: usize = 100;
+/// How long after the last keystroke the gutter's run icons are recomputed.
+const DECORATION_DELAY: Duration = Duration::from_millis(300);
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,6 +161,8 @@ pub struct Workspace {
     nav_forward: Vec<Target>,
 
     save_tabs: Option<Task<()>>,
+    /// Gutter refreshes waiting for typing to pause, by editor.
+    decoration_tasks: HashMap<gpui::EntityId, Task<()>>,
     restoring: bool,
     _watcher: Option<WorkspaceWatcher>,
     _tasks: Vec<Task<()>>,
@@ -338,6 +342,7 @@ impl Workspace {
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             save_tabs: None,
+            decoration_tasks: HashMap::new(),
             restoring: false,
             _watcher: watcher,
             _tasks: tasks,
@@ -347,6 +352,7 @@ impl Workspace {
             workspace.ensure_terminal(window, cx);
         }
         workspace.sync_chat_mode(cx);
+        workspace.activate_agent_if_shown(cx);
         cx.on_release(|this: &mut Self, cx| {
             this.debugger.update(cx, |debugger, cx| debugger.stop(cx));
             this.agent.update(cx, |agent, _| agent.shutdown());
@@ -364,11 +370,19 @@ impl Workspace {
     // --- persistence -------------------------------------------------------
 
     fn save_layout(&self, cx: &mut App) {
+        self.activate_agent_if_shown(cx);
         let Ok(json) = serde_json::to_string(&self.layout) else { return };
         let id = self.workspace_id;
         AppState::global(cx)
             .db
             .write_detached("layout", move |w| w.save_layout(id, &json));
+    }
+
+    /// Connects the agent once its panel (or chat mode) is on screen.
+    fn activate_agent_if_shown(&self, cx: &mut App) {
+        if self.layout.agent_visible || self.chat_mode() {
+            self.agent.update(cx, |agent, cx| agent.activate(cx));
+        }
     }
 
     /// Saves open tabs shortly after the last change.
@@ -797,7 +811,9 @@ impl Workspace {
                 }
             }
         }
-        self.source_control.update(cx, |scm, cx| scm.refresh(cx));
+        if change.affects_git {
+            self.source_control.update(cx, |scm, cx| scm.refresh(cx));
+        }
     }
 
     // --- agent -------------------------------------------------------------
@@ -1621,10 +1637,10 @@ impl Workspace {
 
     fn render_sidebar(&self) -> AnyElement {
         match self.layout.sidebar {
-            SidebarView::Explorer => self.explorer.clone().into_any_element(),
-            SidebarView::SourceControl => self.source_control.clone().into_any_element(),
-            SidebarView::Search => self.search.clone().into_any_element(),
-            SidebarView::Chats => self.chat_history.clone().into_any_element(),
+            SidebarView::Explorer => cached(&self.explorer),
+            SidebarView::SourceControl => cached(&self.source_control),
+            SidebarView::Search => cached(&self.search),
+            SidebarView::Chats => cached(&self.chat_history),
         }
     }
 
@@ -1641,10 +1657,10 @@ impl Workspace {
 
     fn render_center(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.chat_mode() {
-            return self.agent_panel.clone().into_any_element();
+            return cached(&self.agent_panel);
         }
         if !self.layout.split {
-            return self.panes[0].clone().into_any_element();
+            return cached(&self.panes[0]);
         }
         let sizes = self.panel_sizes("panes", cx);
         let marker = theme::tokens(cx).accent.alpha(0.6);
@@ -1652,7 +1668,7 @@ impl Workspace {
             div()
                 .relative()
                 .size_full()
-                .child(self.panes[ix].clone())
+                .child(cached(&self.panes[ix]))
                 // The pane that takes new tabs.
                 .when(ix == self.active_pane, |el| {
                     el.child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(marker))
@@ -1720,8 +1736,8 @@ impl Workspace {
             .child(resizable_panel().child(middle))
             .when_some(right, |group, right| {
                 let (size, element) = match right {
-                    Right::Agent => (px(380.), self.agent_panel.clone().into_any_element()),
-                    Right::Diff => (px(480.), self.diff_panel.clone().into_any_element()),
+                    Right::Agent => (px(380.), cached(&self.agent_panel)),
+                    Right::Diff => (px(480.), cached(&self.diff_panel)),
                 };
                 group.child(
                     resizable_panel()
@@ -1965,13 +1981,42 @@ impl Workspace {
     }
 
     fn on_edited(&mut self, editor: &Entity<EditorView>, old: &gpui_component::input::Rope, cx: &mut Context<Self>) {
-        let path = editor.read(cx).path().to_path_buf();
+        use gpui_component::input::RopeExt as _;
+        let (path, new) = {
+            let view = editor.read(cx);
+            (view.path().to_path_buf(), view.rope(cx))
+        };
         if !self.debugger.read(cx).breakpoints().for_file(&path).is_empty() {
-            let (old, new) = (old.to_string(), editor.read(cx).rope(cx).to_string());
+            let (old, new) = (old.to_string(), new.to_string());
             // Emits DecorationsChanged (and so a redraw) when something moved.
             self.debugger.update(cx, |d, cx| d.reanchor(&path, &old, &new, cx));
         }
-        self.refresh_decorations(editor, cx);
+        // Rescanning the file for run icons on every keystroke is wasted
+        // work: while lines stay put the icons are still right, so that waits
+        // for a pause in typing. Lines added or removed move them now.
+        if old.lines_len() != new.lines_len() {
+            self.decoration_tasks.remove(&editor.entity_id());
+            self.refresh_decorations(editor, cx);
+        } else {
+            self.schedule_decorations(editor, cx);
+        }
+    }
+
+    /// Refreshes `editor`'s gutter once typing pauses.
+    fn schedule_decorations(&mut self, editor: &Entity<EditorView>, cx: &mut Context<Self>) {
+        let id = editor.entity_id();
+        let editor = editor.downgrade();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DECORATION_DELAY).await;
+            this.update(cx, |this, cx| {
+                this.decoration_tasks.remove(&id);
+                if let Some(editor) = editor.upgrade() {
+                    this.refresh_decorations(&editor, cx);
+                }
+            })
+            .ok();
+        });
+        self.decoration_tasks.insert(id, task);
     }
 
     fn on_gutter(&mut self, editor: &Entity<EditorView>, event: GutterEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2382,8 +2427,8 @@ impl Workspace {
     fn render_bottom(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let tool = self.layout.bottom;
         let content = match tool {
-            BottomTool::Terminal => self.ensure_terminal(window, cx).into_any_element(),
-            BottomTool::Debug => self.debug_panel.clone().into_any_element(),
+            BottomTool::Terminal => cached(&self.ensure_terminal(window, cx)),
+            BottomTool::Debug => cached(&self.debug_panel),
         };
         let t = theme::tokens(cx).clone();
         let debugging = self.debugger.read(cx).is_live();
@@ -2471,8 +2516,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &actions::QuickOpen, window, cx| this.open_palette(true, window, cx)))
             .on_action(cx.listener(|this, _: &actions::FocusAgent, window, cx| this.focus_agent(window, cx)))
             .on_action(cx.listener(|this, _: &actions::NewAgentThread, window, cx| {
+                // Like typing @claude: the thread starts with its first prompt.
                 this.focus_agent(window, cx);
-                this.agent.update(cx, |agent, cx| agent.new_thread(cx));
+                this.agent_panel.update(cx, |panel, cx| panel.start_mention(window, cx));
             }))
             .on_action(cx.listener(|this, _: &actions::InterruptAgent, _, cx| {
                 this.agent.update(cx, |agent, cx| agent.interrupt(cx));
@@ -2574,6 +2620,17 @@ impl Render for Workspace {
             .children(dialogs)
             .children(notifications)
     }
+}
+
+/// `view`, drawn from the previous frame unless it changed since. Without
+/// this every keystroke in the editor would re-render the sidebar, the
+/// agent's transcript and the terminal, and every line a terminal prints
+/// would re-render the editor. Each view notifies itself when what it shows
+/// changes; window-wide changes (theme, focus) refresh everything.
+fn cached<V: Render>(view: &Entity<V>) -> AnyElement {
+    AnyView::from(view.clone())
+        .cached(StyleRefinement::default().size_full())
+        .into_any_element()
 }
 
 fn push_bounded(stack: &mut Vec<Target>, target: Target) {

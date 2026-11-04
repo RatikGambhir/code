@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 
 use anyhow::Result;
-use gpui::{AssetSource, SharedString};
+use gpui::{App, AssetSource, SharedString};
 use gpui_component::Icon;
 
 /// Extra Lucide icons (ISC licensed, see `assets/icons/LICENSE-lucide.txt`).
@@ -43,6 +43,57 @@ const ICONS: &[(&str, &[u8])] = &[
     ("icons/cockpit/square-pen.svg", include_bytes!("../../../assets/icons/square-pen.svg")),
     ("icons/cockpit/notebook-pen.svg", include_bytes!("../../../assets/icons/notebook-pen.svg")),
 ];
+
+/// Zed's typefaces: IBM Plex Sans for the interface and Lilex (IBM Plex
+/// Mono's letters with programming ligatures) for code. Both are under the
+/// SIL Open Font License 1.1; see `assets/fonts/*/LICENSE.txt`.
+pub const UI_FONT: &str = "IBM Plex Sans";
+pub const MONO_FONT: &str = "Lilex";
+
+/// The faces the interface uses: regular, italic, and the medium, semibold
+/// and bold weights for emphasis.
+const FONTS: &[&[u8]] = &[
+    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
+    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf"),
+    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Medium.ttf"),
+    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf"),
+    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Bold.ttf"),
+    include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf"),
+    include_bytes!("../../../assets/fonts/lilex/Lilex-Italic.ttf"),
+    include_bytes!("../../../assets/fonts/lilex/Lilex-Medium.ttf"),
+    include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf"),
+    include_bytes!("../../../assets/fonts/lilex/Lilex-BoldItalic.ttf"),
+];
+
+/// Makes the bundled fonts available to the text system. Returns false if
+/// they could not be loaded (the interface then falls back to system fonts).
+pub fn load_fonts(cx: &App) -> bool {
+    let fonts = FONTS.iter().map(|bytes| Cow::Borrowed(*bytes)).collect();
+    if let Err(err) = cx.text_system().add_fonts(fonts) {
+        tracing::warn!("loading the bundled fonts: {err:#}");
+        return false;
+    }
+    // The text system quietly substitutes a fallback for a family it cannot
+    // find, and the nearest weight for a missing face: check both.
+    let text = cx.text_system();
+    let resolves = |family: &'static str, weights: &[gpui::FontWeight]| {
+        let ids: Vec<_> = weights
+            .iter()
+            .map(|&weight| text.resolve_font(&gpui::Font { weight, ..gpui::font(SharedString::new_static(family)) }))
+            .collect();
+        let found = text.get_font_for_id(ids[0]).is_some_and(|font| font.family.as_ref() == family);
+        let distinct = ids.iter().enumerate().all(|(i, id)| !ids[..i].contains(id));
+        found && distinct
+    };
+    use gpui::FontWeight as W;
+    let ok = resolves(UI_FONT, &[W::NORMAL, W::MEDIUM, W::SEMIBOLD, W::BOLD]) && resolves(MONO_FONT, &[W::NORMAL, W::MEDIUM, W::BOLD]);
+    if ok {
+        tracing::debug!("bundled fonts loaded: {UI_FONT}, {MONO_FONT}");
+    } else {
+        tracing::warn!("the bundled fonts loaded but do not resolve; using system fonts");
+    }
+    ok
+}
 
 pub struct Assets;
 

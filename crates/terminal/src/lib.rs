@@ -243,6 +243,13 @@ impl Terminal {
         Snapshot::capture(&parser, *self.shared.exited.lock())
     }
 
+    /// Re-arms the `Updated` notification without copying the screen, for
+    /// a UI that snapshots lazily (once per frame) but still wants to hear
+    /// about changes in between, such as a new title.
+    pub fn acknowledge(&self) {
+        self.shared.update_pending.store(false, Ordering::Release);
+    }
+
     /// The visible screen as plain text.
     pub fn contents(&self) -> String {
         self.shared.parser.lock().screen().contents()

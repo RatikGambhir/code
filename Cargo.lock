@@ -1028,16 +1028,23 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
+ "base64 0.22.1",
  "cockpit-common",
  "dirs 6.0.0",
  "futures",
+ "getrandom 0.3.4",
+ "libc",
  "parking_lot",
+ "security-framework",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "ureq",
+ "url",
 ]
 
 [[package]]

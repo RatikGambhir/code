@@ -66,6 +66,8 @@ impl CellAnalysis for RustAnalysis {
                 "targetDir": self.target_dir.to_string_lossy(),
             },
             "procMacro": { "enable": true },
+            // As in the editor: `name()` with the cursor inside.
+            "completion": { "callable": { "snippets": "add_parentheses" } },
             // Index only what cells use, as they use it.
             "cachePriming": { "enable": false },
             "diagnostics": { "disabled": ["unlinked-file", "inactive-code"] },

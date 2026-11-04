@@ -6,7 +6,7 @@ use gpui::{
     Point, Render, RenderOnce, SharedString, Styled, StyledText, Subscription, Window, canvas,
     deferred, div, prelude::FluentBuilder, px, relative,
 };
-use lsp_types::{CompletionItem, CompletionTextEdit};
+use lsp_types::CompletionItem;
 
 const MAX_MENU_WIDTH: Pixels = px(320.);
 const MAX_MENU_HEIGHT: Pixels = px(240.);
@@ -15,7 +15,7 @@ const POPOVER_GAP: Pixels = px(4.);
 use crate::{
     ActiveTheme, IndexPath, Selectable, actions, h_flex,
     input::{
-        self, InputState, RopeExt,
+        self, CompletionProvider, InputState,
         popovers::{editor_popover, render_markdown},
     },
     label::Label,
@@ -30,8 +30,8 @@ struct ContextMenuDelegate {
 }
 
 impl ContextMenuDelegate {
-    fn set_items(&mut self, items: Vec<CompletionItem>) {
-        self.items = items.into_iter().map(Rc::new).collect();
+    fn set_items(&mut self, items: Vec<Rc<CompletionItem>>) {
+        self.items = items;
         self.selected_ix = 0;
     }
 
@@ -86,11 +86,10 @@ impl RenderOnce for CompletionMenuItem {
         let item = self.item;
 
         let deprecated = item.deprecated.unwrap_or(false);
-        let matched_len = item
-            .filter_text
-            .as_ref()
-            .map(|s| s.len())
-            .unwrap_or(self.highlight_prefix.len());
+        // cockpit patch: highlight the label's own characters that spell
+        // the typed word. A length taken from `filter_text` or the query
+        // could fall inside a character of the label, which panics.
+        let matched_len = matched_prefix_len(&item.label, &self.highlight_prefix);
 
         let highlights = vec![(
             0..matched_len,
@@ -156,12 +155,12 @@ impl ListDelegate for ContextMenuDelegate {
     }
 
     fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<ListState<Self>>) {
-        let Some(item) = self.selected_item() else {
+        let Some(item) = self.selected_item().cloned() else {
             return;
         };
 
         self.menu.update(cx, |this, cx| {
-            this.select_item(&item, window, cx);
+            this.select_item(&item, false, window, cx);
         });
     }
 }
@@ -177,6 +176,15 @@ pub struct CompletionMenu {
     /// The offset of the first character that triggered the completion.
     pub(crate) trigger_start_offset: Option<usize>,
     query: SharedString,
+    /// cockpit patch: the server's last answer, unfiltered; typing narrows
+    /// it locally until the next answer arrives.
+    all_items: Vec<Rc<CompletionItem>>,
+    /// cockpit patch: completion requests made, the one whose answer is
+    /// shown, and the last one made before the menu was dismissed (answers
+    /// to those must not bring it back).
+    requests: usize,
+    shown_request: usize,
+    dismissed_request: usize,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -220,48 +228,34 @@ impl CompletionMenu {
                 open: false,
                 trigger_start_offset: None,
                 query: SharedString::default(),
+                all_items: Vec::new(),
+                requests: 0,
+                shown_request: 0,
+                dismissed_request: 0,
                 bounds: Bounds::default(),
                 _subscriptions,
             }
         })
     }
 
-    fn select_item(&mut self, item: &CompletionItem, window: &mut Window, cx: &mut Context<Self>) {
-        let offset = self.offset;
+    /// Accepts `item`: replacing the rest of the word (Tab, `replace`) or
+    /// inserting before it (Enter, a click).
+    fn select_item(
+        &mut self,
+        item: &CompletionItem,
+        replace: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let item = item.clone();
-        let mut range = self.trigger_start_offset.unwrap_or(self.offset)..self.offset;
-
         let editor = self.editor.clone();
 
+        // The editor may be mid-update (this runs from its key handling).
         cx.spawn_in(window, async move |_, cx| {
             editor.update_in(cx, |editor, window, cx| {
                 editor.completion_inserting = true;
-
-                let mut new_text = item.label.clone();
-                if let Some(text_edit) = item.text_edit.as_ref() {
-                    match text_edit {
-                        CompletionTextEdit::Edit(edit) => {
-                            new_text = edit.new_text.clone();
-                            range.start = editor.text.position_to_offset(&edit.range.start);
-                            range.end = editor.text.position_to_offset(&edit.range.end);
-                        }
-                        CompletionTextEdit::InsertAndReplace(edit) => {
-                            new_text = edit.new_text.clone();
-                            range.start = editor.text.position_to_offset(&edit.replace.start);
-                            range.end = editor.text.position_to_offset(&edit.replace.end);
-                        }
-                    }
-                } else if let Some(insert_text) = item.insert_text.clone() {
-                    new_text = insert_text;
-                    range = offset..offset;
-                }
-
-                editor.replace_text_in_range_silent(
-                    Some(editor.range_to_utf16(&range)),
-                    &new_text,
-                    window,
-                    cx,
-                );
+                // cockpit patch: see `InputState::apply_completion`.
+                editor.apply_completion(&item, replace, window, cx);
                 editor.completion_inserting = false;
                 // FIXME: Input not get the focus
                 editor.focus(window, cx);
@@ -269,7 +263,7 @@ impl CompletionMenu {
         })
         .detach();
 
-        self.hide(cx);
+        self.dismiss(cx);
     }
 
     pub(crate) fn handle_action(
@@ -284,7 +278,10 @@ impl CompletionMenu {
 
         cx.propagate();
         if action.partial_eq(&input::Enter { secondary: false }) {
-            self.on_action_enter(window, cx);
+            self.on_action_enter(false, window, cx);
+        } else if action.partial_eq(&input::IndentInline) {
+            // cockpit patch: Tab accepts too, replacing the whole word.
+            self.on_action_enter(true, window, cx);
         } else if action.partial_eq(&input::Escape) {
             self.on_action_escape(window, cx);
         } else if action.partial_eq(&input::MoveUp) {
@@ -298,15 +295,15 @@ impl CompletionMenu {
         true
     }
 
-    fn on_action_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_action_enter(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.list.read(cx).delegate().selected_item().cloned() else {
             return;
         };
-        self.select_item(&item, window, cx);
+        self.select_item(&item, replace, window, cx);
     }
 
     fn on_action_escape(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        self.hide(cx);
+        self.dismiss(cx);
     }
 
     fn on_action_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -332,6 +329,66 @@ impl CompletionMenu {
         cx.notify();
     }
 
+    /// cockpit patch: closes the menu at the user's request (Escape, an
+    /// accepted item); answers to requests made so far are ignored.
+    pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
+        self.dismissed_request = self.requests;
+        self.hide(cx);
+    }
+
+    /// cockpit patch: numbers a new completion request.
+    pub(crate) fn next_request(&mut self) -> usize {
+        self.requests += 1;
+        self.requests
+    }
+
+    /// cockpit patch: whether the answer to `request` should be shown.
+    pub(crate) fn wants_answer(&self, request: usize) -> bool {
+        request > self.dismissed_request && request >= self.shown_request
+    }
+
+    /// cockpit patch: shows the answer to `request`, narrowed to `word`.
+    pub(crate) fn set_items(
+        &mut self,
+        request: usize,
+        offset: usize,
+        items: Vec<CompletionItem>,
+        provider: &dyn CompletionProvider,
+        word: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.shown_request = request;
+        self.all_items = items.into_iter().map(Rc::new).collect();
+        self.refilter(provider, word, offset, window, cx);
+    }
+
+    /// cockpit patch: narrows the last answer to `word` without asking the
+    /// server; hides the menu when nothing is left.
+    pub(crate) fn refilter(
+        &mut self,
+        provider: &dyn CompletionProvider,
+        word: &str,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let indices = {
+            let all: Vec<&CompletionItem> = self.all_items.iter().map(|item| item.as_ref()).collect();
+            provider.filter_completions(&all, word)
+        };
+        let items: Vec<Rc<CompletionItem>> = indices
+            .into_iter()
+            .filter_map(|ix| self.all_items.get(ix).cloned())
+            .collect();
+        if items.is_empty() {
+            self.hide(cx);
+            return;
+        }
+        self.query = SharedString::from(word.to_string());
+        self.show(offset, items, window, cx);
+    }
+
     /// Sets the trigger start offset if it is not already set.
     pub(crate) fn update_query(&mut self, start_offset: usize, query: impl Into<SharedString>) {
         if self.trigger_start_offset.is_none() {
@@ -343,11 +400,10 @@ impl CompletionMenu {
     pub(crate) fn show(
         &mut self,
         offset: usize,
-        items: impl Into<Vec<CompletionItem>>,
+        items: Vec<Rc<CompletionItem>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let items = items.into();
         self.offset = offset;
         self.open = true;
         self.list.update(cx, |this, cx| {
@@ -464,5 +520,35 @@ impl Render for CompletionMenu {
                 })),
         )
         .into_any_element()
+    }
+}
+
+/// cockpit patch: how many bytes at the start of `label` spell `typed`,
+/// ignoring case (always a character boundary of `label`).
+fn matched_prefix_len(label: &str, typed: &str) -> usize {
+    let mut typed = typed.chars().flat_map(char::to_lowercase);
+    let mut len = 0;
+    for c in label.chars() {
+        let mut lower = c.to_lowercase();
+        let matches = lower.all(|l| typed.next() == Some(l));
+        if !matches {
+            break;
+        }
+        len += c.len_utf8();
+    }
+    len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matched_prefix_len;
+
+    #[test]
+    fn highlight_covers_the_typed_prefix_only() {
+        assert_eq!(matched_prefix_len("HashMap", "has"), 3);
+        assert_eq!(matched_prefix_len("HashMap", ""), 0);
+        assert_eq!(matched_prefix_len("HashMap", "map"), 0);
+        assert_eq!(matched_prefix_len("é_test", "É"), 2);
+        assert_eq!(matched_prefix_len("ab", "abc"), 2);
     }
 }

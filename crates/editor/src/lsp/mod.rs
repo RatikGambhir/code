@@ -33,6 +33,14 @@ use serde_json::{json, Value};
 
 pub use registry::{install_hint, resolve_server, server_for_language, server_key, ServerConfig};
 
+/// What a server's column numbers count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionEncoding {
+    Utf8,
+    Utf16,
+    Utf32,
+}
+
 /// Something the server told us without being asked.
 #[derive(Clone, Debug)]
 pub enum ServerEvent {
@@ -154,6 +162,29 @@ impl LspClient {
         self.capabilities.get()
     }
 
+    /// The server takes edits (`didChange` with ranges) rather than the
+    /// whole text on every change.
+    pub fn incremental_sync(&self) -> bool {
+        use lsp_types::{TextDocumentSyncCapability, TextDocumentSyncKind};
+        let kind = match self.capabilities().and_then(|c| c.text_document_sync.as_ref()) {
+            Some(TextDocumentSyncCapability::Kind(kind)) => Some(*kind),
+            Some(TextDocumentSyncCapability::Options(options)) => options.change,
+            None => None,
+        };
+        kind == Some(TextDocumentSyncKind::INCREMENTAL)
+    }
+
+    /// What the server's columns count, as negotiated at `initialize`.
+    pub fn position_encoding(&self) -> PositionEncoding {
+        use lsp_types::PositionEncodingKind;
+        match self.capabilities().and_then(|c| c.position_encoding.as_ref()) {
+            Some(kind) if *kind == PositionEncodingKind::UTF8 => PositionEncoding::Utf8,
+            Some(kind) if *kind == PositionEncodingKind::UTF32 => PositionEncoding::Utf32,
+            // UTF-16 is the protocol's default.
+            _ => PositionEncoding::Utf16,
+        }
+    }
+
     fn send(&self, message: &Value) -> Result<()> {
         codec::write_message(&mut **self.writer.lock(), message)
             .with_context(|| format!("writing to {}", self.name))
@@ -243,6 +274,22 @@ impl LspClient {
                 version,
                 text: text.into(),
             },
+        })
+    }
+
+    /// Sends one edit: `range` (in the server's old text) became `text`.
+    /// Only for servers with [`Self::incremental_sync`].
+    pub fn did_change_range(&self, path: &Path, version: i32, range: lsp_types::Range, text: &str) -> Result<()> {
+        self.notify::<notification::DidChangeTextDocument>(lsp_types::DidChangeTextDocumentParams {
+            text_document: lsp_types::VersionedTextDocumentIdentifier {
+                uri: path_to_uri(path)?,
+                version,
+            },
+            content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                range: Some(range),
+                range_length: None,
+                text: text.into(),
+            }],
         })
     }
 
@@ -536,7 +583,7 @@ fn client_capabilities() -> ClientCapabilities {
             "synchronization": { "didSave": true, "dynamicRegistration": false },
             "completion": {
                 "completionItem": {
-                    "snippetSupport": false,
+                    "snippetSupport": true,
                     "documentationFormat": ["markdown", "plaintext"],
                     "insertReplaceSupport": true
                 },

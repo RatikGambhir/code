@@ -98,8 +98,9 @@ fn runs(command: &Path, args: &[&str]) -> bool {
 
 /// Per-server settings. rust-analyzer's defaults are good; these only turn on
 /// what an IDE wants (build scripts and proc macros so macro-heavy crates
-/// resolve, `cargo check` diagnostics on save) and skip completions that need
-/// snippet support the editor does not have.
+/// resolve, `cargo check` diagnostics on save). Functions complete as
+/// `name()` with the cursor between the parentheses, as in IntelliJ, rather
+/// than with each argument's name typed out for you to replace.
 fn settings_for(server: &str) -> Option<Value> {
     match server {
         "rust-analyzer" => Some(json!({
@@ -108,8 +109,8 @@ fn settings_for(server: &str) -> Option<Value> {
             "checkOnSave": true,
             "check": { "command": "check" },
             "completion": {
-                "callable": { "snippets": "none" },
-                "postfix": { "enable": false },
+                "callable": { "snippets": "add_parentheses" },
+                "postfix": { "enable": true },
                 "fullFunctionSignatures": { "enable": false }
             },
             "diagnostics": { "enable": true },

@@ -19,6 +19,12 @@ use tracing_subscriber::{fmt::writer::MakeWriterExt as _, EnvFilter};
 const BROWSER_PROFILE: &str = "default";
 
 fn main() {
+    // Codex runs Hangar this way for a ChatGPT access token (see
+    // cockpit_agents::chatgpt). Print it and leave before any UI starts.
+    if std::env::args().nth(1).as_deref() == Some(cockpit_agents::chatgpt::TOKEN_HELPER_FLAG) {
+        std::process::exit(cockpit_agents::chatgpt::print_access_token());
+    }
+    cockpit_common::startup::mark();
     if let Err(err) = run() {
         eprintln!("hangar: {err:#}");
         std::process::exit(1);
