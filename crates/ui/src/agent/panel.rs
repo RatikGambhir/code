@@ -146,17 +146,16 @@ impl AgentPanel {
         }
     }
 
-    /// Totals of what the active thread changed, recomputed only when the
-    /// transcript changes.
+    /// Totals of what the active thread changed, recomputed only when one
+    /// of its file changes moves (not on every streamed token).
     fn refresh_diff_summary(&mut self, cx: &App) {
         let controller = self.controller.read(cx);
-        let key = controller
-            .active_thread()
-            .map(|t| (Some(t.id.clone()), t.transcript.revision()))
-            .unwrap_or((None, 0));
-        if key == self.diff_summary.0 {
+        let thread = controller.active_thread();
+        let revision = thread.map_or(0, |t| t.transcript.changes_revision());
+        if self.diff_summary.0 .0.as_deref() == thread.map(|t| t.id.as_str()) && self.diff_summary.0 .1 == revision {
             return;
         }
+        let key = (thread.map(|t| t.id.clone()), revision);
         let summary = controller
             .active_thread()
             .map(|t| DiffSummary::of(&chat_changes(t.transcript.entries())))
@@ -165,11 +164,20 @@ impl AgentPanel {
     }
 
     /// Centers `el` in a reading-width column when the chat fills the window.
-    fn column<E: Styled>(&self, el: E) -> E {
+    ///
+    /// The column sits in a full-width block wrapper rather than being a
+    /// `w_full().max_w()` flex item: taffy measures a flex item's height at
+    /// its unclamped width, so wrapped text came out too short and spilled
+    /// past the card. Block layout applies `max_w` before measuring.
+    fn column<E: Styled + IntoElement>(&self, el: E) -> AnyElement {
         if self.full {
-            el.w_full().max_w(px(CHAT_COLUMN_WIDTH)).mx_auto()
+            div()
+                .flex_none()
+                .w_full()
+                .child(el.max_w(px(CHAT_COLUMN_WIDTH)).mx_auto())
+                .into_any_element()
         } else {
-            el
+            el.into_any_element()
         }
     }
 
@@ -1007,7 +1015,7 @@ impl AgentPanel {
         if let Some(body) = body {
             card = card.child(self.render_open_body(&view.thread_id, body, cwd, window, cx));
         }
-        self.column(card).into_any_element()
+        self.column(card)
     }
 
     fn render_open_body(
@@ -1426,8 +1434,12 @@ impl AgentPanel {
         if pending.is_empty() && plan.is_empty() {
             return None;
         }
-        let mut column = v_flex().px(px(14.)).pt(px(12.)).pb(px(4.)).gap(px(10.));
-        column = if self.full { self.column(column) } else { column.border_t_1().border_color(t.border) };
+        let mut column = v_flex()
+            .px(px(14.))
+            .pt(px(12.))
+            .pb(px(4.))
+            .gap(px(10.))
+            .when(!self.full, |el| el.border_t_1().border_color(t.border));
         if !plan.is_empty() {
             let mut steps = v_flex().gap(px(7.)).child(caps_label("Plan", cx));
             for (step, status) in plan {
@@ -1486,7 +1498,7 @@ impl AgentPanel {
                     ),
             );
         }
-        Some(column.into_any_element())
+        Some(self.column(column))
     }
 
     fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1622,7 +1634,7 @@ impl AgentPanel {
                 .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
         };
 
-        self.column(v_flex())
+        let composer = v_flex()
             .flex_none()
             .px(px(12.))
             .pt(px(8.))
@@ -1719,7 +1731,8 @@ impl AgentPanel {
                         Some(hint) => el.child(div().min_w_0().truncate().text_color(t.warning).child(hint)),
                         None => el.child("↩ send · ⇧↩ newline"),
                     }),
-            )
+            );
+        self.column(composer)
     }
 
     /// The handles that can finish the `@…` being typed. Rows act on mouse
@@ -1805,9 +1818,9 @@ impl Render for AgentPanel {
         if self.full {
             self.refresh_diff_summary(cx);
         }
-        let connection = self.render_connection(cx).map(|el| self.column(div()).child(el).into_any_element());
+        let connection = self.render_connection(cx).map(|el| self.column(div().child(el)));
         let login = if connection.is_none() {
-            self.render_login(cx).map(|el| self.column(div()).child(el).into_any_element())
+            self.render_login(cx).map(|el| self.column(div().child(el)))
         } else {
             None
         };

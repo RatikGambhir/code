@@ -440,6 +440,16 @@ impl TerminalPanel {
 
     pub fn add_terminal(&mut self, program: Option<(String, Vec<String>)>, cx: &mut Context<Self>) -> Entity<TerminalView> {
         let cwd = self.cwd.clone();
+        self.add_terminal_in(cwd, program, cx)
+    }
+
+    /// A new terminal tab started in `cwd` (a project task's directory).
+    pub fn add_terminal_in(
+        &mut self,
+        cwd: PathBuf,
+        program: Option<(String, Vec<String>)>,
+        cx: &mut Context<Self>,
+    ) -> Entity<TerminalView> {
         let terminal = cx.new(|cx| TerminalView::new(cwd, program, cx));
         self._subscriptions.push(cx.subscribe(&terminal, |_, _, event: &TerminalViewEvent, cx| match event {
             TerminalViewEvent::OpenUrl(url) => cx.emit(TerminalPanelEvent::OpenUrl(url.clone())),

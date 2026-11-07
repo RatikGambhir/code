@@ -42,6 +42,30 @@ const ICONS: &[(&str, &[u8])] = &[
     ("icons/cockpit/message-square.svg", include_bytes!("../../../assets/icons/message-square.svg")),
     ("icons/cockpit/square-pen.svg", include_bytes!("../../../assets/icons/square-pen.svg")),
     ("icons/cockpit/notebook-pen.svg", include_bytes!("../../../assets/icons/notebook-pen.svg")),
+    // Tasks: status and priority marks are Hangar's own; project (box) and list-todo are Lucide.
+    ("icons/cockpit/status-backlog.svg", include_bytes!("../../../assets/icons/status-backlog.svg")),
+    ("icons/cockpit/status-todo.svg", include_bytes!("../../../assets/icons/status-todo.svg")),
+    ("icons/cockpit/status-started.svg", include_bytes!("../../../assets/icons/status-started.svg")),
+    ("icons/cockpit/status-triage.svg", include_bytes!("../../../assets/icons/status-triage.svg")),
+    ("icons/cockpit/status-done.svg", include_bytes!("../../../assets/icons/status-done.svg")),
+    ("icons/cockpit/status-canceled.svg", include_bytes!("../../../assets/icons/status-canceled.svg")),
+    ("icons/cockpit/priority-none.svg", include_bytes!("../../../assets/icons/priority-none.svg")),
+    ("icons/cockpit/priority-low.svg", include_bytes!("../../../assets/icons/priority-low.svg")),
+    ("icons/cockpit/priority-medium.svg", include_bytes!("../../../assets/icons/priority-medium.svg")),
+    ("icons/cockpit/priority-high.svg", include_bytes!("../../../assets/icons/priority-high.svg")),
+    ("icons/cockpit/priority-urgent.svg", include_bytes!("../../../assets/icons/priority-urgent.svg")),
+    ("icons/cockpit/project.svg", include_bytes!("../../../assets/icons/project.svg")),
+    ("icons/cockpit/list-todo.svg", include_bytes!("../../../assets/icons/list-todo.svg")),
+    // GitHub view (Lucide).
+    ("icons/cockpit/git-pull-request.svg", include_bytes!("../../../assets/icons/git-pull-request.svg")),
+    ("icons/cockpit/git-merge.svg", include_bytes!("../../../assets/icons/git-merge.svg")),
+    ("icons/cockpit/git-pull-request-closed.svg", include_bytes!("../../../assets/icons/git-pull-request-closed.svg")),
+    ("icons/cockpit/git-pull-request-draft.svg", include_bytes!("../../../assets/icons/git-pull-request-draft.svg")),
+    ("icons/cockpit/lock.svg", include_bytes!("../../../assets/icons/lock.svg")),
+    ("icons/cockpit/book-marked.svg", include_bytes!("../../../assets/icons/book-marked.svg")),
+    ("icons/cockpit/git-fork.svg", include_bytes!("../../../assets/icons/git-fork.svg")),
+    ("icons/cockpit/workflow.svg", include_bytes!("../../../assets/icons/workflow.svg")),
+    ("icons/cockpit/circle-slash.svg", include_bytes!("../../../assets/icons/circle-slash.svg")),
 ];
 
 /// Zed's typefaces: IBM Plex Sans for the interface and Lilex (IBM Plex

@@ -95,6 +95,9 @@ pub struct Transcript {
     diff: Option<String>,
     /// Increments on every change, so views can cache derived layout.
     revision: u64,
+    /// Increments only when a file-change entry is added or updated, so
+    /// views of edited files skip the far more frequent text deltas.
+    changes_revision: u64,
     next_local: u64,
 }
 
@@ -131,6 +134,11 @@ impl Transcript {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Like [`Self::revision`], but bumped only by file changes.
+    pub fn changes_revision(&self) -> u64 {
+        self.changes_revision
     }
 
     /// The running turn, if any.
@@ -427,6 +435,9 @@ impl Transcript {
     fn upsert_item(&mut self, turn_id: &str, item: &ThreadItem, streaming: bool) {
         let Some(id) = item.id() else { return };
         let Some(kind) = entry_kind(item) else { return };
+        if matches!(kind, EntryKind::FileChange { .. }) {
+            self.changes_revision += 1;
+        }
 
         // The server echoes the user's message; adopt the optimistic local
         // entry instead of showing the prompt twice.
@@ -758,6 +769,25 @@ mod tests {
         assert_eq!(files[0].change, "renamed → src/b.rs");
         assert!(matches!(t.entries()[2].kind, EntryKind::Error { .. }));
         assert_eq!(t.last_status(), Some(TurnStatus::Failed));
+    }
+
+    #[test]
+    fn changes_revision_ignores_text_deltas() {
+        let mut t = Transcript::new();
+        t.apply(&AgentEvent::AgentMessageDelta { thread_id: "t".into(), item_id: "m".into(), delta: "x".into() });
+        t.apply(&AgentEvent::AgentMessageDelta { thread_id: "t".into(), item_id: "m".into(), delta: "y".into() });
+        assert_eq!(t.changes_revision(), 0);
+
+        let edit = |status| ThreadItem::FileChange {
+            id: "f".into(),
+            status,
+            changes: vec![FileUpdateChange { path: "a.rs".into(), kind: PatchChangeKind::Add, diff: "+x".into() }],
+        };
+        t.apply(&started(edit(ItemStatus::InProgress)));
+        let after_start = t.changes_revision();
+        assert!(after_start > 0);
+        t.apply(&completed(edit(ItemStatus::Completed)));
+        assert!(t.changes_revision() > after_start, "completing an edit counts");
     }
 
     #[test]

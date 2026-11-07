@@ -7,6 +7,8 @@ members = [
     "crates/terminal",
     "crates/editor",
     "crates/agents",
+    "crates/tasks",
+    "crates/github",
     "crates/orchestrator",
     "crates/debugger",
     "crates/notebook",
@@ -32,6 +34,8 @@ cockpit-git = { path = "crates/git" }
 cockpit-terminal = { path = "crates/terminal" }
 cockpit-editor = { path = "crates/editor" }
 cockpit-agents = { path = "crates/agents" }
+cockpit-tasks = { path = "crates/tasks" }
+cockpit-github = { path = "crates/github" }
 cockpit-orchestrator = { path = "crates/orchestrator" }
 cockpit-debugger = { path = "crates/debugger" }
 cockpit-notebook = { path = "crates/notebook" }

@@ -1,7 +1,8 @@
 //! Everything about files the UI needs that is not drawing: documents with
 //! save/reload and external-change detection, language detection, directory
 //! listing for the explorer, workspace search, fuzzy file finding, file
-//! watching and a Language Server Protocol client.
+//! watching, project detection (Node/Bun/Deno and Go projects, their
+//! frameworks and tools) and a Language Server Protocol client.
 //!
 //! The text buffer itself is gpui-component's rope-backed editor; this crate
 //! owns the relationship between that buffer and the file on disk.
@@ -11,8 +12,9 @@ pub mod fs_tree;
 pub mod fuzzy;
 mod language;
 pub mod lsp;
+pub mod project;
 pub mod search;
 pub mod watcher;
 
 pub use document::{Document, DocumentError, LineEnding};
-pub use language::{language_for_path, lsp_language_id};
+pub use language::{language_for_path, lsp_language_id, lsp_language_id_for_path};

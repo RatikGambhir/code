@@ -1,15 +1,20 @@
 //! The diff panel beside the chat: what this conversation changed, or
 //! everything uncommitted in the repository, one collapsible file at a time.
+//!
+//! Diffs are parsed once when they change and drawn as a virtualized list of
+//! rows (file headers and lines), so long diffs scroll smoothly and a
+//! streaming reply costs nothing: the panel only wakes up when an edit lands.
 
 use std::{
     collections::HashSet,
+    ops::Range,
     path::{Path, PathBuf},
 };
 
-use cockpit_git::{StatusKind, Repository};
+use cockpit_git::{Repository, StatusKind};
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, Hsla, ScrollHandle, Subscription, Task, Window,
+    div, list, prelude::*, px, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, Hsla, ListAlignment, ListOffset, ListState, Subscription, Task, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -19,7 +24,9 @@ use gpui_component::{
     v_flex, IconName, Sizable as _,
 };
 
-use super::diff::{chat_changes, parse_lines, split_git_diff, ChangeKind, DiffSummary, FileDiff, LineKind};
+use super::diff::{
+    applied_edits, chat_changes, shown_lines, split_git_diff, ChangeKind, DiffSummary, FileDiff, LineKind, ShownLine,
+};
 use crate::{
     agent::AgentController,
     assets::icon,
@@ -28,18 +35,20 @@ use crate::{
     theme::{self, tokens, Tokens, TEXT_BODY, TEXT_SMALL},
 };
 
-/// Lines drawn per file before the rest is left to a full tab.
-const MAX_LINES_PER_FILE: usize = 400;
-/// Lines drawn across all files; later files start collapsed.
-const MAX_LINES_TOTAL: usize = 3_000;
+/// Lines drawn per file; the rest is left to a full diff tab.
+const MAX_LINES_PER_FILE: usize = 5_000;
 /// Untracked files diffed one by one (each is a `git` run).
 const MAX_UNTRACKED: usize = 40;
+/// Rows laid out beyond the viewport so fast scrolling doesn't pop in.
+const OVERDRAW: f32 = 600.;
 
 pub enum DiffPanelEvent {
     OpenFile(PathBuf),
     /// Show a whole diff in a read-only editor tab.
     OpenDiff { title: String, diff: String },
     Close,
+    /// The active conversation just wrote to disk.
+    ChangesApplied { thread_id: String },
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -51,10 +60,46 @@ pub enum DiffSource {
     Uncommitted,
 }
 
+/// A file's diff with its lines parsed for drawing.
+struct ShownFile {
+    diff: FileDiff,
+    lines: Vec<ShownLine>,
+    /// Lines past [`MAX_LINES_PER_FILE`].
+    hidden: usize,
+}
+
+impl ShownFile {
+    fn new(diff: FileDiff) -> Self {
+        let (lines, hidden) = shown_lines(&diff.diff, MAX_LINES_PER_FILE);
+        Self { diff, lines, hidden }
+    }
+}
+
+/// One row of the virtualized list.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Row {
+    Summary,
+    File(usize),
+    Line { file: usize, line: usize },
+    /// "N more lines · open the full diff".
+    More(usize),
+    /// A file with nothing to draw (binary, mode change).
+    Note(usize),
+}
+
+impl Row {
+    fn file(self) -> Option<usize> {
+        match self {
+            Row::Summary => None,
+            Row::File(file) | Row::More(file) | Row::Note(file) | Row::Line { file, .. } => Some(file),
+        }
+    }
+}
+
 /// The working tree's changes, as last loaded.
 #[derive(Default)]
 struct GitDiffs {
-    files: Vec<FileDiff>,
+    files: Vec<ShownFile>,
     root: Option<PathBuf>,
     loading: bool,
     /// Loaded at least once.
@@ -65,18 +110,29 @@ struct GitDiffs {
     error: Option<String>,
 }
 
+/// The active conversation's changes.
+#[derive(Default)]
+struct ChatDiffs {
+    thread_id: Option<String>,
+    /// The transcript's `changes_revision` these files were built from.
+    revision: u64,
+    files: Vec<ShownFile>,
+    /// Edits that reached the disk, to notice new ones.
+    applied: usize,
+    /// The file the latest applied edit touched.
+    latest: Option<String>,
+}
+
 pub struct DiffPanel {
     controller: Entity<AgentController>,
     source_control: Entity<SourceControl>,
     source: DiffSource,
-    /// The active thread's changes, keyed by (thread, revision).
-    chat: ((Option<String>, u64), Vec<FileDiff>),
+    chat: ChatDiffs,
     git: GitDiffs,
     /// Files the user folded, as "source:path".
     collapsed: HashSet<String>,
-    /// Files the user unfolded past the line budget.
-    expanded: HashSet<String>,
-    scroll: ScrollHandle,
+    rows: Vec<Row>,
+    list: ListState,
     focus_handle: FocusHandle,
     _load: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -87,7 +143,9 @@ impl EventEmitter<DiffPanelEvent> for DiffPanel {}
 impl DiffPanel {
     pub fn new(controller: Entity<AgentController>, source_control: Entity<SourceControl>, cx: &mut Context<Self>) -> Self {
         let subscriptions = vec![
-            cx.observe(&controller, |_, _, cx| cx.notify()),
+            // Fires on every streamed token; `sync_chat` returns early unless
+            // a file change arrived or the conversation switched.
+            cx.observe(&controller, |this, _, cx| this.sync_chat(cx)),
             cx.subscribe(&source_control, |this, _, event: &SourceControlEvent, cx| {
                 if matches!(event, SourceControlEvent::StatusChanged) {
                     this.git.stale = true;
@@ -97,19 +155,21 @@ impl DiffPanel {
                 }
             }),
         ];
-        Self {
+        let mut panel = Self {
             controller,
             source_control,
             source: DiffSource::default(),
-            chat: ((None, 0), Vec::new()),
+            chat: ChatDiffs::default(),
             git: GitDiffs { stale: true, ..GitDiffs::default() },
             collapsed: HashSet::new(),
-            expanded: HashSet::new(),
-            scroll: ScrollHandle::new(),
+            rows: Vec::new(),
+            list: ListState::new(0, ListAlignment::Top, px(OVERDRAW)),
             focus_handle: cx.focus_handle(),
             _load: None,
             _subscriptions: subscriptions,
-        }
+        };
+        panel.sync_chat(cx);
+        panel
     }
 
     /// Called when the panel is shown, so a stale working-tree diff reloads.
@@ -119,13 +179,64 @@ impl DiffPanel {
         }
     }
 
+    /// Switches to this chat's changes and scrolls to the file the agent
+    /// edited last, unfolding it.
+    pub fn reveal_latest(&mut self, cx: &mut Context<Self>) {
+        if self.source != DiffSource::Chat {
+            self.source = DiffSource::Chat;
+            self.rebuild_rows(false);
+        }
+        if let Some(path) = self.chat.latest.clone() {
+            if self.collapsed.remove(&self.key(&path)) {
+                self.rebuild_rows(true);
+            }
+            let row = self.chat.files.iter().position(|f| f.diff.path == path).and_then(|file| {
+                self.rows.iter().position(|row| *row == Row::File(file))
+            });
+            if let Some(item_ix) = row {
+                self.list.scroll_to(ListOffset { item_ix, offset_in_item: px(0.) });
+            }
+        }
+        cx.notify();
+    }
+
     fn set_source(&mut self, source: DiffSource, cx: &mut Context<Self>) {
+        if self.source == source {
+            return;
+        }
         self.source = source;
-        self.scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.rebuild_rows(false);
         if source == DiffSource::Uncommitted && (self.git.stale || !self.git.loaded) {
             self.load_git(cx);
         }
         cx.notify();
+    }
+
+    /// Rebuilds this chat's diffs when its file changes moved on, and
+    /// announces edits that just reached the disk.
+    fn sync_chat(&mut self, cx: &mut Context<Self>) {
+        let controller = self.controller.read(cx);
+        let thread = controller.active_thread();
+        let revision = thread.map_or(0, |t| t.transcript.changes_revision());
+        if self.chat.thread_id.as_deref() == thread.map(|t| t.id.as_str()) && self.chat.revision == revision {
+            return;
+        }
+        let thread_id = thread.map(|t| t.id.clone());
+        let entries = thread.map_or(&[][..], |t| t.transcript.entries());
+        let files: Vec<ShownFile> = chat_changes(entries).into_iter().map(ShownFile::new).collect();
+        let applied = applied_edits(entries);
+
+        // Opening an older conversation is not "the agent just edited".
+        let grew = thread_id.is_some() && thread_id == self.chat.thread_id && applied.count > self.chat.applied;
+        let same_thread = thread_id == self.chat.thread_id;
+        self.chat = ChatDiffs { thread_id: thread_id.clone(), revision, files, applied: applied.count, latest: applied.latest };
+        if self.source == DiffSource::Chat {
+            self.rebuild_rows(same_thread);
+        }
+        cx.notify();
+        if let (true, Some(thread_id)) = (grew, thread_id) {
+            cx.emit(DiffPanelEvent::ChangesApplied { thread_id });
+        }
     }
 
     /// Reads `git diff HEAD` and the untracked files in the background,
@@ -134,6 +245,9 @@ impl DiffPanel {
         let scm = self.source_control.read(cx);
         let Some(repo) = scm.repository().cloned() else {
             self.git = GitDiffs { no_repo: true, loaded: true, ..GitDiffs::default() };
+            if self.source == DiffSource::Uncommitted {
+                self.rebuild_rows(false);
+            }
             cx.notify();
             return;
         };
@@ -150,7 +264,11 @@ impl DiffPanel {
             .unwrap_or_default();
         self.git.loading = true;
         self.git.stale = false;
-        let task = cx.background_spawn(async move { working_tree_diff(&repo, &untracked) });
+        // Parsing happens off the main thread too: working-tree diffs can be huge.
+        let task = cx.background_spawn(async move {
+            working_tree_diff(&repo, &untracked)
+                .map(|(root, files)| (root, files.into_iter().map(ShownFile::new).collect::<Vec<_>>()))
+        });
         self._load = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
@@ -165,6 +283,9 @@ impl DiffPanel {
                     }
                     Err(err) => this.git.error = Some(format!("{err:#}")),
                 }
+                if this.source == DiffSource::Uncommitted {
+                    this.rebuild_rows(true);
+                }
                 cx.notify();
             })
             .ok();
@@ -172,24 +293,9 @@ impl DiffPanel {
         cx.notify();
     }
 
-    fn refresh_chat(&mut self, cx: &App) {
-        let controller = self.controller.read(cx);
-        let key = controller
-            .active_thread()
-            .map(|t| (Some(t.id.clone()), t.transcript.revision()))
-            .unwrap_or((None, 0));
-        if key != self.chat.0 {
-            let files = controller
-                .active_thread()
-                .map(|t| chat_changes(t.transcript.entries()))
-                .unwrap_or_default();
-            self.chat = (key, files);
-        }
-    }
-
-    fn files(&self) -> &[FileDiff] {
+    fn files(&self) -> &[ShownFile] {
         match self.source {
-            DiffSource::Chat => &self.chat.1,
+            DiffSource::Chat => &self.chat.files,
             DiffSource::Uncommitted => &self.git.files,
         }
     }
@@ -207,16 +313,66 @@ impl DiffPanel {
         format!("{:?}:{path}", self.source)
     }
 
-    fn toggle_file(&mut self, key: String, over_budget: bool, cx: &mut Context<Self>) {
-        let set = if over_budget { &mut self.expanded } else { &mut self.collapsed };
-        if !set.remove(&key) {
-            set.insert(key);
+    fn push_file_rows(rows: &mut Vec<Row>, ix: usize, file: &ShownFile, open: bool) {
+        rows.push(Row::File(ix));
+        if !open {
+            return;
         }
+        if file.lines.is_empty() {
+            rows.push(Row::Note(ix));
+            return;
+        }
+        rows.extend((0..file.lines.len()).map(|line| Row::Line { file: ix, line }));
+        if file.hidden > 0 {
+            rows.push(Row::More(ix));
+        }
+    }
+
+    /// Lays the rows out again after the files changed. `keep_scroll` holds
+    /// the reader's place (new edits arriving); otherwise back to the top.
+    fn rebuild_rows(&mut self, keep_scroll: bool) {
+        let top = self.list.logical_scroll_top();
+        let mut rows = std::mem::take(&mut self.rows);
+        rows.clear();
+        if !self.files().is_empty() {
+            rows.push(Row::Summary);
+            for (ix, file) in self.files().iter().enumerate() {
+                let open = !self.collapsed.contains(&self.key(&file.diff.path));
+                Self::push_file_rows(&mut rows, ix, file, open);
+            }
+        }
+        self.rows = rows;
+        self.list.reset(self.rows.len());
+        if keep_scroll {
+            self.list.scroll_to(top);
+        }
+    }
+
+    /// The rows file `ix` occupies.
+    fn file_rows(&self, ix: usize) -> Option<Range<usize>> {
+        let start = self.rows.iter().position(|row| *row == Row::File(ix))?;
+        let len = self.rows[start..].iter().take_while(|row| row.file() == Some(ix)).count();
+        Some(start..start + len)
+    }
+
+    /// Folds or unfolds one file, re-measuring only its rows.
+    fn toggle_file(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let (Some(old), Some(file)) = (self.file_rows(ix), self.files().get(ix)) else { return };
+        let key = self.key(&file.diff.path);
+        let open = !self.collapsed.remove(&key);
+        if !open {
+            self.collapsed.insert(key);
+        }
+        let mut replacement = Vec::new();
+        Self::push_file_rows(&mut replacement, ix, &self.files()[ix], !open);
+        let count = replacement.len();
+        self.rows.splice(old.clone(), replacement);
+        self.list.splice(old, count);
         cx.notify();
     }
 
     fn set_all_collapsed(&mut self, collapse: bool, cx: &mut Context<Self>) {
-        let keys: Vec<String> = self.files().iter().map(|f| self.key(&f.path)).collect();
+        let keys: Vec<String> = self.files().iter().map(|f| self.key(&f.diff.path)).collect();
         if collapse {
             self.collapsed.extend(keys);
         } else {
@@ -224,6 +380,7 @@ impl DiffPanel {
                 self.collapsed.remove(&key);
             }
         }
+        self.rebuild_rows(false);
         cx.notify();
     }
 
@@ -250,7 +407,7 @@ impl DiffPanel {
                 })
                 .on_click(cx.listener(move |this, _, _, cx| this.set_source(source, cx)))
         };
-        let any_open = self.files().iter().any(|f| !self.collapsed.contains(&self.key(&f.path)));
+        let any_open = self.files().iter().any(|f| !self.collapsed.contains(&self.key(&f.diff.path)));
         h_flex()
             .h(px(40.))
             .flex_none()
@@ -291,10 +448,18 @@ impl DiffPanel {
             )
     }
 
-    fn render_summary(&self, summary: DiffSummary, cx: &App) -> impl IntoElement {
+    fn summary(&self) -> DiffSummary {
+        self.files().iter().fold(DiffSummary::default(), |acc, f| DiffSummary {
+            files: acc.files + 1,
+            added: acc.added + f.diff.added,
+            removed: acc.removed + f.diff.removed,
+        })
+    }
+
+    fn render_summary(&self, cx: &App) -> AnyElement {
         let t = tokens(cx);
+        let summary = self.summary();
         h_flex()
-            .flex_none()
             .px(px(12.))
             .py(px(8.))
             .gap(px(8.))
@@ -306,6 +471,7 @@ impl DiffPanel {
             .when(self.source == DiffSource::Uncommitted && self.git.loading, |el| {
                 el.child(Spinner::new().xsmall())
             })
+            .into_any_element()
     }
 
     fn render_empty(&self, cx: &App) -> AnyElement {
@@ -344,10 +510,53 @@ impl DiffPanel {
             .into_any_element()
     }
 
-    fn render_file(&self, ix: usize, file: &FileDiff, over_budget: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// One list row. File rows are framed so each file reads as a card.
+    fn render_row(&mut self, ix: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(&row) = self.rows.get(ix) else { return div().into_any_element() };
+        if row == Row::Summary {
+            return self.render_summary(cx);
+        }
         let t = tokens(cx).clone();
-        let key = self.key(&file.path);
-        let open = if over_budget { self.expanded.contains(&key) } else { !self.collapsed.contains(&key) };
+        let header = matches!(row, Row::File(_));
+        // A file's card ends where the next file (or the list) starts.
+        let last = !matches!(self.rows.get(ix + 1), Some(Row::Line { .. } | Row::More(_) | Row::Note(_)));
+        let content = match row {
+            Row::File(file) => self.render_file_header(file, !last, cx),
+            Row::Line { file, line } => render_line(&self.files()[file].lines[line], &t),
+            Row::More(file) => self.render_more(file, cx),
+            Row::Note(file) => {
+                let binary = self.files()[file].diff.diff.contains("Binary files");
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .text_size(TEXT_SMALL)
+                    .text_color(t.fg_subtle)
+                    .child(if binary { "Binary file" } else { "No textual changes" })
+                    .into_any_element()
+            }
+            Row::Summary => unreachable!("handled above"),
+        };
+        let radius = theme::RADIUS;
+        div()
+            .px(px(10.))
+            .when(last, |el| el.pb(px(10.)))
+            .child(
+                div()
+                    .overflow_hidden()
+                    .border_color(t.border)
+                    .border_l_1()
+                    .border_r_1()
+                    .when(header, |el| el.border_t_1().rounded_tl(radius).rounded_tr(radius))
+                    .when(last, |el| el.border_b_1().rounded_bl(radius).rounded_br(radius))
+                    .when(matches!(row, Row::Line { .. }), |el| el.font_family(t.mono.clone()).text_size(px(11.5)))
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
+    fn render_file_header(&self, ix: usize, open: bool, cx: &mut Context<Self>) -> AnyElement {
+        let t = tokens(cx).clone();
+        let file = &self.files()[ix].diff;
         let path = Path::new(&file.path);
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| file.path.clone());
         let dir = path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
@@ -357,11 +566,9 @@ impl DiffPanel {
             _ => theme::modified(cx),
         };
         let absolute = self.absolute(&file.path, cx);
-        let tab_title = format!("{name} (diff)");
-        let full_diff = file.diff.clone();
         let deleted = file.change == ChangeKind::Deleted;
 
-        let header = h_flex()
+        h_flex()
             .id(("diff-file", ix))
             .h(px(32.))
             .px(px(8.))
@@ -370,7 +577,7 @@ impl DiffPanel {
             .bg(t.raised)
             .when(open, |el| el.border_b_1().border_color(t.border))
             .hover(|s| s.bg(t.hover))
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_file(key.clone(), over_budget, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_file(ix, cx)))
             .child(
                 gpui_component::Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
                     .size(px(12.))
@@ -402,72 +609,47 @@ impl DiffPanel {
                             cx.emit(DiffPanelEvent::OpenFile(absolute.clone()));
                         })),
                 )
-            });
+            })
+            .into_any_element()
+    }
 
-        let mut card = v_flex()
-            .mx(px(10.))
-            .mb(px(10.))
-            .rounded(theme::RADIUS)
-            .border_1()
+    fn render_more(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let t = tokens(cx);
+        let file = &self.files()[ix];
+        let name = Path::new(&file.diff.path).file_name().map_or_else(|| file.diff.path.clone(), |n| n.to_string_lossy().into_owned());
+        let title = format!("{name} (diff)");
+        let full_diff = file.diff.diff.clone();
+        div()
+            .id(("diff-more", ix))
+            .px(px(12.))
+            .py(px(6.))
+            .border_t_1()
             .border_color(t.border)
-            .overflow_hidden()
-            .child(header);
-        if open {
-            let lines = parse_lines(&file.diff);
-            if lines.is_empty() {
-                card = card.child(
-                    div()
-                        .px(px(12.))
-                        .py(px(8.))
-                        .text_size(TEXT_SMALL)
-                        .text_color(t.fg_subtle)
-                        .child(if file.diff.contains("Binary files") { "Binary file" } else { "No textual changes" }),
-                );
-            } else {
-                let hidden = lines.len().saturating_sub(MAX_LINES_PER_FILE);
-                let mut body = v_flex().py(px(2.)).font_family(t.mono.clone()).text_size(px(11.5));
-                for line in lines.iter().take(MAX_LINES_PER_FILE) {
-                    body = body.child(render_line(line.kind, line.old, line.new, line.text, &t));
-                }
-                card = card.child(body);
-                if hidden > 0 {
-                    card = card.child(
-                        div()
-                            .id(("diff-more", ix))
-                            .px(px(12.))
-                            .py(px(6.))
-                            .border_t_1()
-                            .border_color(t.border)
-                            .text_size(TEXT_SMALL)
-                            .text_color(t.accent_text)
-                            .cursor_pointer()
-                            .hover(|s| s.underline())
-                            .child(format!("{hidden} more lines · open the full diff in a tab"))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(DiffPanelEvent::OpenDiff { title: tab_title.clone(), diff: full_diff.clone() });
-                            })),
-                    );
-                }
-            }
-        }
-        card.into_any_element()
+            .text_size(TEXT_SMALL)
+            .text_color(t.accent_text)
+            .cursor_pointer()
+            .hover(|s| s.underline())
+            .child(format!("{} more lines · open the full diff in a tab", file.hidden))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(DiffPanelEvent::OpenDiff { title: title.clone(), diff: full_diff.clone() });
+            }))
+            .into_any_element()
     }
 }
 
 /// One diff line: old and new line numbers, a sign, the text.
-fn render_line(kind: LineKind, old: Option<u32>, new: Option<u32>, text: &str, t: &Tokens) -> AnyElement {
-    if kind == LineKind::Hunk {
+pub(crate) fn render_line(line: &ShownLine, t: &Tokens) -> AnyElement {
+    if line.kind == LineKind::Hunk {
         return div()
             .px(px(10.))
             .py(px(2.))
-            .my(px(2.))
             .bg(t.accent_soft.alpha(0.5))
             .text_color(t.accent_text)
             .truncate()
-            .child(text.to_string())
+            .child(line.text.clone())
             .into_any_element();
     }
-    let (sign, bg, fg): (&str, Option<Hsla>, Hsla) = match kind {
+    let (sign, bg, fg): (&str, Option<Hsla>, Hsla) = match line.kind {
         LineKind::Added => ("+", Some(t.added_bg()), t.fg),
         LineKind::Removed => ("−", Some(t.removed_bg()), t.fg),
         _ => (" ", None, t.fg_muted),
@@ -479,22 +661,15 @@ fn render_line(kind: LineKind, old: Option<u32>, new: Option<u32>, text: &str, t
             .pr(px(6.))
             .text_right()
             .text_color(t.fg_subtle.alpha(0.7))
-            .child(n.map(|n| n.to_string()).unwrap_or_default())
+            .children(n.map(|n| n.to_string()))
     };
     h_flex()
         .items_start()
         .when_some(bg, |el, bg| el.bg(bg))
-        .child(number(old))
-        .child(number(new))
+        .child(number(line.old))
+        .child(number(line.new))
         .child(div().flex_none().w(px(14.)).text_color(fg).child(sign))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .pr(px(8.))
-                .text_color(fg)
-                .child(if text.is_empty() { " ".to_string() } else { text.replace('\t', "    ") }),
-        )
+        .child(div().flex_1().min_w_0().pr(px(8.)).text_color(fg).child(line.text.clone()))
         .into_any_element()
 }
 
@@ -527,43 +702,22 @@ impl Focusable for DiffPanel {
 
 impl Render for DiffPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.refresh_chat(cx);
-        let summary_chat = DiffSummary::of(&self.chat.1);
-        let summary_git = self.git.loaded.then(|| DiffSummary::of(&self.git.files));
-        let summary = match self.source {
-            DiffSource::Chat => summary_chat,
-            DiffSource::Uncommitted => summary_git.unwrap_or_default(),
-        };
+        let summary_chat = DiffSummary { files: self.chat.files.len(), ..DiffSummary::default() };
+        let summary_git = self.git.loaded.then(|| DiffSummary { files: self.git.files.len(), ..DiffSummary::default() });
         let header = self.render_header(summary_chat, summary_git, cx);
 
-        let body = if summary.files == 0 {
+        let body = if self.rows.is_empty() {
             self.render_empty(cx)
         } else {
-            // Draw files until the line budget runs out; the rest start folded.
-            let mut budget = MAX_LINES_TOTAL;
-            let mut list = v_flex().pb(px(12.));
-            for (ix, file) in self.files().iter().enumerate() {
-                let lines = file.diff.lines().count().min(MAX_LINES_PER_FILE);
-                let over_budget = lines > budget;
-                if !over_budget && !self.collapsed.contains(&self.key(&file.path)) {
-                    budget -= lines;
-                }
-                list = list.child(self.render_file(ix, file, over_budget, cx));
-            }
             div()
                 .relative()
                 .flex_1()
                 .min_h_0()
                 .child(
-                    div()
-                        .id("diff-panel-files")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll)
-                        .child(self.render_summary(summary, cx))
-                        .child(list),
+                    list(self.list.clone(), cx.processor(|this, ix, window, cx| this.render_row(ix, window, cx)))
+                        .size_full(),
                 )
-                .vertical_scrollbar(&self.scroll)
+                .vertical_scrollbar(&self.list)
                 .into_any_element()
         };
 

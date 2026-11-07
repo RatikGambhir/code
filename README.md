@@ -49,9 +49,39 @@ turn stream, approve commands and edits, and interrupt.
   Readable `String`/`Vec`/`HashMap`/`Option` values come from your Rust
   toolchain's LLDB formatters, and stepping into the standard library
   needs `rustup component add rust-src`.
-- Optional language servers for other languages on your `PATH`:
-  `typescript-language-server`, `pyright-langserver`, `gopls`, `clangd`,
-  `zls`, `vscode-{css,html,json}-language-server`
+- Language servers for other languages are picked per file from the
+  project around it (see *Languages and projects* below). Hangar uses the
+  project's own (`node_modules/.bin`), then your `PATH`, `~/go/bin` and
+  `~/.bun/bin`, then any it installed itself: **Install Missing Language
+  Servers** in the command palette installs what open files needed (npm
+  packages with npm or Bun, Go tools with `go install`) into
+  `~/Library/Application Support/Hangar/language-servers`.
+
+## Languages and projects
+
+Opening a file detects its project by walking up to the markers each
+ecosystem leaves, and starts the servers that apply, once per project
+root (one TypeScript server per package-manager workspace, one gopls per
+Go module or `go.work`). The status bar shows what was found, such as
+`Bun · TypeScript · Next.js · Tailwind` or `Go 1.23 · Gin`; clicking it
+(or **Run Project Task…**) lists the project's commands and runs one in a
+terminal.
+
+| | Detected from | Servers |
+|---|---|---|
+| TypeScript 7+ | installed `typescript` ≥ 7, or none installed | its own `tsc --lsp` (`tsgo` with `@typescript/native-preview`) |
+| TypeScript ≤ 6 | `node_modules/typescript/lib/tsserver.js` | `typescript-language-server` or `vtsls` on the project's tsserver |
+| Node / Bun / Deno | lockfiles, `bunfig.toml`, `@types/bun`, `deno.json` | Deno's `deno lsp` replaces TypeScript and ESLint |
+| Vue, Svelte, Astro, Angular | dependencies | `vue-language-server`, `svelteserver`, `astro-ls`, `ngserver` |
+| ESLint, Biome, oxlint | config files or dependencies | their servers, as linters beside the primary one |
+| Tailwind | `tailwindcss` or a config | `tailwindcss-language-server`, its completions merged in |
+| Go | `go.mod`, `go.work` | `gopls` (staticcheck on); `golangci-lint-langserver` with a `.golangci.*` config; `templ lsp` for `.templ` |
+| JSON, YAML | always | schemas for `package.json`, `tsconfig.json`, `deno.json`, `biome.json` and others |
+
+Tasks come from `package.json` scripts (run with the project's package
+manager), `deno.json` tasks, and for Go `go run/test/build/vet`, `go mod
+tidy`, `go generate`, plus `golangci-lint`, `templ generate`, `air`,
+`sqlc` and `buf` when the project uses them.
 
 ## Build and run
 
@@ -107,7 +137,10 @@ live_claude` (version, account and models, which bill nothing; add
 `HANGAR_CLAUDE_LIVE_TURN=1` for a real turn on Claude Haiku 5.5, or set
 `HANGAR_CLAUDE_LIVE_MODEL`). `cargo test -p cockpit-notebook --test
 rust_analyzer_live -- --ignored` checks completion inside a notebook cell
-against the installed rust-analyzer.
+against the installed rust-analyzer. `cargo test -p cockpit-editor --test
+live_go_and_typescript` drives gopls and TypeScript 6 and 7 through project
+detection; set `HANGAR_LANGUAGE_SERVERS=<dir>` (and `HANGAR_TEST_INSTALL=1`
+to install missing servers there first) to use managed installs.
 
 ## Keys
 
@@ -131,7 +164,7 @@ against the installed rust-analyzer.
 | ⌘L | Ask the agent (Enter sends, ⇧Enter newline, ⌃C stops the turn) |
 | ⇧⌘N | New agent thread |
 | ⇧⌘A | Chat mode: the conversation fills the window, history in the sidebar (again to hide the history) |
-| ⇧⌘D | Show or hide the chat's changes (this chat, or everything uncommitted) |
+| ⇧⌘D | Show or hide the chat's changes (this chat, or everything uncommitted). The panel also slides out on its own when the agent writes a file, on the file it touched; closing it keeps it closed for that conversation |
 | ⌃R / ⌃D | Run / debug the selected configuration (in the editor) |
 | ⌃⇧R / ⌃⇧D | Run / debug the test or `fn main` at the cursor |
 | ⌘F2, ⌘F5 | Stop, rerun under the debugger |
@@ -140,6 +173,22 @@ against the installed rust-analyzer.
 | ⌘F8, ⇧⌘F8 | Toggle breakpoint, view breakpoints |
 | ⌥F8, ⌘5 | Evaluate expression, debug panel |
 | ⌘↵, ⇧⌘↵, ⇧⌥F | In a notebook cell: run it, add a cell below, format it |
+
+## Tasks
+
+The checklist button under Chat in the left rail opens Tasks: projects and
+issues in a Linear-style list (grouped by status, with priority, labels,
+project and assignee), a projects table with progress, and the open issue's
+details beside the list.
+
+- *This workspace*: a local board kept in Hangar's data directory (one JSON
+  file per folder, nothing written into the repo). Add issues with New issue
+  or + on a status group, and set status, priority and project in the
+  details pane.
+- *Linear*: choose Connect Linear and paste a personal API key (Linear →
+  Settings → Security & access). It is checked with Linear and kept in the
+  macOS Keychain. Hangar pulls your projects and your 500 most recently
+  updated issues, read-only; Open in Linear jumps to the item.
 
 ## Run and debug
 
@@ -268,7 +317,8 @@ crates/
                 building and running cells in a throwaway crate,
                 deleting its build files)
   editor        documents, file tree, fuzzy finder, search, file watcher,
-                language server client
+                project detection, language server catalog, installer
+                and client
   terminal      PTY + vt100 emulation, key encoding, URL detection
   git           git CLI wrapper and porcelain v2 status parser
   persistence   SQLite (WAL) with a typed, readable SQL builder; every write

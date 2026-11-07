@@ -31,6 +31,8 @@ actions!(
         NavigateBack,
         NavigateForward,
         RestartLanguageServers,
+        InstallLanguageServers,
+        RunProjectTask,
         About,
         Quit,
     ]

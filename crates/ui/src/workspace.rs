@@ -2,7 +2,7 @@
 //! title and status bars. It owns the wiring between them.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -42,6 +42,8 @@ use crate::{
     appearance::{AppearanceEvent, AppearancePanel},
     assets::icon,
     chat::{ChatHistory, ChatHistoryEvent, DiffPanel, DiffPanelEvent},
+    tasks::{TasksModel, TasksSidebar, TasksView},
+    github::{GitHubModel, GitHubSidebar, GitHubView},
     chrome,
     browser_view::{BrowserEvent, BrowserView},
     debug::{
@@ -53,7 +55,7 @@ use crate::{
     explorer::{Explorer, ExplorerEvent},
     lsp::{LspEvent, LspManager, Target},
     notebook::{NotebookEvent, NotebookView},
-    palette::{LocationItem, Palette, PaletteEvent},
+    palette::{LocationItem, Palette, PaletteEvent, TaskItem},
     pane::{Pane, PaneEvent, PaneItem},
     search_panel::{SearchPanel, SearchPanelEvent},
     source_control::{SourceControl, SourceControlEvent},
@@ -81,6 +83,13 @@ enum SidebarView {
     /// Chat mode: the conversation fills the center and the sidebar lists
     /// past chats.
     Chats,
+    /// Tasks mode: projects and issues fill the center, the sidebar lists
+    /// views and projects.
+    Tasks,
+    /// GitHub mode: a repository fills the center, the sidebar lists the
+    /// account's repositories.
+    #[serde(rename = "github")]
+    GitHub,
 }
 
 /// What the bottom dock shows.
@@ -139,6 +148,13 @@ pub struct Workspace {
     agent_panel: Entity<AgentPanel>,
     chat_history: Entity<ChatHistory>,
     diff_panel: Entity<DiffPanel>,
+    /// Conversations whose diff panel the user closed: their edits no
+    /// longer open it.
+    diff_dismissed: HashSet<String>,
+    tasks_sidebar: Entity<TasksSidebar>,
+    tasks_view: Entity<TasksView>,
+    github_sidebar: Entity<GitHubSidebar>,
+    github_view: Entity<GitHubView>,
     /// The browser tab Codex drives.
     agent_browser: Option<WeakEntity<BrowserView>>,
     debugger: Entity<Debugger>,
@@ -187,12 +203,22 @@ impl Workspace {
         let explorer = cx.new(|cx| Explorer::new(root.clone(), cx));
         let source_control = cx.new(|cx| SourceControl::new(root.clone(), window, cx));
         let search = cx.new(|cx| SearchPanel::new(root.clone(), window, cx));
-        let lsp = cx.new(|_| LspManager::new(root.clone()));
+        let tools = cockpit_editor::lsp::ToolDirs {
+            search: cockpit_common::shell_env::common_tool_dirs(),
+            managed: Some(cockpit_editor::lsp::ManagedDir::new(AppState::global(cx).paths.language_servers_dir())),
+        };
+        let lsp = cx.new(|_| LspManager::new(root.clone(), tools));
         let panes = [cx.new(Pane::new), cx.new(Pane::new)];
         let agent = cx.new(|cx| AgentController::new(record.id, root.clone(), cx));
         let agent_panel = cx.new(|cx| AgentPanel::new(agent.clone(), window, cx));
         let chat_history = cx.new(|cx| ChatHistory::new(agent.clone(), window, cx));
         let diff_panel = cx.new(|cx| DiffPanel::new(agent.clone(), source_control.clone(), cx));
+        let tasks = cx.new(|cx| TasksModel::new(root.clone(), cx));
+        let tasks_sidebar = cx.new(|cx| TasksSidebar::new(tasks.clone(), cx));
+        let tasks_view = cx.new(|cx| TasksView::new(tasks, window, cx));
+        let github = cx.new(GitHubModel::new);
+        let github_sidebar = cx.new(|cx| GitHubSidebar::new(github.clone(), window, cx));
+        let github_view = cx.new(|cx| GitHubView::new(github, window, cx));
         let debugger = cx.new(|cx| Debugger::new(root.clone(), record.id, cx));
         let debug_panel = cx.new(|cx| DebugPanel::new(debugger.clone(), window, cx));
 
@@ -228,11 +254,26 @@ impl Workspace {
                     }
                 }
             }),
-            cx.subscribe_in(&lsp, window, |this, lsp, event: &LspEvent, _, cx| {
-                if let LspEvent::Diagnostics(path) = event {
-                    let diagnostics = lsp.read(cx).diagnostics(path).to_vec();
-                    for editor in this.editors_for(path, cx) {
-                        editor.update(cx, |editor, cx| editor.set_diagnostics(&diagnostics, cx));
+            cx.subscribe_in(&lsp, window, |this, lsp, event: &LspEvent, window, cx| {
+                match event {
+                    LspEvent::Diagnostics(path) => {
+                        let diagnostics = lsp.read(cx).diagnostics(path);
+                        for editor in this.editors_for(path, cx) {
+                            editor.update(cx, |editor, cx| editor.set_diagnostics(&diagnostics, cx));
+                        }
+                    }
+                    LspEvent::StatusChanged => {}
+                    LspEvent::Missing { server, hint } => {
+                        let message = format!("The {server} language server is {hint}.");
+                        window.push_notification(Notification::info(message), cx);
+                    }
+                    LspEvent::Installed(Ok(installed)) => {
+                        let message = format!("Installed {}. Restarting language servers…", installed.join(", "));
+                        window.push_notification(Notification::info(message), cx);
+                        this.restart_language_servers(window, cx);
+                    }
+                    LspEvent::Installed(Err(err)) => {
+                        window.push_notification(Notification::error(format!("Install failed: {err}")), cx);
                     }
                 }
                 cx.notify();
@@ -255,6 +296,7 @@ impl Workspace {
                     this.open_read_only(title, "diff", diff.clone(), window, cx);
                 }
                 DiffPanelEvent::Close => this.toggle_diff(window, cx),
+                DiffPanelEvent::ChangesApplied { thread_id } => this.reveal_agent_changes(thread_id, cx),
             }),
             cx.observe(&agent, |_, _, cx| cx.notify()),
             cx.subscribe_in(&debugger, window, Self::on_debugger_event),
@@ -329,6 +371,11 @@ impl Workspace {
             agent_panel,
             chat_history,
             diff_panel,
+            diff_dismissed: HashSet::new(),
+            tasks_sidebar,
+            tasks_view,
+            github_sidebar,
+            github_view,
             agent_browser: None,
             debugger,
             debug_panel,
@@ -555,7 +602,7 @@ impl Workspace {
             );
             return None;
         }
-        let diagnostics = self.lsp.read(cx).diagnostics(&path).to_vec();
+        let diagnostics = self.lsp.read(cx).diagnostics(&path);
         if !diagnostics.is_empty() {
             editor.update(cx, |editor, cx| editor.set_diagnostics(&diagnostics, cx));
         }
@@ -674,6 +721,60 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// Installs the language servers that open files needed and that were
+    /// not found; servers restart once that is done.
+    fn install_language_servers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let lsp = self.lsp.read(cx);
+        let message = if lsp.is_installing() {
+            "Language servers are already being installed.".to_string()
+        } else if lsp.missing_servers().is_empty() {
+            "No missing language servers that Hangar can install. Open a file to detect what its project needs.".to_string()
+        } else {
+            let servers = lsp.missing_servers().join(", ");
+            self.lsp.update(cx, |lsp, cx| lsp.install_missing(cx));
+            format!("Installing {servers}…")
+        };
+        window.push_notification(Notification::info(message), cx);
+        cx.notify();
+    }
+
+    /// Lists the commands the active file's project offers: package
+    /// scripts with its package manager, `go test`, linters.
+    fn show_project_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.active_pane().read(cx).active_editor().map(|editor| editor.read(cx).path().to_path_buf());
+        let tasks = self.lsp.read(cx).tasks(path.as_deref());
+        if tasks.is_empty() {
+            window.push_notification(
+                Notification::info("No project tasks found: no package.json, deno.json or go.mod around this file."),
+                cx,
+            );
+            return;
+        }
+        let items = tasks.into_iter().map(|task| TaskItem::new(task, &self.root)).collect();
+        let palette = cx.new(|cx| Palette::tasks(items, window, cx));
+        self.show_palette(palette, None, window, cx);
+    }
+
+    /// Runs a project task in a new terminal tab, through the login shell so
+    /// version managers (nvm, asdf) and aliases apply.
+    fn run_project_task(&mut self, task: cockpit_editor::project::ProjectTask, window: &mut Window, cx: &mut Context<Self>) {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        let command_line = std::iter::once(task.program.as_str())
+            .chain(task.args.iter().map(String::as_str))
+            .map(shell_quote)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let terminal = self.ensure_terminal(window, cx);
+        terminal.update(cx, |panel, cx| {
+            panel.add_terminal_in(task.cwd.clone(), Some((shell, vec!["-l".into(), "-c".into(), command_line])), cx);
+            panel.focus_active(window, cx);
+        });
+        self.layout.terminal_visible = true;
+        self.layout.bottom = BottomTool::Terminal;
+        self.save_layout(cx);
+        cx.notify();
     }
 
     /// Stops every language server and reconnects the open editors, which
@@ -1118,6 +1219,8 @@ impl Workspace {
             (true, SidebarView::Explorer) => window.focus(&self.explorer.focus_handle(cx)),
             (true, SidebarView::SourceControl) => window.focus(&self.source_control.focus_handle(cx)),
             (true, SidebarView::Chats) => window.focus(&self.agent_panel.focus_handle(cx)),
+            (true, SidebarView::Tasks) => window.focus(&self.tasks_view.focus_handle(cx)),
+            (true, SidebarView::GitHub) => window.focus(&self.github_view.focus_handle(cx)),
             (false, _) => self.focus_center(window, cx),
         }
         self.sync_chat_mode(cx);
@@ -1147,9 +1250,50 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Back to the editor, e.g. because a file is being opened.
+    /// The task views fill the center instead of the editor.
+    fn tasks_mode(&self) -> bool {
+        self.layout.sidebar == SidebarView::Tasks
+    }
+
+    /// The tasks tab: enters tasks mode with its sidebar out; once in it,
+    /// slides the sidebar in and out.
+    fn show_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tasks_mode() {
+            self.layout.sidebar_visible = !self.layout.sidebar_visible;
+        } else {
+            self.layout.sidebar = SidebarView::Tasks;
+            self.layout.sidebar_visible = true;
+        }
+        self.sync_chat_mode(cx);
+        window.focus(&self.tasks_view.focus_handle(cx));
+        self.save_layout(cx);
+        cx.notify();
+    }
+
+    /// The GitHub view fills the center instead of the editor.
+    fn github_mode(&self) -> bool {
+        self.layout.sidebar == SidebarView::GitHub
+    }
+
+    /// The GitHub tab: enters GitHub mode with the repository list out; once
+    /// in it, slides the list in and out.
+    fn show_github(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.github_mode() {
+            self.layout.sidebar_visible = !self.layout.sidebar_visible;
+        } else {
+            self.layout.sidebar = SidebarView::GitHub;
+            self.layout.sidebar_visible = true;
+        }
+        self.sync_chat_mode(cx);
+        window.focus(&self.github_view.focus_handle(cx));
+        self.save_layout(cx);
+        cx.notify();
+    }
+
+    /// Back to the editor from chat, tasks or GitHub, e.g. because a file is
+    /// being opened.
     fn leave_chat(&mut self, cx: &mut Context<Self>) {
-        if !self.chat_mode() {
+        if !self.chat_mode() && !self.tasks_mode() && !self.github_mode() {
             return;
         }
         self.layout.sidebar = SidebarView::Explorer;
@@ -1163,6 +1307,15 @@ impl Workspace {
     fn toggle_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.chat_mode() {
             self.layout.diff_visible = !self.layout.diff_visible;
+            // Closing it keeps it closed for this conversation's later edits;
+            // opening it again lets it follow them.
+            if let Some(thread_id) = self.agent.read(cx).active_thread().map(|t| t.id.clone()) {
+                if self.layout.diff_visible {
+                    self.diff_dismissed.remove(&thread_id);
+                } else {
+                    self.diff_dismissed.insert(thread_id);
+                }
+            }
         } else {
             self.layout.sidebar = SidebarView::Chats;
             self.layout.diff_visible = true;
@@ -1173,6 +1326,28 @@ impl Workspace {
         }
         self.sync_chat_mode(cx);
         self.save_layout(cx);
+        cx.notify();
+    }
+
+    /// The agent just wrote files: slide the diff panel out beside the chat
+    /// on the file it touched, unless the user closed the panel for this
+    /// conversation. Outside chat mode the docked agent shows edits inline.
+    fn reveal_agent_changes(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        if !self.chat_mode() || self.diff_dismissed.contains(thread_id) {
+            return;
+        }
+        let opening = !self.layout.diff_visible;
+        if opening {
+            self.layout.diff_visible = true;
+            self.sync_chat_mode(cx);
+            self.save_layout(cx);
+        }
+        self.diff_panel.update(cx, |panel, cx| {
+            if opening {
+                panel.shown(cx);
+            }
+            panel.reveal_latest(cx);
+        });
         cx.notify();
     }
 
@@ -1357,6 +1532,11 @@ impl Workspace {
                             this.jump_to(target, window, cx);
                         }
                     }
+                }
+                PaletteEvent::RunTask(task) => {
+                    let task = task.clone();
+                    this.close_palette(window, cx);
+                    this.run_project_task(task, window, cx);
                 }
                 PaletteEvent::Run(action) => {
                     let action = action.boxed_clone();
@@ -1622,6 +1802,24 @@ impl Workspace {
                     }))
                     .on_click(cx.listener(|this, _, window, cx| this.show_chat(window, cx))),
             )
+            .child(
+                chrome::frame_button("activity-tasks", icon("list-todo"), self.tasks_mode(), cx)
+                    .tooltip(chrome::tooltip(if self.tasks_mode() && self.layout.sidebar_visible {
+                        "Hide task views"
+                    } else {
+                        "Tasks"
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| this.show_tasks(window, cx))),
+            )
+            .child(
+                chrome::frame_button("activity-github", IconName::GitHub, self.github_mode(), cx)
+                    .tooltip(chrome::tooltip(if self.github_mode() && self.layout.sidebar_visible {
+                        "Hide repositories"
+                    } else {
+                        "GitHub"
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| this.show_github(window, cx))),
+            )
             .child(div().flex_1())
             .child(
                 chrome::frame_button("activity-browser", IconName::Globe, false, cx)
@@ -1641,6 +1839,8 @@ impl Workspace {
             SidebarView::SourceControl => cached(&self.source_control),
             SidebarView::Search => cached(&self.search),
             SidebarView::Chats => cached(&self.chat_history),
+            SidebarView::Tasks => cached(&self.tasks_sidebar),
+            SidebarView::GitHub => cached(&self.github_sidebar),
         }
     }
 
@@ -1658,6 +1858,12 @@ impl Workspace {
     fn render_center(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.chat_mode() {
             return cached(&self.agent_panel);
+        }
+        if self.tasks_mode() {
+            return cached(&self.tasks_view);
+        }
+        if self.github_mode() {
+            return cached(&self.github_view);
         }
         if !self.layout.split {
             return cached(&self.panes[0]);
@@ -1766,6 +1972,7 @@ impl Workspace {
                 format!("Ln {}, Col {}", cursor.line + 1, cursor.character + 1),
                 editor.language(),
                 editor.line_ending(),
+                lsp.project_label(editor.path()),
             )
         });
         let agent = self.agent.read(cx);
@@ -1844,8 +2051,16 @@ impl Workspace {
                 )
             })
             .child(div().flex_1())
-            .when_some(editor_info, |el, (position, language, ending)| {
+            .when_some(editor_info, |el, (position, language, ending, project)| {
                 el.child(div().px(px(6.)).child(position))
+                    .when_some(project, |el, project| {
+                        el.child(
+                            clickable("status-project")
+                                .text_color(muted)
+                                .child(project)
+                                .on_click(cx.listener(|this, _, window, cx| this.show_project_tasks(window, cx))),
+                        )
+                    })
                     .child(div().px(px(6.)).child(language))
                     .child(div().px(px(6.)).child(ending))
             })
@@ -2530,6 +2745,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &actions::NavigateForward, window, cx| {
                 this.navigate_history(false, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &actions::InstallLanguageServers, window, cx| {
+                this.install_language_servers(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &actions::RunProjectTask, window, cx| {
+                this.show_project_tasks(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &actions::RestartLanguageServers, window, cx| {
                 this.restart_language_servers(window, cx)
             }))
@@ -2668,4 +2889,16 @@ fn location_items(root: &Path, targets: Vec<Target>) -> Vec<LocationItem> {
             LocationItem::new(target, root, preview)
         })
         .collect()
+}
+
+/// `arg` as one word for a POSIX shell: as is when it is plain, else in
+/// single quotes.
+fn shell_quote(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c));
+    if plain {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
 }

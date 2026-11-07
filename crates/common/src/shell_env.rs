@@ -117,12 +117,26 @@ pub fn common_tool_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
+        // The official Go installer.
+        PathBuf::from("/usr/local/go/bin"),
     ];
+    // `go install` puts tools in $GOBIN, else $GOPATH/bin, else ~/go/bin.
+    if let Some(dir) = std::env::var_os("GOBIN") {
+        dirs.push(PathBuf::from(dir));
+    }
+    if let Some(gopath) = std::env::var_os("GOPATH") {
+        dirs.extend(std::env::split_paths(&gopath).map(|dir| dir.join("bin")));
+    }
     if let Some(home) = dirs::home_dir() {
         dirs.push(home.join(".cargo/bin"));
         dirs.push(home.join(".local/bin"));
+        dirs.push(home.join("go/bin"));
         dirs.push(home.join(".npm-global/bin"));
         dirs.push(home.join(".bun/bin"));
+        dirs.push(home.join(".deno/bin"));
+        dirs.push(home.join(".volta/bin"));
+        dirs.push(home.join("Library/pnpm"));
+        dirs.push(home.join(".yarn/bin"));
     }
     dirs
 }
