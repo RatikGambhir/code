@@ -1126,6 +1126,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-github"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "cockpit-common",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "tracing",
+ "ureq",
+]
+
+[[package]]
 name = "cockpit-notebook"
 version = "0.1.0"
 dependencies = [
@@ -1176,6 +1190,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-tasks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "cockpit-common",
+ "getrandom 0.3.4",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+ "ureq",
+]
+
+[[package]]
 name = "cockpit-terminal"
 version = "0.1.0"
 dependencies = [
@@ -1204,9 +1235,11 @@ dependencies = [
  "cockpit-debugger",
  "cockpit-editor",
  "cockpit-git",
+ "cockpit-github",
  "cockpit-notebook",
  "cockpit-orchestrator",
  "cockpit-persistence",
+ "cockpit-tasks",
  "cockpit-terminal",
  "futures",
  "gpui",

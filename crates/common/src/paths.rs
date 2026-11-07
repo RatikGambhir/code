@@ -77,6 +77,11 @@ impl AppPaths {
         self.browser_profiles_dir().join(safe)
     }
 
+    /// Language servers Hangar installs itself (npm packages, Go tools).
+    pub fn language_servers_dir(&self) -> PathBuf {
+        self.root.join("language-servers")
+    }
+
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }

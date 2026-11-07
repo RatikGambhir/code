@@ -28,7 +28,6 @@ use gpui_component::{
     input::{Input, InputEvent, InputState, RopeExt as _, TabSize},
     v_flex, Sizable as _,
 };
-use serde_json::Value as Json;
 
 use crate::{
     actions::{self, NOTEBOOK_CELL_CONTEXT},
@@ -270,8 +269,7 @@ impl NotebookView {
                 return Ok(None);
             };
             if let Some(overrides) = analysis.settings() {
-                let base = config.settings.take().unwrap_or_else(|| Json::Object(Default::default()));
-                config.settings = Some(merge_settings(base, overrides));
+                config.merge_settings(overrides);
             }
             LspClient::start(&config, analysis.root()).await.map(Some)
         });
@@ -964,40 +962,5 @@ impl Render for NotebookView {
                     .child(self.render_header(cx))
                     .children(cells),
             )
-    }
-}
-
-
-/// `overrides` laid over `base`, object by object.
-fn merge_settings(mut base: Json, overrides: Json) -> Json {
-    match (&mut base, overrides) {
-        (Json::Object(base_map), Json::Object(overrides)) => {
-            for (key, value) in overrides {
-                let merged = match base_map.remove(&key) {
-                    Some(existing) => merge_settings(existing, value),
-                    None => value,
-                };
-                base_map.insert(key, merged);
-            }
-            base
-        }
-        (_, overrides) => overrides,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    #[test]
-    fn settings_merge_object_by_object() {
-        let merged = super::merge_settings(
-            json!({"cargo": {"buildScripts": {"enable": true}, "allTargets": true}, "checkOnSave": true}),
-            json!({"cargo": {"allTargets": false, "targetDir": "/t"}, "checkOnSave": false}),
-        );
-        assert_eq!(
-            merged,
-            json!({"cargo": {"buildScripts": {"enable": true}, "allTargets": false, "targetDir": "/t"}, "checkOnSave": false})
-        );
     }
 }

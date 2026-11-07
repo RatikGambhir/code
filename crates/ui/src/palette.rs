@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use cockpit_editor::{fs_tree, fuzzy};
+use cockpit_editor::{fs_tree, fuzzy, project::ProjectTask};
 use gpui::{
     div, prelude::*, px, uniform_list, Action, AnyElement, App, Context, Entity, EventEmitter,
     FocusHandle, Focusable, SharedString, Subscription, UniformListScrollHandle, Window,
@@ -29,6 +29,27 @@ pub enum PaletteEvent {
     Run(Box<dyn Action>),
     OpenFile(PathBuf),
     OpenLocation(Target),
+    RunTask(ProjectTask),
+}
+
+/// A row of the task list: a command a project offers.
+pub struct TaskItem {
+    pub task: ProjectTask,
+    /// The task's directory, relative to the workspace when inside it.
+    dir: String,
+    search: String,
+}
+
+impl TaskItem {
+    pub fn new(task: ProjectTask, root: &std::path::Path) -> Self {
+        let dir = match task.cwd.strip_prefix(root) {
+            Ok(rel) if rel.as_os_str().is_empty() => String::new(),
+            Ok(rel) => rel.display().to_string(),
+            Err(_) => task.cwd.display().to_string(),
+        };
+        let search = format!("{} {} {dir}", task.label, task.detail);
+        Self { task, dir, search }
+    }
 }
 
 /// A row of a location list (references, several definitions).
@@ -62,6 +83,7 @@ enum Source {
     /// Paths relative to the root.
     Files { root: PathBuf, paths: Vec<String>, loading: bool },
     Locations(Vec<LocationItem>),
+    Tasks(Vec<TaskItem>),
 }
 
 pub struct Palette {
@@ -112,6 +134,10 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Go Back", Box::new(actions::NavigateBack)),
         ("Go Forward", Box::new(actions::NavigateForward)),
         ("Restart Language Servers", Box::new(actions::RestartLanguageServers)),
+        ("Install Missing Language Servers", Box::new(actions::InstallLanguageServers)),
+        ("Trust This Workspace", Box::new(actions::TrustWorkspace)),
+        ("Stop Trusting This Workspace", Box::new(actions::UntrustWorkspace)),
+        ("Run Project Task…", Box::new(actions::RunProjectTask)),
         ("Run", Box::new(actions::RunSelected)),
         ("Debug", Box::new(actions::DebugSelected)),
         ("Run Test or Main at Cursor", Box::new(actions::RunAtCursor)),
@@ -182,6 +208,11 @@ impl Palette {
         Self::new(Source::Locations(items), title, window, cx)
     }
 
+    /// The commands a project offers (package scripts, `go test`).
+    pub fn tasks(items: Vec<TaskItem>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new(Source::Tasks(items), "Run a task", window, cx)
+    }
+
     fn new(source: Source, placeholder: impl Into<SharedString>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let subscriptions = vec![cx.subscribe(&query, |this, _, event: &InputEvent, cx| match event {
@@ -208,6 +239,7 @@ impl Palette {
             Source::Commands(commands) => commands.len(),
             Source::Files { paths, .. } => paths.len(),
             Source::Locations(items) => items.len(),
+            Source::Tasks(items) => items.len(),
         }
     }
 
@@ -239,6 +271,7 @@ impl Palette {
             Source::Commands(commands) => commands[ix].label,
             Source::Files { paths, .. } => paths[ix].as_str(),
             Source::Locations(items) => items[ix].search.as_str(),
+            Source::Tasks(items) => items[ix].search.as_str(),
         }
     }
 
@@ -258,6 +291,7 @@ impl Palette {
             Source::Commands(commands) => cx.emit(PaletteEvent::Run(commands[index].action.boxed_clone())),
             Source::Files { root, paths, .. } => cx.emit(PaletteEvent::OpenFile(root.join(&paths[index]))),
             Source::Locations(items) => cx.emit(PaletteEvent::OpenLocation(items[index].target.clone())),
+            Source::Tasks(items) => cx.emit(PaletteEvent::RunTask(items[index].task.clone())),
         }
     }
 
@@ -317,6 +351,40 @@ impl Palette {
                                     .text_color(muted)
                                     .child(item.label.clone()),
                             )
+                    }
+                    Source::Tasks(items) => {
+                        let item = &items[ix];
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_family(t.mono.clone())
+                                    .text_size(TEXT_MONO)
+                                    .child(item.task.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(TEXT_SMALL)
+                                    .text_color(muted)
+                                    .child(item.task.detail.clone()),
+                            )
+                            .when(!item.dir.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .max_w(px(200.))
+                                        .truncate()
+                                        .text_size(TEXT_SMALL)
+                                        .text_color(muted)
+                                        .child(item.dir.clone()),
+                                )
+                            })
                     }
                 };
                 div()

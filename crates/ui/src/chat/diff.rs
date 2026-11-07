@@ -2,6 +2,7 @@
 //! the working tree's changes split per file. Pure functions, no UI.
 
 use cockpit_agents::{protocol::ItemStatus, Entry, EntryKind};
+use gpui::SharedString;
 
 /// One file's changes, ready to show.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +119,27 @@ pub fn chat_changes(entries: &[Entry]) -> Vec<FileDiff> {
         }
     }
     files
+}
+
+/// Edits that reached the disk (completed, not merely proposed), and the
+/// file the latest one touched.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppliedEdits {
+    pub count: usize,
+    pub latest: Option<String>,
+}
+
+pub fn applied_edits(entries: &[Entry]) -> AppliedEdits {
+    let mut applied = AppliedEdits::default();
+    for entry in entries {
+        if let EntryKind::FileChange { files, status: ItemStatus::Completed } = &entry.kind {
+            applied.count += 1;
+            if let Some(file) = files.last() {
+                applied.latest = Some(file.path.clone());
+            }
+        }
+    }
+    applied
 }
 
 /// Splits `git diff` output into one entry per file.
@@ -255,6 +277,36 @@ pub fn parse_lines(diff: &str) -> Vec<DiffLine<'_>> {
     out
 }
 
+/// A diff line kept for drawing: parsed once, text owned and display-ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShownLine {
+    pub kind: LineKind,
+    pub old: Option<u32>,
+    pub new: Option<u32>,
+    pub text: SharedString,
+}
+
+/// Up to `max` drawable lines of `diff`, and how many were left out.
+pub fn shown_lines(diff: &str, max: usize) -> (Vec<ShownLine>, usize) {
+    let lines = parse_lines(diff);
+    let hidden = lines.len().saturating_sub(max);
+    let shown = lines
+        .into_iter()
+        .take(max)
+        .map(|line| ShownLine {
+            kind: line.kind,
+            old: line.old,
+            new: line.new,
+            text: match line.text {
+                "" => SharedString::new_static(" "),
+                text if text.contains('\t') => text.replace('\t', "    ").into(),
+                text => SharedString::from(text.to_string()),
+            },
+        })
+        .collect();
+    (shown, hidden)
+}
+
 /// `@@ -12,7 +12,9 @@` → (12, 12).
 fn hunk_starts(line: &str) -> Option<(u32, u32)> {
     let mut parts = line.split_whitespace().skip(1);
@@ -318,6 +370,30 @@ mod tests {
             file_change("2", ItemStatus::Failed, &[("b.rs", "modified", "+x")]),
         ];
         assert!(chat_changes(&entries).is_empty());
+    }
+
+    #[test]
+    fn applied_edits_count_only_completed() {
+        let entries = [
+            file_change("1", ItemStatus::Completed, &[("a.rs", "added", "+x")]),
+            file_change("2", ItemStatus::InProgress, &[("b.rs", "modified", "+y")]),
+            file_change("3", ItemStatus::Declined, &[("c.rs", "modified", "+z")]),
+            file_change("4", ItemStatus::Completed, &[("d.rs", "modified", "+w"), ("e.rs", "modified", "+v")]),
+        ];
+        assert_eq!(applied_edits(&entries), AppliedEdits { count: 2, latest: Some("e.rs".into()) });
+    }
+
+    #[test]
+    fn shown_lines_cap_and_expand_tabs() {
+        let diff = "@@ -1,3 +1,3 @@\n-\told\n+\tnew\n \n";
+        let (lines, hidden) = shown_lines(diff, 3);
+        assert_eq!(hidden, 1);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1].text.as_ref(), "    old");
+        assert_eq!((lines[2].kind, lines[2].new), (LineKind::Added, Some(1)));
+        let (all, none) = shown_lines(diff, 10);
+        assert_eq!((all.len(), none), (4, 0));
+        assert_eq!(all[3].text.as_ref(), " ", "blank lines keep their height");
     }
 
     #[test]

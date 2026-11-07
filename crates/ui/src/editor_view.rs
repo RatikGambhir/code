@@ -1,10 +1,13 @@
 //! A code editor tab: gpui-component's rope-based editor bound to a file.
 
-use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc};
+use std::{path::PathBuf, rc::Rc, sync::Arc};
 
 use anyhow::Result;
 use cockpit_debugger::Runnable;
-use cockpit_editor::{lsp::LspClient, Document};
+use cockpit_editor::{
+    lsp::{LspClient, Role},
+    lsp_language_id_for_path, Document,
+};
 use gpui::{
     div, prelude::*, px, App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton,
     MouseDownEvent, MouseMoveEvent, SharedString, Subscription, WeakEntity, Window,
@@ -19,7 +22,7 @@ use gpui_component::{
 use crate::{
     actions::{self, CODE_EDITOR_CONTEXT},
     debug::{editor::DebugHover, Debugger},
-    lsp::{self, LspDocument, LspManager, Target},
+    lsp::{self, FileDiagnostics, LspDocument, LspManager, Target},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,9 +58,10 @@ pub struct EditorView {
     /// The file changed on disk while it had unsaved edits.
     conflict: bool,
     read_only: bool,
+    /// The primary language server's view of the file.
     lsp: Option<Rc<LspDocument>>,
-    /// The file's diagnostics, shared with the code action provider.
-    diagnostics: Rc<RefCell<Vec<lsp_types::Diagnostic>>>,
+    /// Linters' and add-ons' views of it (ESLint, Tailwind, golangci-lint).
+    other_lsp: Vec<(Role, Rc<LspDocument>)>,
     /// The text as of the last `Edited`, to tell what an edit changed.
     last_text: Rope,
     /// Lines with a run icon, and what they run.
@@ -97,12 +101,12 @@ impl EditorView {
     /// Asks the workspace's language servers for this file's server; it calls
     /// back [`Self::attach_lsp`] once that is running.
     pub fn connect_lsp(&self, lsp: &Entity<LspManager>, cx: &mut Context<Self>) {
-        let language = self.document.language();
-        if self.read_only || language == "text" {
+        let path = self.document.path().to_path_buf();
+        let Some(language) = lsp_language_id_for_path(&path).filter(|_| !self.read_only) else {
             return;
-        }
+        };
         let this = cx.entity().downgrade();
-        lsp.update(cx, |lsp, cx| lsp.attach(language, this, cx));
+        lsp.update(cx, |lsp, cx| lsp.attach(path, language, this, cx));
     }
 
     /// A read-only buffer that is not backed by a file the user edits (diffs).
@@ -160,7 +164,7 @@ impl EditorView {
             conflict: false,
             read_only,
             lsp: None,
-            diagnostics: Rc::default(),
+            other_lsp: Vec::new(),
             last_text: Rope::from(text_for_last.as_str()),
             runnables: Vec::new(),
             debugger: None,
@@ -208,7 +212,7 @@ impl EditorView {
         self.document.save(&text)?;
         self.dirty = false;
         self.conflict = false;
-        if let Some(doc) = &self.lsp {
+        for doc in self.lsp_documents() {
             doc.saved(&text);
         }
         cx.emit(EditorEvent::Saved(self.document.path().to_path_buf()));
@@ -271,25 +275,40 @@ impl EditorView {
 
     // --- language server ---------------------------------------------------
 
-    pub fn attach_lsp(&mut self, client: Arc<LspClient>, cx: &mut Context<Self>) {
-        if self.lsp.is_some() {
+    /// Every language server document for the file, primary first.
+    fn lsp_documents(&self) -> impl Iterator<Item = &Rc<LspDocument>> {
+        self.lsp.iter().chain(self.other_lsp.iter().map(|(_, doc)| doc))
+    }
+
+    /// Connects to one of the file's servers (`key` identifies it), which
+    /// plays `role` for it.
+    pub fn attach_lsp(&mut self, client: Arc<LspClient>, key: String, role: Role, cx: &mut Context<Self>) {
+        if self.lsp_documents().any(|doc| doc.key == key) {
+            return;
+        }
+        if role == Role::Primary && self.lsp.is_some() {
             return;
         }
         let path = self.document.path().to_path_buf();
+        let Some(language) = lsp_language_id_for_path(&path) else { return };
         let text = self.input.read(cx).text().clone();
-        let doc = match LspDocument::open(client, path, self.document.language(), &text, self.diagnostics.clone()) {
+        let doc = match LspDocument::open(client, key, path, language, &text) {
             Ok(doc) => doc,
             Err(err) => {
                 tracing::warn!("didOpen {}: {err:#}", self.document.path().display());
                 return;
             }
         };
-        self.input.update(cx, |input, _| lsp::install_providers(&doc, input));
-        self.lsp = Some(doc);
+        match role {
+            Role::Primary => self.lsp = Some(doc),
+            Role::Linter | Role::Addon => self.other_lsp.push((role, doc)),
+        }
+        let (primary, others) = (self.lsp.clone(), self.other_lsp.clone());
+        self.input.update(cx, |input, _| lsp::install_all(primary.as_ref(), &others, input));
         self.install_debug_hover(cx);
     }
 
-    /// Disconnects from the language server (it is restarting).
+    /// Disconnects from the language servers (they are restarting).
     pub fn detach_lsp(&mut self, cx: &mut Context<Self>) {
         self.detach();
         self.input.update(cx, |input, _| lsp::remove_providers(input));
@@ -329,8 +348,10 @@ impl EditorView {
     }
 
     fn sync_lsp(&mut self, cx: &mut Context<Self>) {
-        let Some(doc) = &self.lsp else { return };
-        doc.sync(self.input.read(cx).text());
+        let text = self.input.read(cx).text();
+        for doc in self.lsp.iter().chain(self.other_lsp.iter().map(|(_, doc)| doc)) {
+            doc.sync(text);
+        }
     }
 
     /// The cursor as a [`Target`], where a jump returns to.
@@ -424,9 +445,13 @@ impl EditorView {
         }
     }
 
-    pub fn set_diagnostics(&mut self, diagnostics: &[lsp_types::Diagnostic], cx: &mut Context<Self>) {
-        *self.diagnostics.borrow_mut() = diagnostics.to_vec();
-        let diagnostics = diagnostics.to_vec();
+    /// Shows every server's diagnostics, and hands each server back its own
+    /// for code actions.
+    pub fn set_diagnostics(&mut self, by_server: &FileDiagnostics, cx: &mut Context<Self>) {
+        for doc in self.lsp_documents() {
+            doc.set_diagnostics(by_server.get(&doc.key).cloned().unwrap_or_default());
+        }
+        let diagnostics: Vec<lsp_types::Diagnostic> = by_server.values().flatten().cloned().collect();
         self.input.update(cx, |input, cx| {
             if let Some(set) = input.diagnostics_mut() {
                 set.clear();
@@ -437,7 +462,7 @@ impl EditorView {
     }
 
     pub fn detach(&mut self) {
-        if let Some(doc) = self.lsp.take() {
+        for doc in self.lsp.take().into_iter().chain(self.other_lsp.drain(..).map(|(_, doc)| doc)) {
             doc.close();
         }
     }

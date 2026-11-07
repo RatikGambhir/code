@@ -7,10 +7,11 @@
 //! answered automatically, since many servers stall waiting for them.
 
 pub mod codec;
+mod install;
 mod registry;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -31,7 +32,10 @@ use lsp_types::{
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
-pub use registry::{install_hint, resolve_server, server_for_language, server_key, ServerConfig};
+pub use install::{Install, ManagedDir};
+pub use registry::{
+    all_servers, merge_json, plan, resolve_server, ResolveError, Role, ServerConfig, ServerPlan, ServerSpec, ToolDirs,
+};
 
 /// What a server's column numbers count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +82,30 @@ pub struct ResponseError {
 
 /// Requests awaiting a response; `None` once the server is gone, so later
 /// requests fail immediately rather than waiting forever.
-type Pending = Arc<Mutex<Option<HashMap<i64, oneshot::Sender<Result<Value, ResponseError>>>>>>;
+type Pending = Arc<Mutex<Option<HashMap<i64, Waiter>>>>;
+
+/// Who gets the answer to a request.
+enum Waiter {
+    /// A future, through [`LspClient::request`].
+    Response(oneshot::Sender<Result<Value, ResponseError>>),
+    /// A pull for a document's diagnostics: the answer becomes a
+    /// [`ServerEvent::Diagnostics`] like a pushed one.
+    Diagnostics(Uri),
+}
+
+/// Pull-diagnostics bookkeeping, for servers that only answer
+/// `textDocument/diagnostic` (TypeScript 7) instead of publishing.
+#[derive(Default)]
+struct Pulls {
+    /// Documents open on the server.
+    open: HashSet<Uri>,
+    /// Documents with a pull on the way.
+    in_flight: HashSet<Uri>,
+    /// Documents that changed while their pull was on the way: pulled again
+    /// when it lands, so a burst of keystrokes costs two requests, not one
+    /// per keystroke.
+    again: HashSet<Uri>,
+}
 
 pub struct LspClient {
     name: String,
@@ -86,8 +113,21 @@ pub struct LspClient {
     pending: Pending,
     next_id: AtomicI64,
     capabilities: OnceLock<ServerCapabilities>,
-    settings: OnceLock<Value>,
+    configuration: OnceLock<Configuration>,
+    /// The workspace folder, for `workspace/workspaceFolders`.
+    root: OnceLock<PathBuf>,
     child: Mutex<Option<Child>>,
+    events: async_channel::Sender<ServerEvent>,
+    pulls: Mutex<Pulls>,
+}
+
+/// What the client answers `workspace/configuration` with.
+#[derive(Clone, Debug, Default)]
+struct Configuration {
+    settings: Option<Value>,
+    default_section: Option<String>,
+    initialization_options: Option<Value>,
+    push_settings: bool,
 }
 
 impl LspClient {
@@ -100,6 +140,7 @@ impl LspClient {
         let mut child = Command::new(&config.command)
             .args(&config.args)
             .current_dir(root)
+            .envs(config.env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -109,9 +150,12 @@ impl LspClient {
         let stdout = child.stdout.take().context("no stdout")?;
         let (client, events) = Self::connect(config.name.clone(), stdout, stdin);
         *client.child.lock() = Some(child);
-        if let Some(settings) = &config.settings {
-            let _ = client.settings.set(settings.clone());
-        }
+        let _ = client.configuration.set(Configuration {
+            settings: config.settings.clone(),
+            default_section: config.default_section.clone(),
+            initialization_options: config.initialization_options.clone(),
+            push_settings: config.push_settings,
+        });
         client.initialize(root).await?;
         Ok((client, events))
     }
@@ -129,8 +173,11 @@ impl LspClient {
             pending: Arc::new(Mutex::new(Some(HashMap::new()))),
             next_id: AtomicI64::new(1),
             capabilities: OnceLock::new(),
-            settings: OnceLock::new(),
+            configuration: OnceLock::new(),
+            root: OnceLock::new(),
             child: Mutex::new(None),
+            events: events_tx.clone(),
+            pulls: Mutex::default(),
         });
         let weak = Arc::downgrade(&client);
         let pending = client.pending.clone();
@@ -143,10 +190,12 @@ impl LspClient {
                 }
                 // Fail whatever was still waiting rather than hanging it.
                 for (_, waiter) in pending.lock().take().into_iter().flatten() {
-                    let _ = waiter.send(Err(ResponseError {
-                        code: -32099,
-                        message: "language server exited".into(),
-                    }));
+                    if let Waiter::Response(waiter) = waiter {
+                        let _ = waiter.send(Err(ResponseError {
+                            code: -32099,
+                            message: "language server exited".into(),
+                        }));
+                    }
                 }
                 let _ = events_tx.send_blocking(ServerEvent::Exited);
             })
@@ -210,25 +259,105 @@ impl LspClient {
         method: &str,
         params: serde_json::Result<Value>,
     ) -> Result<oneshot::Receiver<Result<Value, ResponseError>>> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
+        self.send_request(method, params?, Waiter::Response(tx))?;
+        Ok(rx)
+    }
+
+    fn send_request(&self, method: &str, params: Value, waiter: Waiter) -> Result<()> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         match self.pending.lock().as_mut() {
-            Some(map) => map.insert(id, tx),
+            Some(map) => map.insert(id, waiter),
             None => return Err(anyhow!("{} has exited", self.name)),
         };
         let sent = self.send(&json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
-            "params": params?,
+            "params": params,
         }));
-        if let Err(err) = sent {
+        if sent.is_err() {
             if let Some(map) = self.pending.lock().as_mut() {
                 map.remove(&id);
             }
-            return Err(err);
         }
-        Ok(rx)
+        sent
+    }
+
+    /// The server answers `textDocument/diagnostic` (and may never push).
+    fn pulls_diagnostics(&self) -> bool {
+        self.capabilities().is_some_and(|c| c.diagnostic_provider.is_some())
+    }
+
+    /// Asks for `uri`'s diagnostics, unless a pull for it is already on the
+    /// way (then it is pulled again when that lands).
+    fn pull_diagnostics(&self, uri: Uri) {
+        if !self.pulls_diagnostics() {
+            return;
+        }
+        {
+            let mut pulls = self.pulls.lock();
+            if !pulls.open.contains(&uri) {
+                return;
+            }
+            if !pulls.in_flight.insert(uri.clone()) {
+                pulls.again.insert(uri);
+                return;
+            }
+        }
+        let identifier = self
+            .capabilities()
+            .and_then(|c| serde_json::to_value(c.diagnostic_provider.as_ref()?).ok())
+            .and_then(|provider| provider.get("identifier").cloned())
+            .unwrap_or(Value::Null);
+        let params = json!({ "textDocument": { "uri": uri.as_str() }, "identifier": identifier });
+        if let Err(err) = self.send_request("textDocument/diagnostic", params, Waiter::Diagnostics(uri.clone())) {
+            tracing::debug!("{}: pulling diagnostics: {err:#}", self.name);
+            self.pulls.lock().in_flight.remove(&uri);
+        }
+    }
+
+    /// Every open document, after a save: with inter-file dependencies,
+    /// one file's change can fix or break another.
+    fn pull_all_diagnostics(&self) {
+        let open: Vec<Uri> = self.pulls.lock().open.iter().cloned().collect();
+        for uri in open {
+            self.pull_diagnostics(uri);
+        }
+    }
+
+    /// A pull's answer: a full report becomes a `Diagnostics` event, for
+    /// the document and any related ones the server reported along.
+    fn pull_finished(&self, uri: Uri, result: Result<Value, ResponseError>) {
+        let again = {
+            let mut pulls = self.pulls.lock();
+            pulls.in_flight.remove(&uri);
+            pulls.again.remove(&uri) && pulls.open.contains(&uri)
+        };
+        match result {
+            Ok(report) => {
+                let publish = |uri: Uri, report: &Value| {
+                    if report["kind"] != "full" {
+                        return;
+                    }
+                    let Ok(diagnostics) = serde_json::from_value(report["items"].clone()) else { return };
+                    let params = lsp_types::PublishDiagnosticsParams { uri, diagnostics, version: None };
+                    let _ = self.events.send_blocking(ServerEvent::Diagnostics(params));
+                };
+                publish(uri.clone(), &report);
+                for (related, report) in report["relatedDocuments"].as_object().into_iter().flatten() {
+                    if let Ok(related) = Uri::from_str(related) {
+                        publish(related, report);
+                    }
+                }
+            }
+            // The server gave up on a stale request and asks for another.
+            Err(err) if err.code == -32802 => return self.pull_diagnostics(uri),
+            Err(err) => tracing::debug!("{}: diagnostics for {}: {err}", self.name, uri.as_str()),
+        }
+        if again {
+            self.pull_diagnostics(uri);
+        }
     }
 
     pub fn notify<N: Notification>(&self, params: N::Params) -> Result<()> {
@@ -241,6 +370,8 @@ impl LspClient {
 
     async fn initialize(&self, root: &Path) -> Result<InitializeResult> {
         let root_uri = path_to_uri(root)?;
+        let _ = self.root.set(root.to_path_buf());
+        let configuration = self.configuration.get().cloned().unwrap_or_default();
         #[allow(deprecated)]
         let params = InitializeParams {
             process_id: Some(std::process::id()),
@@ -253,7 +384,7 @@ impl LspClient {
                     .unwrap_or_default(),
             }]),
             capabilities: client_capabilities(),
-            initialization_options: self.settings.get().cloned(),
+            initialization_options: configuration.initialization_options.clone(),
             client_info: Some(lsp_types::ClientInfo {
                 name: "Hangar".into(),
                 version: Some(env!("CARGO_PKG_VERSION").into()),
@@ -263,50 +394,57 @@ impl LspClient {
         let result = self.request::<request::Initialize>(params).await?;
         let _ = self.capabilities.set(result.capabilities.clone());
         self.notify::<notification::Initialized>(lsp_types::InitializedParams {})?;
+        if let Some(settings) = configuration.settings.filter(|_| configuration.push_settings) {
+            self.notify::<notification::DidChangeConfiguration>(lsp_types::DidChangeConfigurationParams { settings })?;
+        }
         Ok(result)
     }
 
     pub fn did_open(&self, path: &Path, language_id: &str, version: i32, text: &str) -> Result<()> {
+        let uri = path_to_uri(path)?;
         self.notify::<notification::DidOpenTextDocument>(lsp_types::DidOpenTextDocumentParams {
             text_document: lsp_types::TextDocumentItem {
-                uri: path_to_uri(path)?,
+                uri: uri.clone(),
                 language_id: language_id.into(),
                 version,
                 text: text.into(),
             },
-        })
+        })?;
+        self.pulls.lock().open.insert(uri.clone());
+        self.pull_diagnostics(uri);
+        Ok(())
     }
 
     /// Sends one edit: `range` (in the server's old text) became `text`.
     /// Only for servers with [`Self::incremental_sync`].
     pub fn did_change_range(&self, path: &Path, version: i32, range: lsp_types::Range, text: &str) -> Result<()> {
+        let uri = path_to_uri(path)?;
         self.notify::<notification::DidChangeTextDocument>(lsp_types::DidChangeTextDocumentParams {
-            text_document: lsp_types::VersionedTextDocumentIdentifier {
-                uri: path_to_uri(path)?,
-                version,
-            },
+            text_document: lsp_types::VersionedTextDocumentIdentifier { uri: uri.clone(), version },
             content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
                 range: Some(range),
                 range_length: None,
                 text: text.into(),
             }],
-        })
+        })?;
+        self.pull_diagnostics(uri);
+        Ok(())
     }
 
     /// Sends the whole new text. Every server supports full sync, and for
     /// files a person edits the cost is negligible.
     pub fn did_change(&self, path: &Path, version: i32, text: &str) -> Result<()> {
+        let uri = path_to_uri(path)?;
         self.notify::<notification::DidChangeTextDocument>(lsp_types::DidChangeTextDocumentParams {
-            text_document: lsp_types::VersionedTextDocumentIdentifier {
-                uri: path_to_uri(path)?,
-                version,
-            },
+            text_document: lsp_types::VersionedTextDocumentIdentifier { uri: uri.clone(), version },
             content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
                 range: None,
                 range_length: None,
                 text: text.into(),
             }],
-        })
+        })?;
+        self.pull_diagnostics(uri);
+        Ok(())
     }
 
     pub fn did_save(&self, path: &Path, text: &str) -> Result<()> {
@@ -315,15 +453,24 @@ impl LspClient {
                 uri: path_to_uri(path)?,
             },
             text: Some(text.into()),
-        })
+        })?;
+        self.pull_all_diagnostics();
+        Ok(())
     }
 
     pub fn did_close(&self, path: &Path) -> Result<()> {
+        let uri = path_to_uri(path)?;
         self.notify::<notification::DidCloseTextDocument>(lsp_types::DidCloseTextDocumentParams {
-            text_document: lsp_types::TextDocumentIdentifier {
-                uri: path_to_uri(path)?,
-            },
-        })
+            text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+        })?;
+        let was_open = self.pulls.lock().open.remove(&uri);
+        // Nobody will pull a closed file's diagnostics again; clear them as
+        // a publishing server would.
+        if was_open && self.pulls_diagnostics() {
+            let params = lsp_types::PublishDiagnosticsParams { uri, diagnostics: Vec::new(), version: None };
+            let _ = self.events.send_blocking(ServerEvent::Diagnostics(params));
+        }
+        Ok(())
     }
 
     pub fn completion(
@@ -473,9 +620,8 @@ fn dispatch(
         // A response to one of our requests.
         (Some(id), None) => {
             let Some(id) = id.as_i64() else { return };
-            let Some(waiter) = pending.lock().as_mut().and_then(|map| map.remove(&id)) else {
-                return;
-            };
+            let waiter = pending.lock().as_mut().and_then(|map| map.remove(&id));
+            let Some(waiter) = waiter else { return };
             let result = match message.get("error") {
                 Some(error) => Err(ResponseError {
                     code: error.get("code").and_then(Value::as_i64).unwrap_or(-32603),
@@ -487,7 +633,16 @@ fn dispatch(
                 }),
                 None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
             };
-            let _ = waiter.send(result);
+            match waiter {
+                Waiter::Response(waiter) => {
+                    let _ = waiter.send(result);
+                }
+                Waiter::Diagnostics(uri) => {
+                    if let Some(client) = client.upgrade() {
+                        client.pull_finished(uri, result);
+                    }
+                }
+            }
         }
         // A request from the server.
         (Some(id), Some(method)) => {
@@ -500,9 +655,10 @@ fn dispatch(
                             items
                                 .iter()
                                 .map(|item| {
+                                    let configuration = client.configuration.get();
                                     registry::settings_section(
-                                        &client.name,
-                                        client.settings.get(),
+                                        configuration.and_then(|c| c.settings.as_ref()),
+                                        configuration.and_then(|c| c.default_section.as_deref()),
                                         item.get("section").and_then(Value::as_str),
                                     )
                                 })
@@ -511,11 +667,35 @@ fn dispatch(
                         .unwrap_or_default();
                     json!({"jsonrpc": "2.0", "id": id, "result": result})
                 }
+                "workspace/workspaceFolders" => {
+                    let folders: Vec<Value> = client
+                        .root
+                        .get()
+                        .and_then(|root| {
+                            let uri = path_to_uri(root).ok()?;
+                            let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            Some(json!({"uri": uri.as_str(), "name": name}))
+                        })
+                        .into_iter()
+                        .collect();
+                    json!({"jsonrpc": "2.0", "id": id, "result": folders})
+                }
                 "window/workDoneProgress/create"
                 | "client/registerCapability"
                 | "client/unregisterCapability"
-                | "window/showMessageRequest" => {
+                | "window/showMessageRequest"
+                | "window/showDocument" => {
                     json!({"jsonrpc": "2.0", "id": id, "result": Value::Null})
+                }
+                // Asks to re-request semantic tokens, inlay hints and the
+                // like, none of which are shown.
+                method if method.ends_with("/refresh") => {
+                    json!({"jsonrpc": "2.0", "id": id, "result": Value::Null})
+                }
+                // ESLint's notices (no library, no config, a rule's docs):
+                // acknowledged so it carries on linting.
+                "eslint/noLibrary" | "eslint/noConfig" | "eslint/probeFailed" | "eslint/openDoc" => {
+                    json!({"jsonrpc": "2.0", "id": id, "result": {}})
                 }
                 "workspace/applyEdit" => {
                     json!({"jsonrpc": "2.0", "id": id, "result": {"applied": false}})
@@ -751,7 +931,14 @@ mod tests {
         let (client_reader, mut server_writer) = std::io::pipe().unwrap();
         let (server_reader, client_writer) = std::io::pipe().unwrap();
         let (client, _events) = LspClient::connect("rust-analyzer", client_reader, client_writer);
-        client.settings.set(json!({"check": {"command": "clippy"}})).unwrap();
+        client
+            .configuration
+            .set(Configuration {
+                settings: Some(json!({"rust-analyzer": {"check": {"command": "clippy"}}})),
+                default_section: Some("rust-analyzer".into()),
+                ..Default::default()
+            })
+            .unwrap();
         codec::write_message(&mut server_writer, &json!({
             "jsonrpc": "2.0", "id": 1, "method": "workspace/configuration",
             "params": {"items": [{"section": "rust-analyzer"}, {"section": "rust-analyzer.check"}, {}]}
@@ -760,6 +947,109 @@ mod tests {
         assert_eq!(reply["result"][0]["check"]["command"], "clippy");
         assert_eq!(reply["result"][1]["command"], "clippy");
         assert_eq!(reply["result"][2]["check"]["command"], "clippy");
+    }
+
+    #[test]
+    fn diagnostics_are_pulled_from_servers_that_only_answer_requests() {
+        let (client_reader, mut server_writer) = std::io::pipe().unwrap();
+        let (server_reader, client_writer) = std::io::pipe().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server_reader);
+            let mut pulls = 0;
+            while let Ok(Some(message)) = codec::read_message(&mut reader) {
+                match message.get("method").and_then(Value::as_str) {
+                    Some("initialize") => codec::write_message(&mut server_writer, &json!({
+                        "jsonrpc": "2.0", "id": message["id"],
+                        "result": {"capabilities": {"diagnosticProvider": {
+                            "identifier": "typescript", "interFileDependencies": true, "workspaceDiagnostics": false
+                        }}}
+                    })).unwrap(),
+                    Some("textDocument/diagnostic") => {
+                        pulls += 1;
+                        assert_eq!(message["params"]["identifier"], "typescript");
+                        codec::write_message(&mut server_writer, &json!({
+                            "jsonrpc": "2.0", "id": message["id"],
+                            "result": {"kind": "full", "items": [{
+                                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                                "severity": 1, "message": format!("pull {pulls}")
+                            }]}
+                        })).unwrap();
+                    }
+                    Some("shutdown") => codec::write_message(&mut server_writer, &json!({
+                        "jsonrpc": "2.0", "id": message["id"], "result": null
+                    })).unwrap(),
+                    Some("exit") => break,
+                    _ => {}
+                }
+            }
+        });
+        let (client, events) = LspClient::connect("pulling", client_reader, client_writer);
+        futures::executor::block_on(client.initialize(&std::env::temp_dir())).unwrap();
+        let file = std::env::temp_dir().join("index.ts");
+
+        client.did_open(&file, "typescript", 1, "x").unwrap();
+        let next_diagnostics = || loop {
+            if let ServerEvent::Diagnostics(params) = events.recv_blocking().unwrap() {
+                return params;
+            }
+        };
+        let opened = next_diagnostics();
+        assert_eq!(uri_to_path(&opened.uri).unwrap(), file);
+        assert_eq!(opened.diagnostics[0].message, "pull 1");
+
+        client.did_change(&file, 2, "xy").unwrap();
+        assert_eq!(next_diagnostics().diagnostics[0].message, "pull 2");
+
+        // Closing clears them, as a publishing server would.
+        client.did_close(&file).unwrap();
+        assert!(next_diagnostics().diagnostics.is_empty());
+
+        futures::executor::block_on(client.shutdown()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn workspace_folders_and_pushed_settings() {
+        let (client_reader, mut server_writer) = std::io::pipe().unwrap();
+        let (server_reader, client_writer) = std::io::pipe().unwrap();
+        let (client, _events) = LspClient::connect("json", client_reader, client_writer);
+        client
+            .configuration
+            .set(Configuration {
+                settings: Some(json!({"json": {"validate": {"enable": true}}})),
+                push_settings: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let root = std::env::temp_dir();
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server_reader);
+            let mut seen = Vec::new();
+            while let Ok(Some(message)) = codec::read_message(&mut reader) {
+                match message.get("method").and_then(Value::as_str) {
+                    Some("initialize") => {
+                        codec::write_message(&mut server_writer, &json!({
+                            "jsonrpc": "2.0", "id": "folders", "method": "workspace/workspaceFolders"
+                        })).unwrap();
+                        codec::write_message(&mut server_writer, &json!({
+                            "jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": {}}
+                        })).unwrap();
+                    }
+                    Some("workspace/didChangeConfiguration") => {
+                        seen.push(message);
+                        break;
+                    }
+                    _ => seen.push(message),
+                }
+            }
+            seen
+        });
+        futures::executor::block_on(client.initialize(&root)).unwrap();
+        let seen = server.join().unwrap();
+        let folders = seen.iter().find(|m| m["id"] == "folders").expect("folders answered");
+        assert_eq!(uri_to_path(&Uri::from_str(folders["result"][0]["uri"].as_str().unwrap()).unwrap()).unwrap(), root);
+        let pushed = seen.last().unwrap();
+        assert_eq!(pushed["params"]["settings"]["json"]["validate"]["enable"], true);
     }
 
     #[test]

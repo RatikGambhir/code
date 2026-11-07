@@ -1,25 +1,33 @@
 //! Language servers for a workspace.
 //!
-//! One server per language family, started on first use. Editors attach
-//! when they open a file; diagnostics are routed back to the editor showing
-//! the file. Each attached editor gets an [`LspDocument`] that keeps the
-//! server's copy of the file in step with the buffer, and the providers the
-//! code editor calls for completion, hover, definitions and code actions.
+//! When a file opens, its project is detected (Node, Bun or Deno; Go
+//! modules and workspaces; frameworks and linters) and the servers that
+//! apply are planned: a primary server, plus linters and add-ons such as
+//! ESLint or Tailwind. Each server runs once per project root, started on
+//! first use, so opening a Go file starts gopls for its module and nothing
+//! for TypeScript. Editors attach to every server for their file;
+//! diagnostics are kept per server and merged for display. Each attached
+//! editor gets an [`LspDocument`] per server that keeps the server's copy
+//! of the file in step with the buffer, and the providers the code editor
+//! calls for completion, hover, definitions and code actions.
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use cockpit_editor::{
     fuzzy,
-    lsp::{resolve_server, server_key, uri_to_path, LspClient, PositionEncoding, ServerEvent},
-    lsp_language_id,
+    lsp::{
+        plan, uri_to_path, Install, LspClient, PositionEncoding, ResolveError, Role, ServerEvent, ServerPlan,
+        ServerSpec, ToolDirs,
+    },
+    project::{FileContext, ProjectTask},
 };
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, SharedString, Task, WeakEntity, Window};
 use gpui_component::input::{
@@ -40,9 +48,22 @@ const MAX_COMPLETIONS: usize = 100;
 pub enum LspEvent {
     /// New diagnostics for a file.
     Diagnostics(PathBuf),
-    /// A server started, stopped or reported progress; the status bar shows it.
+    /// A server started, stopped or reported progress, or a file's project
+    /// was detected; the status bar shows it.
     StatusChanged,
+    /// The primary server for a file is not installed but can be (said
+    /// once per server).
+    Missing { server: &'static str, hint: String },
+    /// An install finished: what was installed, or why it failed.
+    Installed(Result<Vec<String>, String>),
+    /// Servers for a file would run the project's own code (its
+    /// `node_modules` tools, config files or build scripts), so they wait
+    /// until the workspace is trusted (said once).
+    NeedsTrust,
 }
+
+/// A file's diagnostics, by the server (its plan key) that reported them.
+pub type FileDiagnostics = BTreeMap<String, Vec<lsp_types::Diagnostic>>;
 
 /// A place in a file. Lines and columns are 0-based; columns count characters.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,14 +87,33 @@ enum Slot {
     Starting(Vec<WeakEntity<EditorView>>),
     Ready(Server),
     Failed(String),
-    /// No server is installed for the language; nothing to show.
+    /// A linter or add-on that is not installed: nothing to show.
     Unavailable,
+}
+
+/// A server process for one root, in whatever state it is in.
+struct Entry {
+    spec: &'static ServerSpec,
+    slot: Slot,
 }
 
 pub struct LspManager {
     root: PathBuf,
-    servers: HashMap<String, Slot>,
-    diagnostics: HashMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+    tools: ToolDirs,
+    /// By plan key (`gopls@/path/to/module`).
+    servers: HashMap<String, Entry>,
+    /// Each opened file's detected project, for the status bar and tasks.
+    contexts: HashMap<PathBuf, FileContext>,
+    /// Servers that were needed but are not installed and can be installed
+    /// automatically, by server id.
+    missing: BTreeMap<&'static str, Install>,
+    /// Servers the user has already been told are missing.
+    announced: BTreeSet<&'static str>,
+    installing: bool,
+    /// The user has been told that servers wait for the workspace to be
+    /// trusted.
+    told_untrusted: bool,
+    diagnostics: HashMap<PathBuf, FileDiagnostics>,
     /// Errors and warnings across `diagnostics`, kept up to date as they
     /// arrive: the status bar shows them on every redraw.
     counts: (usize, usize),
@@ -82,19 +122,32 @@ pub struct LspManager {
 
 impl EventEmitter<LspEvent> for LspManager {}
 
+/// Why a server did not start.
+enum StartFailure {
+    Resolve(ResolveError),
+    Start(anyhow::Error),
+}
+
 impl LspManager {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, tools: ToolDirs) -> Self {
         Self {
             root,
+            tools,
             servers: HashMap::new(),
+            contexts: HashMap::new(),
+            missing: BTreeMap::new(),
+            announced: BTreeSet::new(),
+            installing: false,
+            told_untrusted: false,
             diagnostics: HashMap::new(),
             counts: (0, 0),
             last_status: None,
         }
     }
 
-    pub fn diagnostics(&self, path: &Path) -> &[lsp_types::Diagnostic] {
-        self.diagnostics.get(path).map(Vec::as_slice).unwrap_or_default()
+    /// A file's diagnostics from every server.
+    pub fn diagnostics(&self, path: &Path) -> FileDiagnostics {
+        self.diagnostics.get(path).cloned().unwrap_or_default()
     }
 
     /// Counts of (errors, warnings) across the workspace.
@@ -110,14 +163,51 @@ impl LspManager {
         })
     }
 
+    /// The detected project of an open file: "Bun · TypeScript · Next.js".
+    pub fn project_label(&self, path: &Path) -> Option<String> {
+        self.contexts.get(path).and_then(FileContext::label)
+    }
+
+    /// Commands the project of `path` offers, or the workspace's when no
+    /// file is given (or its project is not known yet).
+    pub fn tasks(&self, path: Option<&Path>) -> Vec<ProjectTask> {
+        if let Some(context) = path.and_then(|path| self.contexts.get(path)) {
+            let tasks = context.tasks();
+            if !tasks.is_empty() {
+                return tasks;
+            }
+        }
+        // As if a Go and a TypeScript file sat at the root.
+        let go = FileContext::detect(&self.root.join("main.go"), "go", &self.root);
+        let js = FileContext::detect(&self.root.join("index.ts"), "typescript", &self.root);
+        go.tasks().into_iter().chain(js.tasks()).collect()
+    }
+
+    /// Servers that were needed and can be installed automatically.
+    pub fn missing_servers(&self) -> Vec<&'static str> {
+        self.missing.keys().copied().collect()
+    }
+
+    pub fn is_installing(&self) -> bool {
+        self.installing
+    }
+
+    /// Lets servers run the project's own tools, or stops them. Takes effect
+    /// for servers started afterwards; the caller restarts them.
+    pub fn set_trust_project(&mut self, trusted: bool) {
+        self.tools.trust_project = trusted;
+        self.told_untrusted = false;
+    }
+
     /// One line for the status bar.
     pub fn status(&self) -> Option<String> {
-        let mut parts: Vec<String> = self
+        let mut parts: BTreeSet<String> = self
             .servers
-            .iter()
-            .filter_map(|(key, slot)| {
-                Some(match slot {
-                    Slot::Starting(_) => format!("{key}: starting…"),
+            .values()
+            .filter_map(|entry| {
+                let id = entry.spec.id;
+                Some(match &entry.slot {
+                    Slot::Starting(_) => format!("{id}: starting…"),
                     Slot::Ready(server) => {
                         let name = server.client.name();
                         if let Some(work) = server.progress.values().next_back() {
@@ -130,13 +220,15 @@ impl LspManager {
                             name.to_string()
                         }
                     }
-                    Slot::Failed(err) => format!("{key}: {}", cockpit_common::truncate_chars(err, 80)),
+                    Slot::Failed(err) => format!("{id}: {}", cockpit_common::truncate_chars(err, 80)),
                     Slot::Unavailable => return None,
                 })
             })
             .collect();
-        parts.sort();
-        (!parts.is_empty()).then(|| parts.join(", "))
+        if self.installing {
+            parts.insert("installing language servers…".into());
+        }
+        (!parts.is_empty()).then(|| parts.into_iter().collect::<Vec<_>>().join(", "))
     }
 
     /// Emits `StatusChanged` only when the status line text changes; servers
@@ -149,15 +241,46 @@ impl LspManager {
         }
     }
 
-    /// Attaches `editor` to the server for `language`, starting it if needed.
-    /// The editor is called back with the client once it is ready.
-    pub fn attach(&mut self, language: &str, editor: WeakEntity<EditorView>, cx: &mut Context<Self>) {
-        let key = server_key(language).to_string();
-        match self.servers.get_mut(&key) {
+    /// Attaches `editor`, showing `path`, to every server for the file,
+    /// starting those that are not running. The project is detected off
+    /// the main thread; the editor is called back for each server once it
+    /// is ready.
+    pub fn attach(&mut self, path: PathBuf, language: &'static str, editor: WeakEntity<EditorView>, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        let detect = cx.background_spawn(async move {
+            let context = FileContext::detect(&path, language, &root);
+            let plans = plan(&context);
+            (context, plans)
+        });
+        cx.spawn(async move |this, cx| {
+            let (context, plans) = detect.await;
+            this.update(cx, |this, cx| {
+                let label_changed = this.project_label(&context.path) != context.label();
+                let has_own_tools = context.js.as_ref().is_some_and(|js| js.has_own_tools());
+                if has_own_tools {
+                    this.tell_untrusted(cx);
+                }
+                this.contexts.insert(context.path.clone(), context);
+                for plan in plans {
+                    this.attach_to(plan, editor.clone(), cx);
+                }
+                if label_changed {
+                    cx.emit(LspEvent::StatusChanged);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn attach_to(&mut self, plan: ServerPlan, editor: WeakEntity<EditorView>, cx: &mut Context<Self>) {
+        let key = plan.key();
+        let role = plan.role();
+        match self.servers.get_mut(&key).map(|entry| &mut entry.slot) {
             Some(Slot::Ready(server)) => {
                 let client = server.client.clone();
                 cx.defer(move |cx| {
-                    editor.update(cx, |editor, cx| editor.attach_lsp(client, cx)).ok();
+                    editor.update(cx, |editor, cx| editor.attach_lsp(client, key, role, cx)).ok();
                 });
                 return;
             }
@@ -169,55 +292,123 @@ impl LspManager {
             None => {}
         }
 
-        self.servers.insert(key.clone(), Slot::Starting(vec![editor]));
+        let spec = plan.spec;
+        self.servers.insert(key.clone(), Entry { spec, slot: Slot::Starting(vec![editor]) });
         self.status_changed(cx);
 
-        let root = self.root.clone();
-        let language = language.to_string();
+        let tools = self.tools.clone();
         let start = cx.background_spawn(async move {
-            // Looking the server up runs it once (`--version`), so it stays
+            // Resolving runs some servers once (`--version`), so it stays
             // off the main thread too.
-            let search_dirs = cockpit_common::shell_env::common_tool_dirs();
-            let Some(config) = resolve_server(&language, &search_dirs).map_err(|err| anyhow!(err))? else {
-                return Ok(None);
-            };
-            LspClient::start(&config, &root).await.map(Some)
+            let config = plan.resolve(&tools).map_err(StartFailure::Resolve)?;
+            LspClient::start(&config, &plan.root).await.map_err(StartFailure::Start)
         });
         cx.spawn(async move |this, cx| {
             let started = start.await;
             this.update(cx, |this, cx| {
-                let waiting = match this.servers.remove(&key) {
-                    Some(Slot::Starting(waiting)) => waiting,
+                let waiting = match this.servers.get_mut(&key).map(|entry| &mut entry.slot) {
+                    Some(Slot::Starting(waiting)) => std::mem::take(waiting),
                     // Restarted while starting: this client is not wanted.
                     _ => return,
                 };
-                match started {
-                    Ok(Some((client, events))) => {
-                        this.servers.insert(
-                            key.clone(),
-                            Slot::Ready(Server {
-                                client: client.clone(),
-                                progress: BTreeMap::new(),
-                                loading: false,
-                                problem: None,
-                            }),
-                        );
+                let slot = match started {
+                    Ok((client, events)) => {
                         for editor in waiting {
                             let client = client.clone();
-                            editor.update(cx, |editor, cx| editor.attach_lsp(client, cx)).ok();
+                            let key = key.clone();
+                            editor.update(cx, |editor, cx| editor.attach_lsp(client, key, role, cx)).ok();
                         }
-                        this.listen(key.clone(), client, events, cx);
+                        this.listen(key.clone(), client.clone(), events, cx);
+                        Slot::Ready(Server { client, progress: BTreeMap::new(), loading: false, problem: None })
                     }
-                    Ok(None) => {
-                        this.servers.insert(key.clone(), Slot::Unavailable);
+                    Err(StartFailure::Resolve(ResolveError::NotInstalled { install })) => {
+                        this.not_installed(spec, install, cx)
                     }
-                    Err(err) => {
-                        tracing::warn!("language server for {key} failed to start: {err:#}");
-                        this.servers.insert(key.clone(), Slot::Failed(format!("{err:#}")));
+                    Err(StartFailure::Resolve(ResolveError::NeedsTrust)) => {
+                        this.tell_untrusted(cx);
+                        // A language's main server says why it is off in the
+                        // status bar; a linter just stays quiet.
+                        if spec.is_essential() {
+                            Slot::Failed(ResolveError::NeedsTrust.to_string())
+                        } else {
+                            Slot::Unavailable
+                        }
                     }
+                    Err(StartFailure::Resolve(err)) => {
+                        tracing::warn!("{key}: {err}");
+                        Slot::Failed(err.to_string())
+                    }
+                    Err(StartFailure::Start(err)) => {
+                        tracing::warn!("language server {key} failed to start: {err:#}");
+                        Slot::Failed(format!("{err:#}"))
+                    }
+                };
+                if let Some(entry) = this.servers.get_mut(&key) {
+                    entry.slot = slot;
                 }
                 this.status_changed(cx);
             })
+        })
+        .detach();
+    }
+
+    /// Says once that servers wait for the workspace to be trusted.
+    fn tell_untrusted(&mut self, cx: &mut Context<Self>) {
+        if !self.tools.trust_project && !self.told_untrusted {
+            self.told_untrusted = true;
+            cx.emit(LspEvent::NeedsTrust);
+        }
+    }
+
+    /// Remembers a missing server for "Install Missing Language Servers"
+    /// and decides how loudly to say so: a language's main server is shown
+    /// (and announced once), a linter's or a config-file helper's is not.
+    fn not_installed(&mut self, spec: &'static ServerSpec, install: Option<Install>, cx: &mut Context<Self>) -> Slot {
+        let automatic = install.as_ref().is_some_and(Install::is_automatic);
+        if let Some(install) = install.clone().filter(|_| automatic) {
+            self.missing.insert(spec.id, install);
+        }
+        if !spec.is_essential() {
+            return Slot::Unavailable;
+        }
+        let message = match &install {
+            Some(_) if automatic => "not installed (run Install Missing Language Servers)".to_string(),
+            Some(install) => format!("not installed; {}", install.hint()),
+            None => return Slot::Unavailable,
+        };
+        if self.announced.insert(spec.id) {
+            cx.emit(LspEvent::Missing { server: spec.id, hint: message.clone() });
+        }
+        Slot::Failed(message)
+    }
+
+    /// Installs every missing server that can be installed. The caller
+    /// restarts the servers once [`LspEvent::Installed`] reports success.
+    pub fn install_missing(&mut self, cx: &mut Context<Self>) {
+        if self.installing || self.missing.is_empty() {
+            return;
+        }
+        let Some(managed) = self.tools.managed.clone() else {
+            cx.emit(LspEvent::Installed(Err("there is nowhere to install servers".into())));
+            return;
+        };
+        self.installing = true;
+        self.status_changed(cx);
+        let installs: Vec<Install> = self.missing.values().cloned().collect();
+        let tools = self.tools.clone();
+        let task = cx.background_spawn(async move { managed.install(&installs, |name| tools.find(name)) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.installing = false;
+                if result.is_ok() {
+                    this.missing.clear();
+                    this.announced.clear();
+                }
+                this.status_changed(cx);
+                cx.emit(LspEvent::Installed(result.map_err(|err| format!("{err:#}"))));
+            })
+            .ok();
         })
         .detach();
     }
@@ -233,20 +424,14 @@ impl LspManager {
             while let Ok(event) = events.recv().await {
                 let keep_going = this.update(cx, |this, cx| {
                     // Events from a client that has since been restarted.
-                    let server = match this.servers.get_mut(&key) {
+                    let server = match this.servers.get_mut(&key).map(|entry| &mut entry.slot) {
                         Some(Slot::Ready(server)) if Arc::ptr_eq(&server.client, &client) => server,
                         _ => return false,
                     };
                     match event {
                         ServerEvent::Diagnostics(params) => {
                             if let Some(path) = uri_to_path(&params.uri) {
-                                let added = Self::count(&params.diagnostics);
-                                let removed = this
-                                    .diagnostics
-                                    .insert(path.clone(), params.diagnostics)
-                                    .map_or((0, 0), |old| Self::count(&old));
-                                this.counts = (this.counts.0 + added.0 - removed.0, this.counts.1 + added.1 - removed.1);
-                                cx.emit(LspEvent::Diagnostics(path));
+                                this.set_diagnostics(path, &key, params.diagnostics, cx);
                             }
                         }
                         ServerEvent::Progress { token, title, message, percentage, done } => {
@@ -271,10 +456,10 @@ impl LspManager {
                         }
                         ServerEvent::Exited => {
                             tracing::warn!("{} exited", client.name());
-                            this.servers.insert(
-                                key.clone(),
-                                Slot::Failed("stopped; run Restart Language Servers".into()),
-                            );
+                            if let Some(entry) = this.servers.get_mut(&key) {
+                                entry.slot = Slot::Failed("stopped; run Restart Language Servers".into());
+                            }
+                            this.clear_server_diagnostics(&key, cx);
                             this.status_changed(cx);
                             return false;
                         }
@@ -289,10 +474,41 @@ impl LspManager {
         .detach();
     }
 
+    /// Replaces what server `key` reports for `path`, keeping the counts.
+    fn set_diagnostics(&mut self, path: PathBuf, key: &str, diagnostics: Vec<lsp_types::Diagnostic>, cx: &mut Context<Self>) {
+        let added = Self::count(&diagnostics);
+        let file = self.diagnostics.entry(path.clone()).or_default();
+        let removed = if diagnostics.is_empty() {
+            file.remove(key)
+        } else {
+            file.insert(key.to_string(), diagnostics)
+        }
+        .map_or((0, 0), |old| Self::count(&old));
+        if file.is_empty() {
+            self.diagnostics.remove(&path);
+        }
+        self.counts = (self.counts.0 + added.0 - removed.0, self.counts.1 + added.1 - removed.1);
+        cx.emit(LspEvent::Diagnostics(path));
+    }
+
+    /// Drops everything a server that went away reported.
+    fn clear_server_diagnostics(&mut self, key: &str, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .diagnostics
+            .iter()
+            .filter(|(_, file)| file.contains_key(key))
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in paths {
+            self.set_diagnostics(path, key, Vec::new(), cx);
+        }
+    }
+
     /// Stops every server and forgets failures, so the next `attach` starts
     /// fresh (after installing a server, or when one got stuck).
     pub fn restart(&mut self, cx: &mut Context<Self>) {
         self.shutdown(cx);
+        self.missing.clear();
         let paths: Vec<PathBuf> = self.diagnostics.drain().map(|(path, _)| path).collect();
         self.counts = (0, 0);
         for path in paths {
@@ -302,8 +518,8 @@ impl LspManager {
     }
 
     pub fn shutdown(&mut self, cx: &mut App) {
-        for slot in self.servers.drain().map(|(_, slot)| slot) {
-            if let Slot::Ready(server) = slot {
+        for entry in self.servers.drain().map(|(_, entry)| entry) {
+            if let Slot::Ready(server) = entry.slot {
                 cx.background_spawn(async move {
                     let _ = server.client.shutdown().await;
                 })
@@ -418,6 +634,8 @@ impl LineShift {
 
 pub struct LspDocument {
     pub client: Arc<LspClient>,
+    /// The server's plan key, which its diagnostics are filed under.
+    pub key: String,
     pub path: PathBuf,
     /// Text the server sees before and after the editor's (notebook cells).
     surround: Option<(String, String)>,
@@ -427,28 +645,26 @@ pub struct LspDocument {
     /// never answers for stale text (completion is asked for before the
     /// editor reports the keystroke that triggered it).
     synced: RefCell<Rope>,
-    diagnostics: Rc<RefCell<Vec<lsp_types::Diagnostic>>>,
+    /// This server's diagnostics for the file, sent back with code action
+    /// requests so it can offer its fixes.
+    diagnostics: RefCell<Vec<lsp_types::Diagnostic>>,
     /// Definitions under the mouse while ⌘ is held, for ⌘-click.
     hovered_definitions: Arc<Mutex<Vec<LocationLink>>>,
 }
 
 impl LspDocument {
-    pub fn open(
-        client: Arc<LspClient>,
-        path: PathBuf,
-        language: &str,
-        text: &Rope,
-        diagnostics: Rc<RefCell<Vec<lsp_types::Diagnostic>>>,
-    ) -> Result<Rc<Self>> {
-        client.did_open(&path, lsp_language_id(language), 1, &text.to_string())?;
+    /// Opens `path`, whose LSP language id is `language`, on `client`.
+    pub fn open(client: Arc<LspClient>, key: String, path: PathBuf, language: &str, text: &Rope) -> Result<Rc<Self>> {
+        client.did_open(&path, language, 1, &text.to_string())?;
         Ok(Rc::new(Self {
             client,
+            key,
             path,
             surround: None,
             shift: LineShift::default(),
             version: Cell::new(1),
             synced: RefCell::new(text.clone()),
-            diagnostics,
+            diagnostics: RefCell::default(),
             hovered_definitions: Arc::default(),
         }))
     }
@@ -464,15 +680,16 @@ impl LspDocument {
         suffix: String,
     ) -> Result<Rc<Self>> {
         let shift = LineShift(prefix.matches('\n').count() as u32);
-        client.did_open(&path, lsp_language_id(language), 1, &format!("{prefix}{text}{suffix}"))?;
+        client.did_open(&path, cockpit_editor::lsp_language_id(language), 1, &format!("{prefix}{text}{suffix}"))?;
         Ok(Rc::new(Self {
             client,
+            key: String::new(),
             path,
             surround: Some((prefix, suffix)),
             shift,
             version: Cell::new(1),
             synced: RefCell::new(text.clone()),
-            diagnostics: Rc::default(),
+            diagnostics: RefCell::default(),
             hovered_definitions: Arc::default(),
         }))
     }
@@ -525,6 +742,11 @@ impl LspDocument {
                 .surround
                 .as_ref()
                 .is_none_or(|(prefix, _)| prefix.is_empty() || prefix.ends_with('\n'))
+    }
+
+    /// What this server reports for the file.
+    pub fn set_diagnostics(&self, diagnostics: Vec<lsp_types::Diagnostic>) {
+        *self.diagnostics.borrow_mut() = diagnostics;
     }
 
     pub fn saved(&self, text: &str) {
@@ -713,6 +935,20 @@ pub struct LspCompletion {
     triggers: Vec<char>,
 }
 
+impl LspCompletion {
+    /// `None` when the server does not complete.
+    fn new(doc: &Rc<LspDocument>) -> Option<Self> {
+        let provider = doc.client.capabilities()?.completion_provider.as_ref()?;
+        let triggers = provider
+            .trigger_characters
+            .iter()
+            .flatten()
+            .filter_map(|t| t.chars().last())
+            .collect();
+        Some(Self { doc: doc.clone(), triggers })
+    }
+}
+
 impl CompletionProvider for LspCompletion {
     fn completions(
         &self,
@@ -897,7 +1133,8 @@ pub struct LspCodeActions {
 
 impl CodeActionProvider for LspCodeActions {
     fn id(&self) -> SharedString {
-        "lsp".into()
+        // One provider per server; actions are routed back by this id.
+        format!("lsp:{}", self.doc.key).into()
     }
 
     fn code_actions(
@@ -1018,38 +1255,130 @@ fn order_edits(edits: Vec<TextEdit>) -> Vec<TextEdit> {
 
 /// Attaches every provider the server supports to `input`.
 pub fn install_providers(doc: &Rc<LspDocument>, input: &mut InputState) {
-    let capabilities = doc.client.capabilities();
-    let triggers = capabilities
-        .and_then(|c| c.completion_provider.as_ref())
-        .and_then(|c| c.trigger_characters.clone())
-        .unwrap_or_default()
+    install_all(Some(doc), &[], input);
+}
+
+/// Attaches providers for every server of a file: completion, hover and
+/// definitions from the primary server, with add-ons' completions and
+/// hovers merged in, and each server's code actions.
+pub fn install_all(primary: Option<&Rc<LspDocument>>, others: &[(Role, Rc<LspDocument>)], input: &mut InputState) {
+    remove_providers(input);
+    let addons = others.iter().filter(|(role, _)| *role == Role::Addon).map(|(_, doc)| doc);
+    let completing: Vec<&Rc<LspDocument>> = primary.into_iter().chain(addons.clone()).collect();
+
+    let completions: Vec<LspCompletion> = completing.iter().filter_map(|doc| LspCompletion::new(doc)).collect();
+    input.lsp.completion_provider = match completions.len() {
+        0 => None,
+        1 => completions.into_iter().next().map(|c| Rc::new(c) as Rc<dyn CompletionProvider>),
+        _ => Some(Rc::new(MergedCompletion(completions))),
+    };
+
+    let hovers: Vec<LspHover> = completing
         .iter()
-        .filter_map(|t| t.chars().last())
+        .filter(|doc| supports_hover(doc))
+        .map(|doc| LspHover { doc: Rc::clone(doc) })
         .collect();
-    let supported = |provider: Option<&OneOf<bool, _>>| match provider {
+    input.lsp.hover_provider = match hovers.len() {
+        0 => None,
+        1 => hovers.into_iter().next().map(|h| Rc::new(h) as Rc<dyn HoverProvider>),
+        _ => Some(Rc::new(FirstHover(hovers))),
+    };
+
+    input.lsp.definition_provider = primary
+        .filter(|doc| supported(doc.client.capabilities().and_then(|c| c.definition_provider.as_ref())))
+        .map(|doc| Rc::new(LspDefinitions { doc: doc.clone() }) as Rc<dyn DefinitionProvider>);
+
+    input.lsp.code_action_providers = primary
+        .into_iter()
+        .chain(others.iter().map(|(_, doc)| doc))
+        .filter(|doc| supports_code_actions(doc))
+        .map(|doc| Rc::new(LspCodeActions { doc: doc.clone() }) as Rc<dyn CodeActionProvider>)
+        .collect();
+}
+
+fn supported<T>(provider: Option<&OneOf<bool, T>>) -> bool {
+    match provider {
         Some(OneOf::Left(enabled)) => *enabled,
         Some(OneOf::Right(_)) => true,
         None => false,
-    };
-    let hover = capabilities.and_then(|c| c.hover_provider.as_ref()).is_some_and(|hover| match hover {
+    }
+}
+
+fn supports_hover(doc: &LspDocument) -> bool {
+    doc.client.capabilities().and_then(|c| c.hover_provider.as_ref()).is_some_and(|hover| match hover {
         lsp_types::HoverProviderCapability::Simple(enabled) => *enabled,
         lsp_types::HoverProviderCapability::Options(_) => true,
-    });
-    let definition = supported(capabilities.and_then(|c| c.definition_provider.as_ref()));
-    let code_actions = capabilities.and_then(|c| c.code_action_provider.as_ref()).is_some_and(|actions| match actions {
+    })
+}
+
+fn supports_code_actions(doc: &LspDocument) -> bool {
+    doc.client.capabilities().and_then(|c| c.code_action_provider.as_ref()).is_some_and(|actions| match actions {
         lsp_types::CodeActionProviderCapability::Simple(enabled) => *enabled,
         lsp_types::CodeActionProviderCapability::Options(_) => true,
-    });
+    })
+}
 
-    input.lsp.completion_provider = Some(Rc::new(LspCompletion { doc: doc.clone(), triggers }));
-    input.lsp.hover_provider = hover.then(|| Rc::new(LspHover { doc: doc.clone() }) as Rc<dyn HoverProvider>);
-    input.lsp.definition_provider =
-        definition.then(|| Rc::new(LspDefinitions { doc: doc.clone() }) as Rc<dyn DefinitionProvider>);
-    input.lsp.code_action_providers = if code_actions {
-        vec![Rc::new(LspCodeActions { doc: doc.clone() }) as Rc<dyn CodeActionProvider>]
-    } else {
-        Vec::new()
-    };
+/// Completions from several servers in one menu: the primary server's and
+/// add-ons' such as Tailwind's class names. A server that fails or is
+/// slow to start just adds nothing.
+struct MergedCompletion(Vec<LspCompletion>);
+
+impl CompletionProvider for MergedCompletion {
+    fn completions(
+        &self,
+        text: &Rope,
+        offset: usize,
+        trigger: CompletionContext,
+        window: &mut Window,
+        cx: &mut Context<InputState>,
+    ) -> Task<Result<CompletionResponse>> {
+        let requests: Vec<_> = self
+            .0
+            .iter()
+            .map(|provider| provider.completions(text, offset, trigger.clone(), window, cx))
+            .collect();
+        cx.background_spawn(async move {
+            let mut items = Vec::new();
+            let mut incomplete = false;
+            for response in futures::future::join_all(requests).await {
+                match response {
+                    Ok(CompletionResponse::Array(more)) => items.extend(more),
+                    Ok(CompletionResponse::List(list)) => {
+                        incomplete |= list.is_incomplete;
+                        items.extend(list.items);
+                    }
+                    Err(err) => tracing::debug!("completion: {err:#}"),
+                }
+            }
+            Ok(CompletionResponse::List(lsp_types::CompletionList { is_incomplete: incomplete, items }))
+        })
+    }
+
+    fn filter_completions(&self, items: &[&CompletionItem], word: &str) -> Vec<usize> {
+        rank_completions(items, word)
+    }
+
+    fn is_completion_trigger(&self, offset: usize, new_text: &str, cx: &mut Context<InputState>) -> bool {
+        self.0.iter().any(|provider| provider.is_completion_trigger(offset, new_text, cx))
+    }
+}
+
+/// Hover from the first server with something to say, in order: the
+/// primary's, then add-ons' (Tailwind's CSS for a class name).
+struct FirstHover(Vec<LspHover>);
+
+impl HoverProvider for FirstHover {
+    fn hover(&self, text: &Rope, offset: usize, window: &mut Window, cx: &mut App) -> Task<Result<Option<lsp_types::Hover>>> {
+        let requests: Vec<_> = self.0.iter().map(|provider| provider.hover(text, offset, window, cx)).collect();
+        cx.background_spawn(async move {
+            for request in requests {
+                if let Ok(Some(hover)) = request.await {
+                    return Ok(Some(hover));
+                }
+            }
+            Ok(None)
+        })
+    }
 }
 
 /// Completion and hover for a notebook cell. Go to definition and code

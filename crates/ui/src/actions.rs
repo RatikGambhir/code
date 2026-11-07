@@ -31,6 +31,10 @@ actions!(
         NavigateBack,
         NavigateForward,
         RestartLanguageServers,
+        InstallLanguageServers,
+        TrustWorkspace,
+        UntrustWorkspace,
+        RunProjectTask,
         About,
         Quit,
     ]

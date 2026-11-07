@@ -7,5 +7,6 @@ mod diff_panel;
 mod history;
 
 pub use diff_panel::{DiffPanel, DiffPanelEvent};
+pub(crate) use diff_panel::render_line as render_diff_line;
 pub(crate) use history::relative_time;
 pub use history::{ChatHistory, ChatHistoryEvent};

@@ -1,425 +1,155 @@
 # Hangar
 
-A native macOS IDE written in Rust: a [GPUI](https://www.gpui.rs) shell with
-[gpui-component](https://github.com/longbridge/gpui-component), a real
-Chromium browser (CEF, off-screen rendering) inside the window, a terminal,
-git, and two coding agents you can switch between: OpenAI's Codex, driven
-through the Codex App Server, and Anthropic's Claude, driven through Claude
-Code — with an orchestration layer of its own for permissions, budgets,
-approvals and the browser tools the agents can use.
+**A native macOS IDE written in Rust, with coding agents, a real browser,
+and your issues and pull requests built in.**
 
-v0.1 covers: file explorer and editor (tree-sitter highlighting, language
-servers, auto-closed brackets and quotes), browser tabs, terminals, source control, find in files, a command
-palette, running and debugging Rust, Rust notebooks for trying out a single
-function, and an agent panel (Codex or Claude) where you prompt, watch the
-turn stream, approve commands and edits, and interrupt.
+Hangar is a fast, native editor built on [GPUI](https://www.gpui.rs) (the
+UI framework behind Zed). Alongside the editor you get a terminal, git, a
+Chromium browser inside the window, and two coding agents you can switch
+between: OpenAI's **Codex** and Anthropic's **Claude Code**. Hangar adds
+its own layer of approvals, permissions and token budgets on top of both.
 
-## Requirements
+> **Status:** early (v0.1). Hangar targets macOS. Everything except the
+> browser also runs on Linux for development. Expect rough edges, and
+> please [open an issue](https://github.com/RatikGambhir/code/issues) when
+> you hit one.
 
-- macOS 12 or later (Apple Silicon or Intel)
-- Rust 1.88+ (`rustup` recommended)
-- Xcode Command Line Tools (`xcode-select --install`)
-- CMake and Ninja, used to build the Chromium wrapper: `brew install cmake ninja`
-- At least one agent CLI:
-  - Codex: `npm install -g @openai/codex` or `brew install codex` (or the
-    copy inside the ChatGPT desktop app, which Hangar finds on its own), then
-    sign in from the agent panel. *Continue with ChatGPT* is Hangar's own
-    Sign in with ChatGPT: Hangar keeps the tokens in the macOS Keychain and
-    Codex asks Hangar for an access token when it needs one
-    (`Hangar --chatgpt-access-token`). Codex's own sign-in (ChatGPT or an
-    OpenAI API key, kept by Codex in `~/.codex`) is still offered; switch
-    between them from the Codex menu in the panel header. Codex ties each
-    thread to the sign-in that started it.
-  - `@chatgpt` in the Codex panel asks ChatGPT itself (no Codex, no tools)
-    on your ChatGPT plan, with Hangar's sign-in: answers stream from
-    `api.openai.com/v1/responses`, and conversations are kept in Hangar's
-    data directory (`chatgpt-threads/`). `@codex` starts a Codex agent.
-  - Claude Code: `curl -fsSL https://claude.ai/install.sh | bash` or
-    `npm install -g @anthropic-ai/claude-code`, then sign in from the agent
-    panel (a Claude plan, an Anthropic Console account, or
-    `ANTHROPIC_API_KEY` / Bedrock / Vertex configured for Claude Code).
-    Claude Code keeps its own credentials; Hangar never stores them.
-- For Rust IDE features (completion, go to definition, references, hover,
-  quick fixes, `cargo check` diagnostics): `rustup component add
-  rust-analyzer`. The `rust-analyzer` in `~/.cargo/bin` is only rustup's
-  proxy until the component is installed; Hangar notices and says so in
-  the status bar.
-- For debugging Rust: `lldb-dap`, which comes with Xcode and the Command
-  Line Tools (`xcode-select --install`); Hangar finds it with `xcrun`.
-  Readable `String`/`Vec`/`HashMap`/`Option` values come from your Rust
-  toolchain's LLDB formatters, and stepping into the standard library
-  needs `rustup component add rust-src`.
-- Optional language servers for other languages on your `PATH`:
-  `typescript-language-server`, `pyright-langserver`, `gopls`, `clangd`,
-  `zls`, `vscode-{css,html,json}-language-server`
+## Features
 
-## Build and run
+**Editing**
+- Tree-sitter highlighting, multiple panes, go to file, find in files, and
+  a command palette
+- Language servers chosen from the project around each file: completion,
+  go to definition, find references, hover, and quick fixes
+- Rust, TypeScript and JavaScript (Node, Bun, Deno; Vue, Svelte, Astro,
+  Angular), Go, Python, C and C++, Swift, Zig, Ruby, and CSS, HTML, JSON,
+  YAML, TOML and Bash
+- **Install Missing Language Servers** installs what your files need into
+  a folder Hangar owns, so nothing is installed globally
+- **Workspace trust**: a project's own tools, config files and build
+  scripts don't run until you trust its folder
 
-```sh
-cargo xtask bundle --run          # debug build, run in this terminal (logs on stderr)
-cargo xtask bundle --release --open
-cargo xtask bundle --release --sign "Developer ID Application: …"   # hardened runtime
+**Coding agents**
+- Codex and Claude Code in one panel: prompt, watch the turn stream, and
+  approve commands and edits
+- Chat mode, where the conversation fills the window and a diff panel
+  shows what the agent changed
+- Permission presets (read only, auto, full access), approval rules,
+  secret detection in prompts, and token budgets per thread, workspace or
+  model
+- Browser tools for the agent (navigate, read, screenshot, click), limited
+  to an allowlist of sites and asking you before anything risky
+
+**Built-in tools**
+- A Chromium browser in the window, so pages sit next to your code
+- Terminals, source control, and project tasks (package scripts,
+  `go test`, linters) one click away
+- Running and debugging Rust with LLDB: breakpoints, stepping, inline
+  values, and a variables view with Rust type names
+- Rust notebooks: call one function with arguments you write and see what
+  it prints and returns, without writing a test or a `main`
+
+**Your work, in the editor**
+- **Tasks**: a local issue board per workspace, plus your Linear projects
+  and issues (read-only)
+- **GitHub**: browse your repositories' code, pull requests with their
+  diffs, issues with comments, and Actions runs (read-only)
+- Sign-ins are kept in the macOS Keychain
+
+## Quick start
+
+You need macOS 12+, Rust 1.88+, the Xcode Command Line Tools, and CMake
+and Ninja. Then:
+
+```bash
+git clone https://github.com/RatikGambhir/code.git hangar
 ```
 
-The first build downloads the Chromium Embedded Framework (~500 MB) into
-`.cef/` (see `.cargo/config.toml`; export `CEF_PATH` to share one download
-between checkouts). The app is assembled at
-`target/<profile>/bundle/Hangar.app`.
-
-Release builds use whole-program LTO in a single codegen unit, so they take
-a few minutes longer to link. When `xcrun` finds the Metal compiler (Xcode,
-or its downloadable Metal toolchain), they also ship precompiled shaders;
-otherwise the shaders compile on the first launch (the `runtime-shaders`
-feature, on by default).
-
-Startup does only what the first frame needs. Chromium starts when the
-first browser tab opens, and the agent (`codex app-server`, `claude`)
-starts when its panel is first shown. The log records
-`window ready … after launch`.
-
-Chromium only works from the app bundle — it locates its framework and the
-`Hangar Helper*.app` processes through the bundle layout. A plain
-`cargo run` starts the IDE with the browser disabled and a note explaining
-why, which is handy when working on non-browser UI.
-
-Pass a folder to open it: `cargo xtask bundle --run -- ~/src/project`; an
-installed app also opens folders dropped on its Dock icon or given to
-`open -a Hangar <folder>`. Otherwise Hangar reopens the last folder, or
-shows the welcome window.
-
-### Verification on any host
-
-```sh
-scripts/check.sh
+```bash
+cd hangar && cargo xtask bundle --run
 ```
 
-runs the tests of every crate (the UI's included), type-checks the app, and
-type-checks the Chromium backend for `aarch64-apple-darwin` without
-downloading CEF (`--features cef-typecheck`).
+The first build downloads Chromium (about 500 MB). See
+**[Getting started](docs/getting-started.md)** for every dependency,
+optional tools such as the agent CLIs and language servers, and how to
+build a release.
 
-The UI itself also runs on Linux, minus the browser, which is handy for
-testing it headless: `cargo run -- <folder>` under `xvfb-run` with a Vulkan
-driver (Mesa's lavapipe works). The live agent tests are opt-in:
-`HANGAR_CODEX_BIN=$(which codex) cargo test -p cockpit-agents --test
-live_codex` (add `HANGAR_CODEX_LIVE_TURN=1` to run a real turn) and
-`HANGAR_CLAUDE_BIN=$(which claude) cargo test -p cockpit-agents --test
-live_claude` (version, account and models, which bill nothing; add
-`HANGAR_CLAUDE_LIVE_TURN=1` for a real turn on Claude Haiku 5.5, or set
-`HANGAR_CLAUDE_LIVE_MODEL`). `cargo test -p cockpit-notebook --test
-rust_analyzer_live -- --ignored` checks completion inside a notebook cell
-against the installed rust-analyzer.
-
-## Keys
+## Documentation
 
 | | |
 |---|---|
-| ⌘P / ⇧⌘P | Go to file / command palette |
-| ⌘O | Open folder |
-| ⌘S, ⌘W | Save, close tab |
-| ⇧⌘[ ⇧⌘] | Previous / next tab |
-| ⌘\\ | Split editor |
-| ⌘B, ⌘J, ⌥⌘B | Toggle sidebar, terminal, agent panel |
-| ⇧⌘E, ⇧⌘G, ⇧⌘F | Explorer, source control, find in files |
-| ⌘T | New browser tab (⌘L address bar, ⌘R reload, ⌘[ ⌘] back/forward, ⌥⌘I DevTools) |
-| ⌃\` | New terminal |
-| F12 or ⌘-click | Go to definition (several matches open a list) |
-| ⇧F12 | Find all references |
-| ⌃- / ⌃⇧- | Go back / forward after a jump |
-| ⌘. | Quick fixes and refactors (e.g. add a missing `use`) |
-| Tab / ↩ | In the completion list (it opens as you type): Tab replaces the word under the cursor, ↩ inserts before it; ↑↓ choose, Esc closes. Picking a name that is not imported yet adds its `use`. |
-| `(` `[` `{` `"` | Closed for you; typing the closer steps over it, ⌫ removes an empty pair, ↩ between a pair opens an indented line, and with text selected it is wrapped |
-| ⌘L | Ask the agent (Enter sends, ⇧Enter newline, ⌃C stops the turn) |
-| ⇧⌘N | New agent thread |
-| ⇧⌘A | Chat mode: the conversation fills the window, history in the sidebar (again to hide the history) |
-| ⇧⌘D | Show or hide the chat's changes (this chat, or everything uncommitted) |
-| ⌃R / ⌃D | Run / debug the selected configuration (in the editor) |
-| ⌃⇧R / ⌃⇧D | Run / debug the test or `fn main` at the cursor |
-| ⌘F2, ⌘F5 | Stop, rerun under the debugger |
-| F8, F7, ⇧F8 | Step over, into, out |
-| ⌥⌘R (or F9), ⌥F9 | Resume, run to cursor |
-| ⌘F8, ⇧⌘F8 | Toggle breakpoint, view breakpoints |
-| ⌥F8, ⌘5 | Evaluate expression, debug panel |
-| ⌘↵, ⇧⌘↵, ⇧⌥F | In a notebook cell: run it, add a cell below, format it |
+| [Getting started](docs/getting-started.md) | Dependencies, building, running, testing, environment variables, troubleshooting |
+| [User guide](docs/guide.md) | Keyboard shortcuts, languages and workspace trust, agents, Tasks, GitHub, running and debugging, notebooks, known limitations |
+| [Architecture](docs/architecture.md) | How the crates fit together, the browser and agent integrations, storage, and extending notebooks |
 
-## Run and debug
+## Project structure
 
-Rust projects get RustRover-style running and debugging, built on Cargo and
-LLDB (`lldb-dap`, spoken to over the Debug Adapter Protocol):
-
-- *Configurations*: the title bar's selector lists the workspace's binaries
-  and examples (from `cargo metadata`) and recently run tests, with program
-  arguments; ▶ runs it in a terminal (`cargo run` / `cargo test`), the bug
-  debugs it.
-- *Gutter*: a ▶ beside `fn main`, each `#[test]` (also `#[tokio::test]`
-  and friends) and each test module offers Run and Debug. Click beside a
-  line number for a breakpoint, ⌥-click to disable it, right-click for a
-  condition, a hit count or a log message (a logpoint, drawn as a diamond).
-  Breakpoints stay on their line as you edit and are kept per workspace.
-- *Debugging* builds with `cargo build`/`cargo test --no-run`, launches the
-  binary under LLDB with the toolchain's Rust formatters, and stops at
-  breakpoints and, by default, on panics (on the first frame of your own
-  code). The paused line is highlighted, locals' values show after the
-  lines that mention them, and hovering a name or `a.b.c` path shows its
-  value.
-- *Debug panel* (bottom dock, beside the terminal): resume, pause, stop,
-  rerun, step over/into/out, run to cursor; threads and frames (library
-  frames dimmed); a variables tree with Rust type names (`{Vec<i32>}
-  size=3`) that keeps what you expanded across steps, double-click to set a
-  value; watches and an expression field (↩ evaluates, ⌘↩ adds a watch); the
-  program's output and an expression console; every breakpoint, with
-  "pause when the program panics".
-
-## Notebooks
-
-A notebook lets you call one function from your code with arguments you
-write, and see what it prints and returns, without writing a test or a
-`main`.
-
-- *Open one*: right-click anywhere in a Rust file and choose **Open Rust
-  Notebook** (or use "Open Notebook" in the command
-  palette). Inside a function (its body, signature or doc comment), the
-  notebook is for that function. Anywhere else, it is for the file: the
-  first cell imports the file's module and you write the calls.
-- *Try a function*: the notebook's header lists the file's public
-  functions and methods. Clicking one adds a cell that calls it.
-- *Cells for a function* are written from its signature: a `use` for the
-  function's module, a `let` with `todo!()` for each argument (references
-  become an owned value you borrow, so `&Config` gives `let config: Config`
-  and passes `&config`), and the call. Methods get a receiver to fill in,
-  and async functions are wrapped in `__hangar::block_on(…)`. Replace the
-  `todo!()`s and press **Run** (⌘↵).
-- *Output*: what the cell prints appears under it (stderr in red), then the
-  value of its last line, pretty-printed with `{:#?}` and labelled with its
-  type. A type without `Debug` shows just its name. End the last line with
-  `;` to show nothing. `?` works in cells, and a panic or an error from `?`
-  is reported. Compiler errors are shown with line numbers of the cell.
-- *As you type*: each notebook starts its own rust-analyzer, so cells get
-  completion (including adding a missing `use`), hover information and
-  errors underlined before you run them. The header says when it is ready;
-  in a large workspace the first load takes a while, since it reads the
-  project's dependencies.
-- *Formatting*: a cell is formatted with `rustfmt` (using your project's
-  `rustfmt.toml`) each time it runs, or on demand with **Format** (⇧⌥F). A
-  format is one edit, so ⌘Z undoes it. If the code doesn't parse yet, Run
-  leaves it as written and the build explains the problem.
-- *Cells* are independent: each runs on its own and they share no
-  variables. Add more with **Add cell** (⇧⌘↵ adds one below the current
-  cell), for example to try other arguments. The header links back to the
-  function.
-
-How it works: each run writes the cell into the `main` of a small,
-throwaway Cargo project that depends on the function's library, builds it
-with `cargo build`, and runs it from the package's directory. The project
-lives in the workspace's target directory (`target/hangar-notebook/`) and
-builds into the same target directory, with the workspace's `Cargo.lock`,
-`[profile]` and `[patch]` settings, so your crate and its dependencies are
-compiled once and shared with your normal builds. The first run of a
-session builds whatever is out of date; later runs only rebuild the cell.
-If the package depends on Tokio, async functions run on a Tokio runtime;
-otherwise on a minimal executor.
-
-For completion, the notebook's rust-analyzer is started in the throwaway
-project. It sees each cell as a module of that crate (`src/cell_<n>.rs`),
-with the cell as the body of a function, and a crate root that declares
-those modules; Hangar sends it that text and maps positions back to the
-cell's lines. It is set up not to run `cargo check` on save, and it uses
-the workspace's target directory for the build scripts and proc macros it
-needs, so it doesn't make a `target/` of its own.
-
-**Cleanup.** The throwaway project's files — its sources, its binary, and
-that binary's entries in `deps/`, `.fingerprint/` and `incremental/` — are
-deleted when the notebook tab closes (a running cell and the notebook's
-rust-analyzer are stopped first). Projects and build files left behind
-because Hangar quit or crashed are deleted the next time any notebook
-opens. Your crate's own build output is not touched, so it stays cached
-like after any `cargo build`.
-
-**Adding a language.** `crates/notebook` is language-neutral. A language
-implements `Language` (which files it handles; prepare a notebook for the
-function at the cursor or for the whole file, with a starting cell for each
-of the file's functions) and returns a `Notebook` carrying a
-`Kernel` (run a cell, stream `RunEvent`s, clean up when dropped). Add it to
-`LANGUAGES` in `crates/notebook/src/lib.rs`; the right-click menu item, the
-command and the notebook tab work for it unchanged. Optionally, the kernel
-formats cells (`Kernel::format`) and the notebook carries a `CellAnalysis`
-describing how a language server should see cells, which gives them
-completion and errors. `crates/notebook/src/rust/`
-is the example to follow.
-
-## Architecture
+Hangar is a Cargo workspace of focused crates. Only `ui` and `app` depend
+on the UI framework, so everything else can be tested without a display.
 
 ```
-crates/
-  app           main executable and the Chromium helper executable
-  ui            GPUI views: workspace, panes, editor, browser, terminal,
-                explorer, source control, search, palette, agent panel
-  browser       BrowserEngine/BrowserTab abstraction, the CEF off-screen
-                backend (macOS), and the automation surface for the agent
-  agents        Codex App Server client (JSON-RPC over stdio), Claude Code
-                client (stream-json over stdio), typed protocol, event
-                stream, transcript reducer, AgentBackend trait
-  orchestrator  prompt checks, permission presets, approval rules, token
-                budgets, turn scheduling, browser-tool policy, worktrees
-  debugger      Debug Adapter Protocol client for lldb-dap, Cargo targets
-                and builds, runnable lines in a file, breakpoints that
-                follow edits, Rust type names and inline values
-  notebook      notebooks: the Language/Kernel interface, and Rust support
-                (reading a file's functions, writing starting cells,
-                building and running cells in a throwaway crate,
-                deleting its build files)
-  editor        documents, file tree, fuzzy finder, search, file watcher,
-                language server client
-  terminal      PTY + vt100 emulation, key encoding, URL detection
-  git           git CLI wrapper and porcelain v2 status parser
-  persistence   SQLite (WAL) with a typed, readable SQL builder; every write
-                is one transaction
-  common        app paths, ids, login-shell PATH discovery
-xtask           `cargo xtask bundle`: builds, assembles and signs Hangar.app
-packaging/macos entitlements for the app and the Chromium helpers; the app
-                icon (Hangar.icns, drawn by make-icon.swift)
+.
+├── crates/
+│   ├── app/           the `hangar` executable and the Chromium helper process
+│   ├── ui/            every window, view and panel (GPUI): workspace, editor tabs,
+│   │                  explorer, terminal, browser tab, agent panel, chat mode,
+│   │                  debugger panel, Tasks and GitHub views, command palette
+│   ├── editor/        documents, file tree, find in files, file watching, project
+│   │                  detection, and the language server catalog, client and installer
+│   ├── agents/        clients for Codex (App Server), Claude Code (stream-json) and
+│   │                  ChatGPT, turned into one stream of events and transcripts
+│   ├── orchestrator/  Hangar's rules around the agents: prompt checks, approval
+│   │                  rules, token budgets, turn scheduling, browser-tool policy
+│   ├── browser/       the embedded Chromium (CEF, rendered off-screen) and the
+│   │                  automation API the agents use
+│   ├── debugger/      Debug Adapter Protocol client for lldb-dap, Cargo run targets,
+│   │                  breakpoints that follow edits, Rust value display
+│   ├── notebook/      notebooks: a language-neutral interface, and Rust support
+│   ├── terminal/      PTY-backed shells with a VT100 screen model
+│   ├── git/           git through the git CLI, and a status parser
+│   ├── tasks/         local issue boards and the read-only Linear client
+│   ├── github/        the read-only GitHub client and its sign-in
+│   ├── persistence/   the SQLite database (WAL) and a typed SQL builder
+│   └── common/        typed ids, on-disk paths, and the login-shell environment
+├── xtask/             `cargo xtask bundle`: builds, assembles and signs Hangar.app
+├── docs/              getting started, user guide and architecture
+├── scripts/check.sh   tests and type-checks every crate
+├── assets/            icons and fonts
+├── packaging/macos/   entitlements and the app icon
+└── vendor/            gpui-component with Hangar's patches
 ```
 
-To redraw the icon after changing its colors in `make-icon.swift`:
+[Architecture](docs/architecture.md) explains each crate file by file, how
+they depend on each other, and how the browser, agents and storage work.
 
-```sh
-swift packaging/macos/make-icon.swift /tmp/Hangar.iconset
-iconutil -c icns /tmp/Hangar.iconset -o packaging/macos/Hangar.icns
-```
+## Contributing
 
-**Browser.** CEF runs windowless: Chromium paints BGRA frames that the
-browser view uploads as GPUI images, so pages clip, overlay and resize like
-any other element (the command palette draws over a page). Input — mouse,
-keys, IME composition, clipboard commands — is translated to CEF events.
-Chromium's message loop is pumped from a `CFRunLoopTimer` because GPUI owns
-`[NSApp run]`. Popups become tabs; the native context menu is suppressed.
-The UI only talks to `BrowserEngine`/`BrowserTab`, so another engine could be
-dropped in.
+Contributions are welcome. Before you open a pull request:
 
-**Agents.** The agent panel talks to one provider at a time; the name in its
-header (Codex or Claude) is a menu that switches between them. The choice,
-and each provider's model and effort, are remembered globally, and each
-provider keeps its own threads.
+1. Read [Getting started](docs/getting-started.md) to build and run Hangar.
+2. Run `scripts/check.sh`, which runs every crate's tests and type-checks
+   the app and the Chromium backend. It also works on Linux.
+3. Keep changes focused, and add tests next to the code you change.
 
-- *Codex*: each window starts `codex app-server` for its folder (when the
-  agent panel is first shown) and talks
-  JSON-RPC over stdio: threads, turns, streaming items, approvals, token
-  usage, account and login.
-- *Claude*: each thread runs `claude -p --input-format stream-json
-  --output-format stream-json` (the protocol the Claude Agent SDK uses),
-  started with `--session-id` and later `--resume`, so threads survive
-  restarts and Claude Code's own history rebuilds the transcript. Permission
-  prompts arrive as `can_use_tool` requests (`--permission-prompt-tool
-  stdio`) and become the same approval cards as Codex's. Models: Claude Opus
-  5.5 (`claude-opus-5-5`, the default), Sonnet 5.5, Haiku 5.5 and Fable 5.1,
-  followed by anything else the installed Claude Code offers; effort maps to
-  `--effort`. A change of model, effort or permissions restarts the thread's
-  process with `--resume` before the next turn.
-- *Signing in to Claude*: the panel runs `claude auth login` (claude.ai or
-  `--console`) in a terminal tab, since that flow is interactive; Claude
-  Code stores the credentials. Hangar reads `claude auth status`, notices a
-  new sign-in by itself, and asks for a new one when a turn is refused with
-  a 401 (an expired sign-in). An `ANTHROPIC_API_KEY`, Bedrock or Vertex set
-  up for Claude Code needs no sign-in.
-
-Hangar's orchestration layer sits between the panel and either agent:
-
-- *Prompt policy*: size limits, secret detection (blocked by default),
-  blocked and warned patterns.
-- *Permissions*: Read only / Auto / Full access presets map to Codex's
-  sandbox and approval policy, and to Claude Code's permission modes
-  (`default`, `acceptEdits`, `bypassPermissions`); read-only commands can be
-  auto-approved and dangerous ones auto-declined by rule, for both. Claude
-  Code has no command sandbox here, so in Auto it asks before every command
-  your Claude Code settings do not already allow.
-- *Budgets*: soft and hard token limits per global/workspace/thread/model
-  scope and day/week/month/total period, checked before each turn against
-  usage recorded in SQLite.
-- *Scheduling*: a cap on concurrent turns, with prompts queued per thread.
-- *Browser tools*: the agent gets an `ide_browser` namespace (navigate,
-  screenshot, read page text, read console, click, reload, back, list tabs):
-  dynamic tools for Codex, an in-process MCP server (served over Claude
-  Code's control channel) for Claude. Calls are checked against an origin allowlist (localhost
-  by default), clicks and off-list navigation ask the user, and everything
-  read from a page is returned inside an "untrusted data" block so the agent
-  treats it as data, not instructions.
-- *Durability*: every loggable event is appended to `agent_events`; threads
-  are listed from SQLite (with their provider) and resumed from Codex's or
-  Claude Code's own history after a restart. Claude reports usage per turn,
-  recorded the same way for budgets.
-
-**Storage.** `~/Library/Application Support/Hangar/` holds `hangar.sqlite3`
-(workspaces, tabs, browser profiles and history, agent threads and events,
-token usage, budgets, policies, settings), the Chromium profile and logs.
-No secrets are stored there. `HANGAR_DATA_DIR` moves it. Data from before
-the app was renamed (`Cockpit/`, `cockpit.sqlite3`) is moved here on first launch.
-
-## Known limitations (v0.1)
-
-- Debugging: a debugged program's output shows in the debug console, but
-  it cannot read from stdin there (Run, in a terminal, can). Expressions are
-  evaluated by LLDB, which knows Rust values but not Rust syntax: field
-  paths, indexing and arithmetic work; method calls and closures do not.
-  Only Rust/Cargo projects can be run and debugged so far.
-- Notebooks: Rust only so far. They can call `pub` functions of library
-  crates (functions in a binary's `main.rs` or `src/bin/`, in tests or in
-  examples cannot be reached from another crate); a function in a private
-  module needs a public path to it. Cells have completion, hover and errors,
-  but not go to definition or quick fixes (⌘.). Each open notebook runs its
-  own rust-analyzer, which costs memory in a large workspace. Notebooks are
-  not reopened after a restart.
-- `vendor/gpui-component` is gpui-component 0.5.1 with small patches for
-  gutter decorations, the editor's right-click menu and bracket pairs (see
-  its `COCKPIT_PATCHES.md`); it has to move with the pinned `gpui`.
-
-- The product targets macOS. Everything but the browser also runs on Linux
-  (for development); the browser needs macOS and the app bundle.
-- Budgets, prompt patterns, approval rules and the browser-tool allowlist are
-  enforced but have no settings screen yet; they live in the `budgets` and
-  `agent_policies` tables (the permission preset and model are set from the
-  agent panel).
-- The orchestrator can create isolated git worktrees for parallel agents, but
-  the UI runs one agent thread at a time per window.
-- Switching provider stops the current provider's agent (a running turn is
-  cut off); each provider's threads come back when you switch again.
-- Not supported for Claude yet: Claude's question tool (`AskUserQuestion` is
-  turned off, since a headless session cannot answer it), hooks, slash
-  commands typed in the panel, and showing subagent (`Task`) steps; only the
-  subagent's result appears. "Approve for session" keeps Claude's suggested
-  rule for this session only, never in your Claude Code settings files.
-  Interrupting a Claude turn is wired to Claude Code's `interrupt` request
-  but has not been exercised against a live turn yet.
-- Diffs open as read-only tabs; there is no side-by-side diff view yet.
-- Chromium's own context menus, file pickers and print dialogs are not wired
-  into the off-screen view.
-
-## Environment variables
-
-| Variable | Effect |
-|---|---|
-| `HANGAR_LOG` | log filter, e.g. `debug` or `cockpit_agents=trace` |
-| `HANGAR_DATA_DIR` | data directory override |
-| `HANGAR_SKIP_SHELL_ENV` | do not read `PATH` from the login shell |
-| `HANGAR_REMOTE_DEBUGGING_PORT` | expose Chromium's DevTools protocol on localhost |
-| `HANGAR_CEF_NO_SANDBOX` | run Chromium without its sandbox (debugging helper setups) |
-| `HANGAR_CEF_MOCK_KEYCHAIN` | mock Keychain in release builds (always on in debug builds) |
-| `HANGAR_CODEX_BIN` | `codex` executable (also used by the live tests) |
-| `HANGAR_CLAUDE_BIN` | `claude` executable (also used by the live tests) |
-| `HANGAR_LLDB_DAP` | `lldb-dap` executable for debugging |
+Bug reports and feature ideas go in
+[issues](https://github.com/RatikGambhir/code/issues).
 
 ## Credits
 
-- The CEF integration follows the approach worked out in
-  [bokuweb/gpui-cef](https://github.com/bokuweb/gpui-cef) (MIT OR Apache-2.0):
-  retrofitting Chromium's application protocols onto GPUI's `NSApp`, the
-  run-loop pump, and text input handling.
+- The CEF integration follows the approach in
+  [bokuweb/gpui-cef](https://github.com/bokuweb/gpui-cef) (MIT OR
+  Apache-2.0).
+- UI components from
+  [gpui-component](https://github.com/longbridge/gpui-component), vendored
+  with small patches (see `vendor/gpui-component/COCKPIT_PATCHES.md`).
+- Chromium Embedded Framework (BSD) via
+  [cef-rs](https://github.com/tauri-apps/cef-rs).
 - Icons from [Lucide](https://lucide.dev) (ISC), see
-  `assets/icons/LICENSE-lucide.txt`; the rest come with gpui-component.
-- Fonts, as in Zed: [IBM Plex Sans](https://github.com/IBM/plex) for the
-  interface and [Lilex](https://github.com/mishamyrt/Lilex) for code, both
-  SIL Open Font License 1.1 (`assets/fonts/*/LICENSE.txt`). A code font set
-  in the settings (`mono_font`) still takes precedence.
-- Chromium Embedded Framework (BSD) via [cef-rs](https://github.com/tauri-apps/cef-rs).
+  `assets/icons/LICENSE-lucide.txt`.
+- Fonts: [IBM Plex Sans](https://github.com/IBM/plex) for the interface
+  and [Lilex](https://github.com/mishamyrt/Lilex) for code, both under the
+  SIL Open Font License 1.1.
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of MIT or Apache-2.0, at your option.
