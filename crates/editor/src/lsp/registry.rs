@@ -124,6 +124,12 @@ pub struct ToolDirs {
     pub search: Vec<PathBuf>,
     /// Servers Hangar installed itself.
     pub managed: Option<ManagedDir>,
+    /// The user trusts the workspace, so servers may run the project's own
+    /// code: executables in its `node_modules/.bin`, its TypeScript, plugins
+    /// from its `node_modules`, and servers that load its config files or
+    /// build scripts ([`ServerSpec::runs_project_code`]). Off by default,
+    /// since a cloned repository can ship any of these.
+    pub trust_project: bool,
 }
 
 impl ToolDirs {
@@ -150,6 +156,9 @@ pub enum ResolveError {
     NotInstalled { install: Option<Install> },
     /// It is installed but cannot run.
     Broken(String),
+    /// It would run the project's own code, and the workspace is not
+    /// trusted.
+    NeedsTrust,
 }
 
 impl fmt::Display for ResolveError {
@@ -158,6 +167,7 @@ impl fmt::Display for ResolveError {
             ResolveError::NotInstalled { install: Some(install) } => write!(f, "not installed; {}", install.hint()),
             ResolveError::NotInstalled { install: None } => f.write_str("not installed"),
             ResolveError::Broken(message) => f.write_str(message),
+            ResolveError::NeedsTrust => f.write_str("off until this workspace is trusted"),
         }
     }
 }
@@ -198,6 +208,29 @@ impl ServerSpec {
     pub fn is_essential(&self) -> bool {
         self.role == Role::Primary && !matches!(self.id, "json" | "yaml" | "bash" | "css" | "html" | "taplo")
     }
+
+    /// Whether starting it runs the project's own code, so it waits until
+    /// the workspace is trusted. rust-analyzer runs build scripts, proc
+    /// macros and `cargo check`; ESLint, Tailwind and Svelte load JavaScript
+    /// config and plugins; Vue loads plugins named in `tsconfig.json`;
+    /// golangci-lint loads plugins named in its config; Ruby LSP evaluates
+    /// the Gemfile; zls runs `build.zig`; SourceKit-LSP runs
+    /// `Package.swift`. Astro loads the project's own packages too.
+    pub fn runs_project_code(&self) -> bool {
+        matches!(
+            self.id,
+            "rust-analyzer"
+                | "eslint"
+                | "tailwind"
+                | "svelte"
+                | "vue"
+                | "astro"
+                | "golangci-lint"
+                | "ruby"
+                | "zls"
+                | "sourcekit"
+        )
+    }
 }
 
 impl PartialEq for ServerSpec {
@@ -220,6 +253,7 @@ impl Resolution<'_> {
         self.context
             .js
             .as_ref()
+            .filter(|_| self.tools.trust_project)
             .and_then(|js| js.typescript_lib.clone())
             .or_else(|| self.tools.managed.as_ref().and_then(ManagedDir::classic_typescript_lib))
     }
@@ -255,7 +289,21 @@ impl ServerPlan {
     /// some servers (`--version` checks), so keep it off the main thread.
     pub fn resolve(&self, tools: &ToolDirs) -> Result<ServerConfig, ResolveError> {
         let spec = self.spec;
-        let project_bins = self.context.js.as_ref().map(|js| js.bin_dirs.as_slice()).unwrap_or_default();
+        // Checked before looking for the executable: even a `--version`
+        // check could run the project's toolchain overrides.
+        if spec.runs_project_code() && !tools.trust_project {
+            return Err(ResolveError::NeedsTrust);
+        }
+        // The project's own executables come first, but only in a trusted
+        // workspace: otherwise opening a file would run whatever the
+        // repository put there (even the `--version` checks below run it).
+        let project_bins = self
+            .context
+            .js
+            .as_ref()
+            .filter(|_| tools.trust_project)
+            .map(|js| js.bin_dirs.as_slice())
+            .unwrap_or_default();
         let mut dirs = project_bins.to_vec();
         dirs.extend(tools.dirs());
         let (program, path, args) = spec
@@ -268,13 +316,30 @@ impl ServerPlan {
                     .find(|candidate| is_executable(candidate) && (spec.accept)(candidate))?;
                 Some((*program, path, *args))
             })
-            .ok_or(ResolveError::NotInstalled { install: spec.install.clone() })?;
+            .ok_or_else(|| self.not_found(tools))?;
         let mut config = ServerConfig::new(program, path, args);
         run_node_scripts_with_bun(&mut config, &dirs);
         config.env.push(("PATH".into(), joined_path(&dirs, Path::new(&config.command))));
         let resolution = Resolution { context: &self.context, root: &self.root, tools };
         (spec.configure)(&mut config, &resolution)?;
         Ok(config)
+    }
+}
+
+impl ServerPlan {
+    /// Why no executable was found: the project has one of its own that an
+    /// untrusted workspace doesn't use (Biome and oxlint live only there),
+    /// or it is not installed.
+    fn not_found(&self, tools: &ToolDirs) -> ResolveError {
+        let in_project = !tools.trust_project
+            && self.context.js.iter().flat_map(|js| &js.bin_dirs).any(|dir| {
+                self.spec.candidates.iter().any(|(program, _)| is_executable(&dir.join(program)))
+            });
+        if in_project {
+            ResolveError::NeedsTrust
+        } else {
+            ResolveError::NotInstalled { install: self.spec.install.clone() }
+        }
     }
 }
 
@@ -320,7 +385,9 @@ pub fn resolve_server(language: &str, search_dirs: &[PathBuf]) -> Result<Option<
             go: None,
         },
     };
-    let tools = ToolDirs { search: search_dirs.to_vec(), managed: None };
+    // Notebooks run in a scratch project Hangar writes itself, and run the
+    // user's own cells anyway.
+    let tools = ToolDirs { search: search_dirs.to_vec(), managed: None, trust_project: true };
     plan.resolve(&tools).map(Some).map_err(|err| err.to_string())
 }
 
@@ -832,9 +899,13 @@ fn configure_astro(config: &mut ServerConfig, resolution: &Resolution) -> Result
 }
 
 /// ngserver finds TypeScript and Angular's compiler through probe
-/// locations: the project's `node_modules`, then Hangar's.
+/// locations: the project's `node_modules` (in a trusted workspace), then
+/// Hangar's.
 fn configure_angular(config: &mut ServerConfig, resolution: &Resolution) -> Result<(), ResolveError> {
-    let mut locations = vec![resolution.root.join("node_modules")];
+    let mut locations = Vec::new();
+    if resolution.tools.trust_project {
+        locations.push(resolution.root.join("node_modules"));
+    }
     if let Some(managed) = &resolution.tools.managed {
         locations.push(managed.node_modules());
     }
@@ -1164,13 +1235,86 @@ mod tests {
         let context = FileContext::detect(&root.join("index.ts"), "typescript", root);
         let plans = plan(&context);
         assert_eq!(ids(&plans), ["typescript-classic"]);
-        let config = plans[0].resolve(&ToolDirs::default()).unwrap();
+        let config = plans[0].resolve(&ToolDirs { trust_project: true, ..ToolDirs::default() }).unwrap();
         assert_eq!(config.command, server.to_string_lossy());
         assert_eq!(config.args, ["--stdio"]);
         let tsserver = &config.initialization_options.as_ref().unwrap()["tsserver"]["path"];
         assert_eq!(tsserver.as_str().unwrap(), root.join("node_modules/typescript/lib/tsserver.js").to_string_lossy());
         let path = config.env.iter().find(|(k, _)| k == "PATH").unwrap();
         assert!(path.1.starts_with(&*root.join("node_modules/.bin").to_string_lossy()));
+    }
+
+    #[test]
+    fn servers_that_run_project_code_wait_for_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "package.json", "{}");
+        write(root, "eslint.config.js", "export default []");
+        write(root, "biome.json", "{}");
+        let ran = root.join("ran");
+        let planted = format!("#!/bin/sh\ntouch {}\n", ran.display());
+        for program in ["vscode-eslint-language-server", "biome"] {
+            executable(root, &format!("node_modules/.bin/{program}"), &planted);
+        }
+        let context = FileContext::detect(&root.join("index.js"), "javascript", root);
+        let plans = plan(&context);
+        let find = |id: &str| plans.iter().find(|p| p.spec.id == id).unwrap_or_else(|| panic!("{id} planned"));
+        let (untrusted, trusted) = (ToolDirs::default(), ToolDirs { trust_project: true, ..ToolDirs::default() });
+
+        // ESLint loads the project's config, so it waits even when installed
+        // globally. Biome lives only in the project, so it says why it is
+        // off rather than "not installed".
+        assert_eq!(find("eslint").resolve(&untrusted).unwrap_err(), ResolveError::NeedsTrust);
+        assert_eq!(find("biome").resolve(&untrusted).unwrap_err(), ResolveError::NeedsTrust);
+        assert!(!ran.exists());
+
+        assert_eq!(find("eslint").resolve(&trusted).unwrap().command, root.join("node_modules/.bin/vscode-eslint-language-server").to_string_lossy());
+        assert_eq!(find("biome").resolve(&trusted).unwrap().command, root.join("node_modules/.bin/biome").to_string_lossy());
+
+        // rust-analyzer runs build scripts: off until trusted.
+        let rust = plan(&FileContext::detect(&root.join("main.rs"), "rust", root));
+        assert_eq!(rust[0].resolve(&untrusted).unwrap_err(), ResolveError::NeedsTrust);
+        assert_ne!(rust[0].resolve(&trusted).err(), Some(ResolveError::NeedsTrust));
+    }
+
+    #[test]
+    fn notebooks_are_trusted() {
+        // Notebooks run in Hangar's own scratch project.
+        assert_ne!(resolve_server("rust", &[]).err().as_deref(), Some("off until this workspace is trusted"));
+    }
+
+    #[test]
+    fn untrusted_workspaces_never_run_project_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cloned");
+        let ran = dir.path().join("ran");
+        let planted = format!("#!/bin/sh\ntouch {}\necho 'Version 7.0.2'\n", ran.display());
+        write(&root, "package.json", r#"{"devDependencies": {"typescript": "5"}}"#);
+        write(&root, "node_modules/typescript/lib/tsserver.js", "");
+        write(&root, "node_modules/typescript/package.json", r#"{"version": "5.6.3"}"#);
+        executable(&root, "node_modules/.bin/typescript-language-server", &planted);
+        let untrusted = ToolDirs::default();
+
+        let classic = plan(&FileContext::detect(&root.join("index.ts"), "typescript", &root));
+        if let Ok(config) = classic[0].resolve(&untrusted) {
+            // A server installed on this machine may still be found.
+            assert!(!config.command.starts_with(&*root.to_string_lossy()), "{}", config.command);
+            let options = config.initialization_options.unwrap_or_default().to_string();
+            assert!(!options.contains(&*root.to_string_lossy()), "no project TypeScript: {options}");
+            let path = config.env.iter().find(|(k, _)| k == "PATH").unwrap();
+            assert!(!path.1.contains(&*root.join("node_modules").to_string_lossy()));
+        }
+
+        // TypeScript 7: picking `tsc` runs `tsc --version`, which must not
+        // be the project's.
+        write(&root, "node_modules/typescript/package.json", r#"{"version": "7.0.2"}"#);
+        executable(&root, "node_modules/.bin/tsc", &planted);
+        let native = plan(&FileContext::detect(&root.join("index.ts"), "typescript", &root));
+        assert_eq!(ids(&native), ["typescript"]);
+        if let Ok(config) = native[0].resolve(&untrusted) {
+            assert!(!config.command.starts_with(&*root.to_string_lossy()), "{}", config.command);
+        }
+        assert!(!ran.exists(), "a project binary ran in an untrusted workspace");
     }
 
     #[test]
@@ -1186,13 +1330,13 @@ mod tests {
         let plans = plan(&context);
         assert_eq!(ids(&plans), ["typescript"]);
 
-        let config = plans[0].resolve(&ToolDirs::default()).unwrap();
+        let config = plans[0].resolve(&ToolDirs { trust_project: true, ..ToolDirs::default() }).unwrap();
         assert_eq!(config.command, native.to_string_lossy());
         assert_eq!(config.args, ["--lsp", "--stdio"]);
 
         // Only the old compiler around: not installed, with the fix.
         let loose = FileContext::detect(&dir.path().join("x.ts"), "typescript", dir.path());
-        let tools = ToolDirs { search: vec![dir.path().join("global")], managed: None };
+        let tools = ToolDirs { search: vec![dir.path().join("global")], managed: None, trust_project: false };
         let only_old = ServerPlan { spec: plans[0].spec, root: dir.path().to_path_buf(), context: loose };
         if tools.find("tsc").is_some_and(|tsc| tsc.starts_with(dir.path())) {
             // PATH has no tsc of its own, so the old one is the only candidate.

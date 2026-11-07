@@ -12,7 +12,7 @@ echo "==> tests"
 cargo test --quiet \
   -p cockpit-common -p cockpit-persistence -p cockpit-git -p cockpit-terminal \
   -p cockpit-editor -p cockpit-agents -p cockpit-orchestrator -p cockpit-browser \
-  -p cockpit-debugger -p cockpit-notebook \
+  -p cockpit-debugger -p cockpit-notebook -p cockpit-tasks -p cockpit-github \
   -p xtask
 
 echo "==> UI and app (host)"

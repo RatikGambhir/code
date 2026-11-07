@@ -1,7 +1,18 @@
 //! The GitHub token: in the macOS Keychain, or an owner-only file elsewhere
 //! (the UI also runs on Linux for testing). Never logged.
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
+
 use anyhow::Result;
+
+/// Held while saving or removing the token. A sign-out sets the sign-in's
+/// cancel flag and then removes the token; a sign-in checks the flag and
+/// saves under this lock, so it either sees the cancel or saves before the
+/// removal. Either way, no token is left behind.
+static STORE: Mutex<()> = Mutex::new(());
 
 pub fn read() -> Result<Option<String>> {
     Ok(backend::read()?
@@ -10,11 +21,18 @@ pub fn read() -> Result<Option<String>> {
         .filter(|token| !token.is_empty()))
 }
 
-pub fn write(token: &str) -> Result<()> {
-    backend::write(token.trim().as_bytes())
+/// Saves the token unless `cancelled` is set. Returns whether it was saved.
+pub fn write_unless_cancelled(token: &str, cancelled: &AtomicBool) -> Result<bool> {
+    let _store = STORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cancelled.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+    backend::write(token.trim().as_bytes())?;
+    Ok(true)
 }
 
 pub fn delete() -> Result<()> {
+    let _store = STORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     backend::delete()
 }
 

@@ -56,6 +56,10 @@ pub enum LspEvent {
     Missing { server: &'static str, hint: String },
     /// An install finished: what was installed, or why it failed.
     Installed(Result<Vec<String>, String>),
+    /// Servers for a file would run the project's own code (its
+    /// `node_modules` tools, config files or build scripts), so they wait
+    /// until the workspace is trusted (said once).
+    NeedsTrust,
 }
 
 /// A file's diagnostics, by the server (its plan key) that reported them.
@@ -106,6 +110,9 @@ pub struct LspManager {
     /// Servers the user has already been told are missing.
     announced: BTreeSet<&'static str>,
     installing: bool,
+    /// The user has been told that servers wait for the workspace to be
+    /// trusted.
+    told_untrusted: bool,
     diagnostics: HashMap<PathBuf, FileDiagnostics>,
     /// Errors and warnings across `diagnostics`, kept up to date as they
     /// arrive: the status bar shows them on every redraw.
@@ -131,6 +138,7 @@ impl LspManager {
             missing: BTreeMap::new(),
             announced: BTreeSet::new(),
             installing: false,
+            told_untrusted: false,
             diagnostics: HashMap::new(),
             counts: (0, 0),
             last_status: None,
@@ -182,6 +190,13 @@ impl LspManager {
 
     pub fn is_installing(&self) -> bool {
         self.installing
+    }
+
+    /// Lets servers run the project's own tools, or stops them. Takes effect
+    /// for servers started afterwards; the caller restarts them.
+    pub fn set_trust_project(&mut self, trusted: bool) {
+        self.tools.trust_project = trusted;
+        self.told_untrusted = false;
     }
 
     /// One line for the status bar.
@@ -241,6 +256,10 @@ impl LspManager {
             let (context, plans) = detect.await;
             this.update(cx, |this, cx| {
                 let label_changed = this.project_label(&context.path) != context.label();
+                let has_own_tools = context.js.as_ref().is_some_and(|js| js.has_own_tools());
+                if has_own_tools {
+                    this.tell_untrusted(cx);
+                }
                 this.contexts.insert(context.path.clone(), context);
                 for plan in plans {
                     this.attach_to(plan, editor.clone(), cx);
@@ -305,6 +324,16 @@ impl LspManager {
                     Err(StartFailure::Resolve(ResolveError::NotInstalled { install })) => {
                         this.not_installed(spec, install, cx)
                     }
+                    Err(StartFailure::Resolve(ResolveError::NeedsTrust)) => {
+                        this.tell_untrusted(cx);
+                        // A language's main server says why it is off in the
+                        // status bar; a linter just stays quiet.
+                        if spec.is_essential() {
+                            Slot::Failed(ResolveError::NeedsTrust.to_string())
+                        } else {
+                            Slot::Unavailable
+                        }
+                    }
                     Err(StartFailure::Resolve(err)) => {
                         tracing::warn!("{key}: {err}");
                         Slot::Failed(err.to_string())
@@ -321,6 +350,14 @@ impl LspManager {
             })
         })
         .detach();
+    }
+
+    /// Says once that servers wait for the workspace to be trusted.
+    fn tell_untrusted(&mut self, cx: &mut Context<Self>) {
+        if !self.tools.trust_project && !self.told_untrusted {
+            self.told_untrusted = true;
+            cx.emit(LspEvent::NeedsTrust);
+        }
     }
 
     /// Remembers a missing server for "Install Missing Language Servers"

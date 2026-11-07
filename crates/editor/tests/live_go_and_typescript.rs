@@ -25,6 +25,8 @@ fn tools() -> ToolDirs {
     ToolDirs {
         search: cockpit_common::shell_env::common_tool_dirs(),
         managed: std::env::var_os("HANGAR_LANGUAGE_SERVERS").map(ManagedDir::new),
+        // These tests build their own projects.
+        trust_project: true,
     }
 }
 

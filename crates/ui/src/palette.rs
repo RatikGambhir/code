@@ -135,6 +135,8 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Go Forward", Box::new(actions::NavigateForward)),
         ("Restart Language Servers", Box::new(actions::RestartLanguageServers)),
         ("Install Missing Language Servers", Box::new(actions::InstallLanguageServers)),
+        ("Trust This Workspace", Box::new(actions::TrustWorkspace)),
+        ("Stop Trusting This Workspace", Box::new(actions::UntrustWorkspace)),
         ("Run Project Task…", Box::new(actions::RunProjectTask)),
         ("Run", Box::new(actions::RunSelected)),
         ("Debug", Box::new(actions::DebugSelected)),

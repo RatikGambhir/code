@@ -278,18 +278,6 @@ impl Element for Inline {
     ) -> Self::PrepaintState {
         self.styled_text
             .prepaint(id, inspector_id, bounds, &mut (), window, cx);
-        // TEMP-DEBUG overflow
-        {
-            let l = self.styled_text.layout();
-            let lines = l.wrapped_text().lines().count();
-            eprintln!(
-                "INLINE-DBG bounds={:?} lines={} painted_h={:?} text={:?}",
-                bounds,
-                lines,
-                l.line_height() * lines as f32,
-                l.text().chars().take(30).collect::<String>()
-            );
-        }
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         hitbox

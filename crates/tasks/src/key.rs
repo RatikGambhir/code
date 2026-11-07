@@ -2,6 +2,11 @@
 //! macOS Keychain, or an owner-only file elsewhere (the UI also runs on
 //! Linux for testing). Never logged.
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex, MutexGuard,
+};
+
 use anyhow::Result;
 
 use crate::oauth::{self, Tokens};
@@ -42,26 +47,61 @@ pub fn read_credential() -> Result<Option<Credential>> {
     }))
 }
 
-pub fn write_credential(credential: &Credential) -> Result<()> {
-    match credential {
-        Credential::ApiKey(key) => write(key),
-        Credential::OAuth(tokens) => write(&serde_json::to_string(tokens)?),
+/// Held while saving or removing the sign-in. A disconnect sets the
+/// sign-in's cancel flag and then removes the sign-in; a sign-in checks the
+/// flag and saves under this lock, so it either sees the cancel or saves
+/// before the removal. Either way, nothing is left behind.
+static STORE: Mutex<()> = Mutex::new(());
+
+/// Held while renewing browser tokens, so two windows don't both spend the
+/// same refresh token at once.
+static REFRESH: Mutex<()> = Mutex::new(());
+
+fn lock(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Saves the sign-in unless `cancelled` is set. Returns whether it was saved.
+pub fn write_credential_unless_cancelled(credential: &Credential, cancelled: &AtomicBool) -> Result<bool> {
+    let text = encode(credential)?;
+    let _store = lock(&STORE);
+    if cancelled.load(Ordering::SeqCst) {
+        return Ok(false);
     }
+    write(&text)?;
+    Ok(true)
+}
+
+fn encode(credential: &Credential) -> Result<String> {
+    Ok(match credential {
+        Credential::ApiKey(key) => key.clone(),
+        Credential::OAuth(tokens) => serde_json::to_string(tokens)?,
+    })
 }
 
 /// The saved sign-in, with browser tokens renewed (and saved) first when
 /// they are about to lapse.
 pub fn usable_credential() -> Result<Option<Credential>> {
+    let _refresh = lock(&REFRESH);
+    // Read after taking the lock: another window may have just renewed.
+    let tokens = match read_credential()? {
+        Some(Credential::OAuth(tokens)) => tokens,
+        other => return Ok(other),
+    };
+    let Some(renewed) = oauth::fresh(&tokens)? else {
+        return Ok(Some(Credential::OAuth(tokens)));
+    };
+    let renewed = Credential::OAuth(renewed);
+    let _store = lock(&STORE);
+    // Save only over the tokens that were renewed. If Linear was
+    // disconnected meanwhile, don't bring the sign-in back.
     match read_credential()? {
-        Some(Credential::OAuth(tokens)) => match oauth::fresh(&tokens)? {
-            Some(renewed) => {
-                let credential = Credential::OAuth(renewed);
-                write_credential(&credential)?;
-                Ok(Some(credential))
-            }
-            None => Ok(Some(Credential::OAuth(tokens))),
-        },
-        other => Ok(other),
+        Some(Credential::OAuth(current)) if current == tokens => {
+            write(&encode(&renewed)?)?;
+            Ok(Some(renewed))
+        }
+        Some(_) => Ok(Some(renewed)),
+        None => anyhow::bail!("Linear is not connected"),
     }
 }
 
@@ -71,11 +111,12 @@ pub fn read() -> Result<Option<String>> {
         .filter(|k| !k.trim().is_empty()))
 }
 
-pub fn write(key: &str) -> Result<()> {
+fn write(key: &str) -> Result<()> {
     backend::write(key.trim().as_bytes())
 }
 
 pub fn delete() -> Result<()> {
+    let _store = lock(&STORE);
     backend::delete()
 }
 

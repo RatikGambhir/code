@@ -200,13 +200,20 @@ impl TasksModel {
         if api_key.is_empty() || self.linear.connecting {
             return;
         }
+        // Dropping the task doesn't stop a job already running, so a
+        // disconnect also has to keep it from saving the key.
+        self.cancel_sign_in.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel_sign_in = cancel.clone();
         self.linear.connecting = true;
         self.linear.error = None;
         self.changed(cx);
         let task = cx.background_spawn(async move {
             let credential = Credential::ApiKey(api_key);
             linear::verify(&credential.header())?;
-            key::write_credential(&credential)?;
+            if !key::write_credential_unless_cancelled(&credential, &cancel)? {
+                anyhow::bail!("Sign-in canceled");
+            }
             linear::fetch(&credential.header())
         });
         self.finish_connect(task, cx);
@@ -249,7 +256,9 @@ impl TasksModel {
             let result = pending.finish(&cancel).and_then(|tokens| {
                 let credential = Credential::OAuth(tokens);
                 linear::verify(&credential.header())?;
-                key::write_credential(&credential)?;
+                if !key::write_credential_unless_cancelled(&credential, &cancel)? {
+                    anyhow::bail!("Sign-in canceled");
+                }
                 linear::fetch(&credential.header())
             });
             tx.send(result).ok();

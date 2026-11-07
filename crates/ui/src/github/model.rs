@@ -377,6 +377,11 @@ impl GitHubModel {
         get_token: impl FnOnce() -> Result<String> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        // Dropping the task below doesn't stop a job already running, so a
+        // cancel or sign-out also has to keep it from saving the token.
+        self.cancel_sign_in.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel_sign_in = cancel.clone();
         self.auth = AuthState::Verifying;
         self.error = None;
         self.changed(cx);
@@ -384,7 +389,9 @@ impl GitHubModel {
             let token = get_token()?;
             let client = Client::new(token.clone());
             let user = client.viewer()?;
-            token::write(&token)?;
+            if !token::write_unless_cancelled(&token, &cancel)? {
+                anyhow::bail!("Sign-in canceled");
+            }
             Ok::<_, anyhow::Error>((client, user))
         });
         self.tasks.insert(
@@ -469,7 +476,9 @@ impl GitHubModel {
                         .and_then(|token| {
                             let client = Client::new(token.clone());
                             let user = client.viewer()?;
-                            token::write(&token)?;
+                            if !token::write_unless_cancelled(&token, &cancel)? {
+                                anyhow::bail!("Sign-in canceled");
+                            }
                             Ok((client, user))
                         });
                     tx.send(result).ok();

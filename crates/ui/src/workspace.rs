@@ -114,6 +114,9 @@ struct Layout {
     split: bool,
     /// Chat mode's diff panel is out.
     diff_visible: bool,
+    /// The user trusts this folder: language servers may run the project's
+    /// own code (`node_modules` tools, config files, build scripts).
+    trusted: bool,
 }
 
 impl Default for Layout {
@@ -126,6 +129,7 @@ impl Default for Layout {
             agent_visible: true,
             split: false,
             diff_visible: false,
+            trusted: false,
         }
     }
 }
@@ -206,6 +210,7 @@ impl Workspace {
         let tools = cockpit_editor::lsp::ToolDirs {
             search: cockpit_common::shell_env::common_tool_dirs(),
             managed: Some(cockpit_editor::lsp::ManagedDir::new(AppState::global(cx).paths.language_servers_dir())),
+            trust_project: layout.trusted,
         };
         let lsp = cx.new(|_| LspManager::new(root.clone(), tools));
         let panes = [cx.new(Pane::new), cx.new(Pane::new)];
@@ -274,6 +279,12 @@ impl Workspace {
                     }
                     LspEvent::Installed(Err(err)) => {
                         window.push_notification(Notification::error(format!("Install failed: {err}")), cx);
+                    }
+                    LspEvent::NeedsTrust => {
+                        let message = "Some language servers here would run this project's own code \
+                            (node_modules tools, ESLint or Tailwind config, Rust build scripts…), so they are \
+                            off. If you trust this folder, run \"Trust This Workspace\" from the command palette.";
+                        window.push_notification(Notification::info(message), cx);
                     }
                 }
                 cx.notify();
@@ -736,6 +747,25 @@ impl Workspace {
             self.lsp.update(cx, |lsp, cx| lsp.install_missing(cx));
             format!("Installing {servers}…")
         };
+        window.push_notification(Notification::info(message), cx);
+        cx.notify();
+    }
+
+    /// Trusts this folder, or stops trusting it, then restarts the language
+    /// servers so they start (or stop) running the project's own code.
+    fn set_workspace_trust(&mut self, trusted: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let message = match (self.layout.trusted, trusted) {
+            (true, true) => "This folder is already trusted.",
+            (false, false) => "This folder is not trusted.",
+            (false, true) => "Trusted this folder. Language servers can now run its own code.",
+            (true, false) => "Stopped trusting this folder. Language servers no longer run its own code.",
+        };
+        if self.layout.trusted != trusted {
+            self.layout.trusted = trusted;
+            self.save_layout(cx);
+            self.lsp.update(cx, |lsp, _| lsp.set_trust_project(trusted));
+            self.restart_language_servers(window, cx);
+        }
         window.push_notification(Notification::info(message), cx);
         cx.notify();
     }
@@ -2747,6 +2777,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &actions::InstallLanguageServers, window, cx| {
                 this.install_language_servers(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &actions::TrustWorkspace, window, cx| {
+                this.set_workspace_trust(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &actions::UntrustWorkspace, window, cx| {
+                this.set_workspace_trust(false, window, cx)
             }))
             .on_action(cx.listener(|this, _: &actions::RunProjectTask, window, cx| {
                 this.show_project_tasks(window, cx)

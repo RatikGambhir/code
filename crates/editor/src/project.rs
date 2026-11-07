@@ -499,13 +499,18 @@ impl JsProject {
             }
             bun_hint |= candidate.join("bunfig.toml").exists();
 
+            // Installed tools come only from inside the workspace: trusting a
+            // workspace must not extend to whatever sits above it (a shared
+            // `/tmp/node_modules`), and a stray file outside any workspace
+            // has none at all.
+            let in_workspace = candidate.starts_with(workspace_root);
             let bin = candidate.join("node_modules/.bin");
-            if bin.is_dir() {
+            if in_workspace && bin.is_dir() {
                 native_preview |= bin.join("tsgo").exists();
                 bin_dirs.push(bin);
             }
             // The nearest installed TypeScript is the one the build uses.
-            if typescript_version.is_none() {
+            if in_workspace && typescript_version.is_none() {
                 let package = candidate.join("node_modules/typescript");
                 if let Some(version) = installed_version(&package) {
                     let lib = package.join("lib");
@@ -583,6 +588,12 @@ impl JsProject {
             typescript_version,
             native_preview,
         }
+    }
+
+    /// The project ships its own tools (executables or a TypeScript), which
+    /// servers use only in a trusted workspace.
+    pub fn has_own_tools(&self) -> bool {
+        !self.bin_dirs.is_empty() || self.typescript_lib.is_some()
     }
 
     pub fn typescript_kind(&self) -> TypeScriptKind {
@@ -1103,6 +1114,31 @@ mod tests {
         assert!(labels.contains(&"bun install"));
         assert!(labels.contains(&"bun test"));
         assert!(labels.contains(&"bunx tsc --noEmit"));
+    }
+
+    #[test]
+    fn tools_above_or_outside_the_workspace_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path();
+        write(outer, "node_modules/typescript/lib/tsserver.js", "");
+        write(outer, "node_modules/typescript/package.json", r#"{"version": "5.6.3"}"#);
+        std::fs::create_dir_all(outer.join("node_modules/.bin")).unwrap();
+        let root = outer.join("workspace");
+        write(&root, "package.json", "{}");
+
+        // Inside the workspace: the walk stops at its root.
+        let inside = JsProject::detect(&root, &root);
+        assert!(inside.bin_dirs.is_empty() && inside.typescript_lib.is_none());
+        assert!(!inside.has_own_tools());
+
+        // A stray file outside it still adopts the manifest around it, but
+        // none of the tools.
+        let stray = outer.join("elsewhere");
+        write(&stray, "package.json", "{}");
+        let outside = JsProject::detect(&stray, &root);
+        assert!(outside.has_manifest);
+        assert!(outside.bin_dirs.is_empty() && outside.typescript_lib.is_none());
+        assert_eq!(outside.typescript_version, None);
     }
 
     #[test]
