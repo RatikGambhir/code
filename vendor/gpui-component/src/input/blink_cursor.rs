@@ -37,6 +37,10 @@ impl BlinkCursor {
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         self.epoch = 0;
+        // cockpit patch: drop the pending tick too, so a stopped cursor wakes
+        // nothing up, and start hidden so the next `start` shows it at once.
+        self._task = Task::ready(());
+        self.visible = false;
         cx.notify();
     }
 

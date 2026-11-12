@@ -5,18 +5,23 @@
 //! GPUI and Chromium both assume they own the application object, so the
 //! order matters:
 //!
-//! 1. [`CefRuntime::load`] at the top of `main` loads the framework and runs
-//!    `cef_execute_process` (child processes normally use the separate helper
-//!    binary and never get here).
+//! 1. [`CefRuntime::load`] at the top of `main` only checks that the
+//!    framework is there. Loading it (a ~200 MB library: ~50 ms of dyld
+//!    fixups and ~15 MB of dirty pages) waits for the first tab. A process
+//!    started as a Chromium child (`--type=…`; children normally use the
+//!    separate helper binary and never get here) still loads it and runs
+//!    `cef_execute_process` right away.
 //! 2. GPUI starts and creates `NSApp` as its own `GPUIApplication` class.
 //!    Initializing Chromium first would create a plain `NSApplication` and
 //!    GPUI would crash looking for its ivars.
 //! 3. [`CefRuntime::start`], inside GPUI's run callback, hands out the
-//!    engine. Chromium itself starts with the first tab: retrofitting its
-//!    protocols onto NSApp ([`nsapp`]), `cef_initialize` with an external
-//!    message pump, and the run-loop pump ([`pump`]). A session that never
-//!    opens a page pays nothing for Chromium (its GPU, network and storage
-//!    processes take ~200 MB and slow the launch).
+//!    engine. Chromium itself starts with the first tab: loading the
+//!    framework and `cef_execute_process` (which returns at once in the
+//!    browser process), retrofitting its protocols onto NSApp ([`nsapp`]),
+//!    `cef_initialize` with an external message pump, and the run-loop pump
+//!    ([`pump`]). A session that never opens a page pays nothing for
+//!    Chromium (its GPU, network and storage processes take ~200 MB and slow
+//!    the launch).
 //! 4. [`CefRuntime::shutdown`] after GPUI's run loop returns.
 //!
 //! # Packaging
@@ -64,15 +69,45 @@ pub struct CefRuntime {
 }
 
 struct Inner {
-    // Unloads the framework when dropped, so it must outlive everything else.
-    _loader: LibraryLoader,
-    app: RefCell<cef::App>,
+    /// The framework and our `CefApp`, once the first tab loaded them.
+    loaded: RefCell<Option<Loaded>>,
     options: RuntimeOptions,
     started: Cell<bool>,
     /// Why `cef_initialize` failed, if it did.
     failed: RefCell<Option<String>>,
     /// Per-process secret that marks script results in console messages.
     secret: String,
+}
+
+/// The loaded framework. The loader unloads it when dropped, so `Inner`
+/// shuts Chromium down (its `Drop`) before this goes.
+struct Loaded {
+    _loader: LibraryLoader,
+    app: cef::App,
+}
+
+impl Loaded {
+    /// Loads the framework and runs `cef_execute_process`, which exits here
+    /// if this process is a Chromium child.
+    fn load(exe: &std::path::Path, options: &RuntimeOptions) -> Result<Self> {
+        let loader = LibraryLoader::new(exe, false);
+        if !loader.load() {
+            bail!("loading the Chromium Embedded Framework failed");
+        }
+        // Pins the API version; must precede any other CEF call.
+        let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
+
+        let args = Args::new();
+        let mut app = handlers::HangarApp::new(handlers::AppConfig {
+            remote_debugging_port: options.remote_debugging_port,
+        });
+        let code = cef::execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
+        if code >= 0 {
+            // This process was launched as a Chromium child after all.
+            std::process::exit(code);
+        }
+        Ok(Self { _loader: loader, app })
+    }
 }
 
 impl CefRuntime {
@@ -95,27 +130,13 @@ impl CefRuntime {
             bail!("the browser runtime was loaded twice");
         }
 
-        let loader = LibraryLoader::new(&exe, false);
-        if !loader.load() {
-            bail!("loading the Chromium Embedded Framework failed");
-        }
-        // Pins the API version; must precede any other CEF call.
-        let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
-
-        let args = Args::new();
-        let mut app = handlers::HangarApp::new(handlers::AppConfig {
-            remote_debugging_port: options.remote_debugging_port,
-        });
-        let code = cef::execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
-        if code >= 0 {
-            // This process was launched as a Chromium child after all.
-            std::process::exit(code);
-        }
+        // A Chromium child must run as one before anything else happens.
+        let child = std::env::args().any(|arg| arg.starts_with("--type="));
+        let loaded = if child { Some(Loaded::load(&exe, &options)?) } else { None };
 
         Ok(Self {
             inner: Rc::new(Inner {
-                _loader: loader,
-                app: RefCell::new(app),
+                loaded: RefCell::new(loaded),
                 options,
                 started: Cell::new(false),
                 failed: RefCell::new(None),
@@ -198,6 +219,12 @@ impl Inner {
     }
 
     fn initialize(&self) -> Result<()> {
+        if self.loaded.borrow().is_none() {
+            let exe = std::env::current_exe().context("locating the executable")?;
+            let began = Instant::now();
+            *self.loaded.borrow_mut() = Some(Loaded::load(&exe, &self.options)?);
+            tracing::debug!("Chromium framework loaded in {:.0?}", began.elapsed());
+        }
         nsapp::adopt_cef_app_protocol().map_err(|err| anyhow!(err))?;
 
         let mut settings = cef::Settings {
@@ -220,8 +247,9 @@ impl Inner {
         }
 
         let args = Args::new();
-        let mut app = self.app.borrow_mut();
-        if cef::initialize(Some(args.as_main_args()), Some(&settings), Some(&mut *app), std::ptr::null_mut()) != 1 {
+        let mut loaded = self.loaded.borrow_mut();
+        let app = &mut loaded.as_mut().expect("loaded above").app;
+        if cef::initialize(Some(args.as_main_args()), Some(&settings), Some(app), std::ptr::null_mut()) != 1 {
             bail!("cef_initialize failed (see the Chromium log for details)");
         }
         self.started.set(true);

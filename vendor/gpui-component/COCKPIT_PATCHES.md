@@ -41,5 +41,21 @@ Cockpit's debugger, notebooks and code editors. Every change is marked `cockpit 
   line. Backspace narrows the list back out. The menu highlights the typed
   prefix from the label itself.
 
+- `src/input/element.rs`, `src/input/state.rs`: the text element's paint
+  notifies its `InputState` only when something the next frame draws from
+  changed (scroll offset or size, bounds, selection, a pending scroll), not
+  on every paint. A notify during paint schedules no frame, but GPUI keeps
+  it and marks the input and every view above it dirty for the next frame,
+  so every visible input (each editor, the agent composer) kept its pane,
+  the agent panel and the workspace from ever being reused from the view
+  cache: typing in the editor re-rendered the agent's whole transcript.
+  `update_scroll_offset` is split so paint can set the offset quietly
+  (`set_scroll_offset_clamped`).
+- `src/input/state.rs`, `src/input/blink_cursor.rs`: a focused input stops
+  blinking when its window goes inactive (the cursor is not drawn there),
+  instead of redrawing the window twice a second in the background.
+  `BlinkCursor::stop` drops its pending tick and resets to hidden, so the
+  next `start` shows the cursor at once.
+
 To move to a newer gpui-component, re-apply these and keep the version in
 step with `gpui` in the workspace `Cargo.toml`.

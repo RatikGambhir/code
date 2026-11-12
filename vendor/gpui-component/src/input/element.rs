@@ -1509,16 +1509,39 @@ impl Element for TextElement {
         }
 
         self.state.update(cx, |state, cx| {
+            // cockpit patch: notify only when something the next frame draws
+            // from changed. A notify during paint schedules no frame, but it
+            // marks the input and every view above it dirty for the next one,
+            // so notifying every time kept the editor's pane, the agent panel
+            // (its composer) and the workspace from ever being reused from
+            // GPUI's view cache.
+            let before = (
+                state.scroll_handle.offset(),
+                state.scroll_size,
+                state.input_bounds,
+                state.last_bounds,
+                state.last_selected_range,
+                state.deferred_scroll_offset.is_some(),
+            );
             state.last_layout = Some(prepaint.last_layout.clone());
             state.last_bounds = Some(bounds);
             state.last_cursor = Some(state.cursor());
             state.set_input_bounds(input_bounds, cx);
             state.last_selected_range = Some(selected_range);
             state.scroll_size = prepaint.scroll_size;
-            state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
+            state.set_scroll_offset_clamped(Some(prepaint.cursor_scroll_offset));
             state.deferred_scroll_offset = None;
-
-            cx.notify();
+            let after = (
+                state.scroll_handle.offset(),
+                state.scroll_size,
+                state.input_bounds,
+                state.last_bounds,
+                state.last_selected_range,
+                state.deferred_scroll_offset.is_some(),
+            );
+            if before != after {
+                cx.notify();
+            }
         });
 
         if let Some(hitbox) = prepaint.hover_definition_hitbox.as_ref() {

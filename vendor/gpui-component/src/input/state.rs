@@ -358,13 +358,21 @@ impl InputState {
             cx.observe(&blink_cursor, |_, _, cx| cx.notify()),
             // Blink the cursor when the window is active, pause when it's not.
             cx.observe_window_activation(window, |input, window, cx| {
+                let focus_handle = input.focus_handle.clone();
+                if !focus_handle.is_focused(window) {
+                    return;
+                }
                 if window.is_window_active() {
-                    let focus_handle = input.focus_handle.clone();
-                    if focus_handle.is_focused(window) {
-                        input.blink_cursor.update(cx, |blink_cursor, cx| {
-                            blink_cursor.start(cx);
-                        });
-                    }
+                    input.blink_cursor.update(cx, |blink_cursor, cx| {
+                        blink_cursor.start(cx);
+                    });
+                } else {
+                    // cockpit patch: the cursor is not drawn in an inactive
+                    // window (`show_cursor`), so stop blinking there instead
+                    // of redrawing the window twice a second for nothing.
+                    input.blink_cursor.update(cx, |blink_cursor, cx| {
+                        blink_cursor.stop(cx);
+                    });
                 }
             }),
             cx.on_focus(&focus_handle, window, Self::on_focus),
@@ -1367,6 +1375,13 @@ impl InputState {
         offset: Option<Point<Pixels>>,
         cx: &mut Context<Self>,
     ) {
+        self.set_scroll_offset_clamped(offset);
+        cx.notify();
+    }
+
+    /// cockpit patch: [`Self::update_scroll_offset`] without the notify, for
+    /// paint, which notifies only when something changed.
+    pub(super) fn set_scroll_offset_clamped(&mut self, offset: Option<Point<Pixels>>) {
         let mut offset = offset.unwrap_or(self.scroll_handle.offset());
 
         let safe_y_range =
@@ -1381,7 +1396,6 @@ impl InputState {
         };
         offset.x = offset.x.clamp(safe_x_range.start, safe_x_range.end);
         self.scroll_handle.set_offset(offset);
-        cx.notify();
     }
 
     /// Scroll to make the given offset visible.

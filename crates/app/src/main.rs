@@ -2,8 +2,9 @@
 //! Codex agent.
 //!
 //! Start-up order matters (see `cockpit_browser::cef`): the login shell's
-//! `PATH` is adopted before any thread exists, Chromium is loaded before GPUI
-//! creates `NSApp`, and Chromium is initialized inside GPUI's run callback.
+//! `PATH` is adopted before any thread exists, the browser runtime is set up
+//! before GPUI creates `NSApp`, and Chromium is loaded and initialized when
+//! the first browser tab opens.
 
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc};
 

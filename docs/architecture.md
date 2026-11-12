@@ -252,8 +252,8 @@ Chromium's message loop is pumped from a `CFRunLoopTimer`, because GPUI
 owns `[NSApp run]`. Popups become tabs, and the native context menu is
 suppressed.
 
-Startup does only what the first frame needs: Chromium starts when the
-first browser tab opens.
+Startup does only what the first frame needs: the Chromium framework is
+loaded, and Chromium started, when the first browser tab opens.
 
 ## Agents and orchestration
 
