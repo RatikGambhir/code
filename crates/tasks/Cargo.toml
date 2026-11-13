@@ -1,6 +1,6 @@
 [package]
 name = "cockpit-tasks"
-description = "Projects and issues: a local task list per workspace and a read-only Linear sync"
+description = "Projects and issues: a local task list per workspace and a connected Linear board"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

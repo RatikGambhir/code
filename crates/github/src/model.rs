@@ -85,10 +85,14 @@ pub struct Label {
 pub struct BranchRef {
     #[serde(rename = "ref")]
     pub name: String,
+    #[serde(default)]
+    pub sha: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct PullRequest {
+    #[serde(default)]
+    pub node_id: String,
     pub number: u64,
     pub title: String,
     /// `open` or `closed`.
@@ -102,6 +106,13 @@ pub struct PullRequest {
     pub html_url: String,
     #[serde(default)]
     pub labels: Vec<Label>,
+    #[serde(default, deserialize_with = "logins")]
+    pub assignees: Vec<String>,
+    #[serde(default, deserialize_with = "logins")]
+    pub requested_reviewers: Vec<String>,
+    #[serde(default)]
+    pub requested_teams: Vec<ReviewTeam>,
+    pub milestone: Option<Milestone>,
     pub head: BranchRef,
     pub base: BranchRef,
     #[serde(default, deserialize_with = "timestamp")]
@@ -187,6 +198,7 @@ pub struct Issue {
     pub assignees: Vec<String>,
     #[serde(default)]
     pub comments: u64,
+    pub milestone: Option<Milestone>,
     #[serde(default, deserialize_with = "timestamp")]
     pub created_at: i64,
     #[serde(default, deserialize_with = "timestamp")]
@@ -194,6 +206,28 @@ pub struct Issue {
     /// Set when the issue is really a pull request (the issues API lists both).
     #[serde(default)]
     pub pull_request: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct Milestone {
+    pub number: u64,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct ReviewTeam {
+    pub slug: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct Review {
+    pub id: u64,
+    #[serde(deserialize_with = "login")]
+    pub user: String,
+    pub state: String,
+    pub body: Option<String>,
+    #[serde(default, deserialize_with = "timestamp")]
+    pub submitted_at: i64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]

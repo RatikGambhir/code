@@ -1,6 +1,5 @@
 //! Projects and issues for the Tasks view: a local board per workspace and a
-//! read-only pull from Linear (signed in with an API key or in the browser). Plain data and blocking I/O; callers run the
-//! I/O off the UI thread.
+//! Linear client. Network and disk operations run off the UI thread.
 
 pub mod key;
 pub mod linear;

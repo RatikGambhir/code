@@ -17,8 +17,8 @@ use anyhow::Result;
 use cockpit_github::{
     api::{check_repo_name, StateFilter},
     auth::{self, DeviceCode},
-    token, Client, Comment, Entry, EntryKind, FileContent, Issue, Job, PullFile, PullRequest,
-    Repo, Run, User, Workflow,
+    token, Client, Comment, Entry, EntryKind, FileContent, Issue, Job, PullFile, PullRequest, Repo,
+    Review, Run, User, Workflow,
 };
 use gpui::{AppContext as _, Context, Task};
 
@@ -96,6 +96,7 @@ impl RepoTab {
 pub struct PullDetail {
     pub pull: PullRequest,
     pub files: Vec<PullFile>,
+    pub reviews: Load<Vec<Review>>,
     pub comments: Vec<Comment>,
 }
 
@@ -322,6 +323,61 @@ impl GitHubModel {
             return;
         };
         self.fetch(slot, move |client| job(client, &name), apply, cx);
+    }
+
+    pub(super) fn client(&self) -> Option<Client> {
+        self.client.clone()
+    }
+
+    pub(super) fn refresh_after_write(
+        &mut self,
+        name: &str,
+        target: super::edit::Target,
+        created: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        use super::edit::Target;
+
+        let Some(repo) = self.repo.as_ref().filter(|repo| repo.full_name() == name) else {
+            return;
+        };
+        match target {
+            Target::Issue(number) => {
+                let active = matches!(repo.detail, Detail::Issue(open, _) if Some(open) == number);
+                if created.is_some() {
+                    self.set_issue_filter(StateFilter::Open, cx);
+                } else {
+                    self.load_issues(cx);
+                }
+                if let Some(number) = created.or(number.filter(|_| active)) {
+                    self.open_issue(number, cx);
+                }
+            }
+            Target::Pull(number) => {
+                let active = matches!(repo.detail, Detail::Pull(open, _) if Some(open) == number);
+                if created.is_some() {
+                    self.set_pull_filter(StateFilter::Open, cx);
+                } else {
+                    self.load_pulls(cx);
+                }
+                if let Some(number) = created.or(number.filter(|_| active)) {
+                    self.open_pull(number, cx);
+                }
+            }
+            Target::Code => self.refresh_tab(cx),
+            Target::FileDeleted => self.open_dir(repo.path.clone(), cx),
+            Target::Branch => self.load_branches(cx),
+            Target::Actions => {
+                let run = match &repo.detail {
+                    Detail::Run(run, _) => Some((**run).clone()),
+                    _ => None,
+                };
+                self.load_runs(cx);
+                if let Some(run) = run {
+                    self.open_run(run, cx);
+                }
+            }
+        }
     }
 
     // --- signing in --------------------------------------------------------
@@ -799,6 +855,7 @@ impl GitHubModel {
                 Ok(PullDetail {
                     pull: client.pull(repo, number)?,
                     files: client.pull_files(repo, number)?,
+                    reviews: client.reviews(repo, number).into(),
                     comments: client.comments(repo, number)?,
                 })
             },
@@ -912,11 +969,17 @@ impl GitHubModel {
         repo.detail = Detail::Run(Box::new(run), Load::Loading);
         self.fetch_repo(
             Slot::Detail,
-            move |client, repo| client.jobs(repo, id),
+            move |client, repo| Ok((client.run(repo, id)?, client.jobs(repo, id)?)),
             move |repo, result| {
                 if let Detail::Run(run, jobs) = &mut repo.detail {
                     if run.id == id {
-                        *jobs = result.into();
+                        match result {
+                            Ok((updated, updated_jobs)) => {
+                                **run = updated;
+                                *jobs = Load::Ready(updated_jobs);
+                            }
+                            Err(error) => *jobs = Load::Failed(format!("{error:#}")),
+                        }
                     }
                 }
             },

@@ -51,6 +51,8 @@ impl Default for Selection {
 pub struct LinearState {
     /// A key is stored (it may still turn out to be invalid).
     pub has_key: bool,
+    pub write_authorized: bool,
+    pub comments: Option<Result<Vec<linear::write::Comment>, String>>,
     /// Checked the Keychain once.
     pub key_checked: bool,
     pub connecting: bool,
@@ -77,6 +79,7 @@ pub struct TasksModel {
     revision: u64,
     _load: Option<Task<()>>,
     _fetch: Option<Task<()>>,
+    _comments: Option<Task<()>>,
     /// Stops a browser sign-in that is waiting.
     cancel_sign_in: Arc<AtomicBool>,
     /// A write is in flight.
@@ -100,6 +103,7 @@ impl TasksModel {
             revision: 0,
             _load: None,
             _fetch: None,
+            _comments: None,
             cancel_sign_in: Arc::new(AtomicBool::new(false)),
             saving: false,
             dirty: false,
@@ -133,11 +137,12 @@ impl TasksModel {
                     let board = local::load(&path, &root)?;
                     Ok((path, board))
                 });
-            let has_key = key::read().map(|k| k.is_some());
+            let has_key =
+                key::read_credential().map(|key| key.map(|credential| credential.allows_writes()));
             (local, has_key)
         });
         self._load = Some(cx.spawn(async move |this, cx| {
-            let (local, has_key) = task.await;
+            let (local, stored_access) = task.await;
             this.update(cx, |this, cx| {
                 match local {
                     Ok((path, board)) => {
@@ -148,8 +153,11 @@ impl TasksModel {
                 }
                 this.local_loaded = true;
                 this.linear.key_checked = true;
-                match has_key {
-                    Ok(has_key) => this.linear.has_key = has_key,
+                match stored_access {
+                    Ok(write_authorized) => {
+                        this.linear.has_key = write_authorized.is_some();
+                        this.linear.write_authorized = write_authorized.unwrap_or(false);
+                    }
                     Err(err) => this.linear.error = Some(format!("{err:#}")),
                 }
                 if this.linear.has_key {
@@ -173,6 +181,7 @@ impl TasksModel {
     pub fn open_issue(&mut self, issue: Option<(Source, String)>, cx: &mut Context<Self>) {
         if self.open_issue != issue {
             self.open_issue = issue;
+            self.load_linear_comments(cx);
             self.changed(cx);
         }
     }
@@ -197,7 +206,7 @@ impl TasksModel {
     /// Checks the key with Linear before keeping it in the Keychain.
     pub fn connect_linear(&mut self, api_key: String, cx: &mut Context<Self>) {
         let api_key = api_key.trim().to_string();
-        if api_key.is_empty() || self.linear.connecting {
+        if api_key.is_empty() || self.linear.connecting || self.linear.loading {
             return;
         }
         // Dropping the task doesn't stop a job already running, so a
@@ -210,11 +219,11 @@ impl TasksModel {
         self.changed(cx);
         let task = cx.background_spawn(async move {
             let credential = Credential::ApiKey(api_key);
-            linear::verify(&credential.header())?;
+            let pulled = linear::fetch(&credential.header())?;
             if !key::write_credential_unless_cancelled(&credential, &cancel)? {
                 anyhow::bail!("Sign-in canceled");
             }
-            linear::fetch(&credential.header())
+            Ok((pulled, credential.allows_writes()))
         });
         self.finish_connect(task, cx);
     }
@@ -230,7 +239,7 @@ impl TasksModel {
         let Some(client_id) = oauth::client_id() else {
             return;
         };
-        if self.linear.connecting {
+        if self.linear.connecting || self.linear.loading {
             return;
         }
         self.cancel_sign_in.store(true, Ordering::Relaxed);
@@ -255,11 +264,11 @@ impl TasksModel {
         std::thread::spawn(move || {
             let result = pending.finish(&cancel).and_then(|tokens| {
                 let credential = Credential::OAuth(tokens);
-                linear::verify(&credential.header())?;
+                let pulled = linear::fetch(&credential.header())?;
                 if !key::write_credential_unless_cancelled(&credential, &cancel)? {
                     anyhow::bail!("Sign-in canceled");
                 }
-                linear::fetch(&credential.header())
+                Ok((pulled, credential.allows_writes()))
             });
             tx.send(result).ok();
         });
@@ -279,20 +288,26 @@ impl TasksModel {
     }
 
     /// Lands a connect attempt: the first pull, or the error.
-    fn finish_connect(&mut self, task: Task<anyhow::Result<linear::LinearBoard>>, cx: &mut Context<Self>) {
+    fn finish_connect(
+        &mut self,
+        task: Task<anyhow::Result<(linear::LinearBoard, bool)>>,
+        cx: &mut Context<Self>,
+    ) {
         self._fetch = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
                 this.linear.connecting = false;
                 this.linear.waiting_for_browser = false;
                 match result {
-                    Ok(pulled) => {
+                    Ok((pulled, write_authorized)) => {
                         this.linear.has_key = true;
+                        this.linear.write_authorized = write_authorized;
                         this.apply_pull(pulled);
                         this.selection = Selection {
                             source: Source::Linear,
                             view: View::MyIssues,
                         };
+                        this.open_issue(None, cx);
                     }
                     Err(err) => this.linear.error = Some(format!("{err:#}")),
                 }
@@ -303,10 +318,11 @@ impl TasksModel {
     }
 
     pub fn refresh_linear(&mut self, cx: &mut Context<Self>) {
-        if !self.linear.has_key || self.linear.loading {
+        if !self.linear.has_key || self.linear.loading || self.linear.connecting {
             return;
         }
         self.linear.loading = true;
+        self.load_linear_comments(cx);
         self.changed(cx);
         let task = cx.background_spawn(async move {
             let credential = key::usable_credential()?
@@ -347,6 +363,7 @@ impl TasksModel {
     pub fn disconnect_linear(&mut self, cx: &mut Context<Self>) {
         self.cancel_sign_in.store(true, Ordering::Relaxed);
         self._fetch = None;
+        self._comments = None;
         self.linear = LinearState {
             key_checked: true,
             ..LinearState::default()
@@ -367,6 +384,71 @@ impl TasksModel {
         })
         .detach();
         self.changed(cx);
+    }
+
+    pub(super) fn load_linear_comments(&mut self, cx: &mut Context<Self>) {
+        self._comments = None;
+        self.linear.comments = None;
+        let Some((Source::Linear, issue)) = self.open_issue.clone() else {
+            return;
+        };
+        let task = cx.background_spawn(async move {
+            let credential = key::usable_credential()?
+                .ok_or_else(|| anyhow::anyhow!("Linear is not connected"))?;
+            linear::write::comments(&credential.header(), &issue)
+        });
+        self._comments = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.linear.comments = Some(result.map_err(|err| format!("{err:#}")));
+                this.changed(cx);
+            })
+            .ok();
+        }));
+        self.changed(cx);
+    }
+
+    pub(super) fn apply_linear_issue(
+        &mut self,
+        issue: Issue,
+        created: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // A pull started before the write may contain the old issue.
+        self.cancel_pending_board_pull();
+        let issues = &mut self.linear.board.issues;
+        issues.retain(|existing| existing.id != issue.id);
+        let id = issue.id.clone();
+        let project = issue.project_id.clone();
+        issues.insert(0, issue);
+        issues.truncate(linear::MAX_ISSUES);
+        if created {
+            if !matches!(&self.selection.view, View::Project(id) if Some(id) == project.as_ref()) {
+                self.selection = Selection {
+                    source: Source::Linear,
+                    view: View::Issues,
+                };
+            }
+            self.open_issue(Some((Source::Linear, id)), cx);
+        }
+        self.changed(cx);
+    }
+
+    pub(super) fn remove_linear_issue(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.cancel_pending_board_pull();
+        self.linear.board.issues.retain(|issue| issue.id != id);
+        if matches!(&self.open_issue, Some((Source::Linear, issue)) if issue == id) {
+            self.open_issue(None, cx);
+        }
+        self.refresh_linear(cx);
+        self.changed(cx);
+    }
+
+    fn cancel_pending_board_pull(&mut self) {
+        if self.linear.loading {
+            self._fetch = None;
+            self.linear.loading = false;
+        }
     }
 
     // --- local edits -------------------------------------------------------

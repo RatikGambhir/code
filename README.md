@@ -51,9 +51,10 @@ its own layer of approvals, permissions and token budgets on top of both.
 
 **Your work, in the editor**
 - **Tasks**: a local issue board per workspace, plus your Linear projects
-  and issues (read-only)
+  and editable issues
 - **GitHub**: browse your repositories' code, pull requests with their
-  diffs, issues with comments, and Actions runs (read-only)
+  diffs, issues with comments, and Actions runs. Edit issues, review and
+  merge pull requests, commit files, and manage workflow runs from the IDE.
 - Sign-ins are kept in the macOS Keychain
 
 ## Quick start
@@ -107,8 +108,8 @@ on the UI framework, so everything else can be tested without a display.
 │   ├── notebook/      notebooks: a language-neutral interface, and Rust support
 │   ├── terminal/      PTY-backed shells with a VT100 screen model
 │   ├── git/           git through the git CLI, and a status parser
-│   ├── tasks/         local issue boards and the read-only Linear client
-│   ├── github/        the read-only GitHub client and its sign-in
+│   ├── tasks/         local issue boards and the Linear client
+│   ├── github/        the GitHub client and its sign-in
 │   ├── persistence/   the SQLite database (WAL) and a typed SQL builder
 │   └── common/        typed ids, on-disk paths, and the login-shell environment
 ├── xtask/             `cargo xtask bundle`: builds, assembles and signs Hangar.app

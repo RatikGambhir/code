@@ -17,12 +17,12 @@ use anyhow::{bail, Context as _, Result};
 use serde::Deserialize;
 
 /// Scopes asked for: private repositories (code, pull requests, issues,
-/// Actions) and organization membership, for org repositories.
-pub const SCOPES: &str = "repo read:org";
+/// Actions), organization membership, and editing workflow files.
+pub const SCOPES: &str = "repo read:org workflow";
 
 /// Where a personal access token with the right scopes is made.
 pub const NEW_TOKEN_URL: &str =
-    "https://github.com/settings/tokens/new?scopes=repo,read:org&description=Hangar";
+    "https://github.com/settings/tokens/new?scopes=repo,read:org,workflow&description=Hangar";
 
 const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";

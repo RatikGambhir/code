@@ -1,7 +1,9 @@
-//! A read-only client for GitHub's REST API.
+//! GitHub's REST API client.
 
 use anyhow::{bail, Context as _, Result};
 use serde::{de::DeserializeOwned, Deserialize};
+use serde_json::Value;
+use ureq::http::Method;
 
 use crate::model::{
     Comment, Entry, FileContent, Issue, Job, PullFile, PullRequest, Repo, Run, User, Workflow,
@@ -91,8 +93,7 @@ impl Client {
         struct Branch {
             name: String,
         }
-        let branches: Vec<Branch> =
-            self.get_json(&format!("/repos/{repo}/branches?per_page=100"))?;
+        let branches: Vec<Branch> = self.get_pages(&format!("/repos/{repo}/branches"))?;
         Ok(branches.into_iter().map(|b| b.name).collect())
     }
 
@@ -166,9 +167,7 @@ impl Client {
 
     /// Conversation comments on an issue or pull request.
     pub fn comments(&self, repo: &str, number: u64) -> Result<Vec<Comment>> {
-        self.get_json(&format!(
-            "/repos/{repo}/issues/{number}/comments?per_page=100"
-        ))
+        self.get_pages(&format!("/repos/{repo}/issues/{number}/comments"))
     }
 
     pub fn workflows(&self, repo: &str) -> Result<Vec<Workflow>> {
@@ -194,6 +193,10 @@ impl Client {
         Ok(page.workflow_runs)
     }
 
+    pub fn run(&self, repo: &str, run: u64) -> Result<Run> {
+        self.get_json(&format!("/repos/{repo}/actions/runs/{run}"))
+    }
+
     pub fn jobs(&self, repo: &str, run: u64) -> Result<Vec<Job>> {
         #[derive(Deserialize)]
         struct Page {
@@ -214,25 +217,66 @@ impl Client {
             .header("X-GitHub-Api-Version", "2022-11-28")
     }
 
-    fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let mut response = self
+    pub(super) fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let response = self
             .request(path)
             .header("Accept", "application/vnd.github+json")
             .call()
             .context("contacting GitHub")?;
-        let status = response.status().as_u16();
-        let left = remaining(&response);
-        let text = response
-            .body_mut()
-            .with_config()
-            .limit(32 * 1024 * 1024)
-            .read_to_string()
-            .context("reading GitHub's answer")?;
-        if !(200..300).contains(&status) {
-            return Err(status_error(status, &text, left));
+        serde_json::from_str(&response_text(response)?).context("reading GitHub's answer")
+    }
+
+    pub(super) fn get_pages<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>> {
+        let mut items = Vec::new();
+        for page in 1.. {
+            let batch: Vec<T> = self.get_json(&format!("{path}?per_page=100&page={page}"))?;
+            let finished = batch.len() < 100;
+            items.extend(batch);
+            if finished {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    pub(super) fn write(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        let request = ureq::http::Request::builder()
+            .method(method)
+            .uri(format!("{API}{path}"))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        let response = if let Some(body) = body {
+            self.agent.run(
+                request
+                    .header("Content-Type", "application/json")
+                    .body(serde_json::to_vec(&body)?)?,
+            )
+        } else {
+            self.agent.run(request.body(())?)
+        }
+        .context("contacting GitHub")?;
+        let text = response_text(response)?;
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
         }
         serde_json::from_str(&text).context("reading GitHub's answer")
     }
+}
+
+fn response_text(mut response: ureq::http::Response<ureq::Body>) -> Result<String> {
+    let status = response.status().as_u16();
+    let left = remaining(&response);
+    let text = response
+        .body_mut()
+        .with_config()
+        .limit(32 * 1024 * 1024)
+        .read_to_string()
+        .context("reading GitHub's answer")?;
+    if !(200..300).contains(&status) {
+        return Err(status_error(status, &text, left));
+    }
+    Ok(text)
 }
 
 /// Requests left in this rate-limit window, when GitHub says.
@@ -254,7 +298,7 @@ fn status_error(status: u16, text: &str, remaining: Option<u64>) -> anyhow::Erro
         403 | 429 if remaining == Some(0) => {
             anyhow::anyhow!("GitHub's rate limit is used up. Try again in a few minutes.")
         }
-        404 => anyhow::anyhow!("Not found on GitHub, or this account cannot see it."),
+        404 => anyhow::anyhow!("GitHub could not find this item with the current sign-in."),
         _ => match message {
             Some(message) => anyhow::anyhow!("GitHub: {message}"),
             None => anyhow::anyhow!("GitHub answered HTTP {status}"),
@@ -262,7 +306,7 @@ fn status_error(status: u16, text: &str, remaining: Option<u64>) -> anyhow::Erro
     }
 }
 
-fn classify(bytes: Vec<u8>) -> FileContent {
+pub(super) fn classify(bytes: Vec<u8>) -> FileContent {
     let size = bytes.len() as u64;
     if size > MAX_FILE_BYTES {
         return FileContent::TooLarge { size };
@@ -277,7 +321,7 @@ fn classify(bytes: Vec<u8>) -> FileContent {
     }
 }
 
-fn contents_url(repo: &str, path: &str, git_ref: &str) -> String {
+pub(super) fn contents_url(repo: &str, path: &str, git_ref: &str) -> String {
     let path = path
         .split('/')
         .filter(|s| !s.is_empty())
@@ -293,7 +337,7 @@ fn contents_url(repo: &str, path: &str, git_ref: &str) -> String {
 }
 
 /// Percent-encodes everything but RFC 3986's unreserved characters.
-fn encode(text: &str) -> String {
+pub(super) fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
         match byte {

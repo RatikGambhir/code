@@ -10,7 +10,7 @@ pub enum Source {
     /// Kept by Hangar for this workspace; editable here.
     #[default]
     Local,
-    /// Pulled from Linear; read-only here.
+    /// Stored in Linear.
     Linear,
 }
 

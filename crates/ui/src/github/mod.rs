@@ -1,6 +1,6 @@
-//! GitHub: sign in, then browse your repositories' code, pull requests,
-//! issues and Actions runs.
+//! The GitHub views for code, pull requests, issues and Actions runs.
 
+mod edit;
 mod model;
 mod sidebar;
 mod view;

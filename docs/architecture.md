@@ -51,8 +51,8 @@ crates/
 ├── notebook/      notebooks: the language-neutral interface and Rust support
 ├── terminal/      PTY-backed shells with a VT100 screen model
 ├── git/           git through the git CLI, and a status parser
-├── tasks/         local issue boards and the read-only Linear client
-├── github/        the read-only GitHub client and its sign-in
+├── tasks/         local issue boards and the Linear client
+├── github/        the GitHub client and its sign-in
 ├── persistence/   the SQLite database and a typed SQL builder
 └── common/        ids, on-disk paths, and the login-shell environment
 ```
@@ -210,8 +210,8 @@ Everything about files that isn't drawing.
 | Crate | Files |
 |---|---|
 | `git` | `lib.rs` runs the `git` CLI (status, diffs, commits, worktrees), so behaviour matches your terminal; `status.rs` parses `git status --porcelain=v2`. |
-| `tasks` | `model.rs` (projects and issues, whatever their source), `local.rs` (the per-folder board, saved as JSON in Hangar's data directory), `linear.rs` (read-only GraphQL pull), `oauth.rs` (Linear browser sign-in with PKCE), `key.rs` (keeping the API key or tokens in the Keychain). |
-| `github` | `auth.rs` (device-flow browser sign-in and the `gh` CLI login), `token.rs` (the token in the Keychain), `api.rs` (read-only REST client), `model.rs` (repositories, pull requests, issues, runs). |
+| `tasks` | `model.rs` (projects and issues, whatever their source), `local.rs` (the per-folder board, saved as JSON in Hangar's data directory), `linear.rs` and `linear/write.rs` (GraphQL queries and mutations), `oauth.rs` (Linear browser sign-in with PKCE), `key.rs` (keeping the API key or tokens in the Keychain). |
+| `github` | `auth.rs` (device-flow browser sign-in and the `gh` CLI login), `token.rs` (the token in the Keychain), `api.rs` and `write.rs` (GitHub queries and mutations), `model.rs` (repositories, pull requests, issues, runs). |
 | `persistence` | `lib.rs` (the database, one SQLite connection in WAL mode), `schema.rs` (migrations and tables), `sql.rs` (a typed SQL builder), `service.rs` (a database thread, so the UI never waits on disk). |
 | `common` | `paths.rs` (where Hangar keeps its files), `shell_env.rs` (reading `PATH` from your login shell, and common tool folders), `ids.rs` (typed ids), `startup.rs` (start-up timing). |
 

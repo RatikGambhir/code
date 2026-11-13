@@ -19,7 +19,7 @@ use sha2::{Digest as _, Sha256};
 const AUTHORIZE_URL: &str = "https://linear.app/oauth/authorize";
 const TOKEN_URL: &str = "https://api.linear.app/oauth/token";
 const REVOKE_URL: &str = "https://api.linear.app/oauth/revoke";
-const SCOPES: &str = "read";
+const SCOPES: &str = "read,write";
 /// The port and path registered as the OAuth app's callback URL. The port
 /// must match exactly, so it is fixed.
 pub const CALLBACK_PORT: u16 = 47_621;
@@ -55,6 +55,8 @@ pub struct Tokens {
     #[serde(default)]
     pub expires_at: i64,
     pub client_id: String,
+    #[serde(default)]
+    pub write_authorized: bool,
 }
 
 impl Tokens {
@@ -171,14 +173,21 @@ impl PendingSignIn {
             let detail = params.get("error_description").unwrap_or(error);
             bail!("Linear: {detail}");
         }
-        let code = params.get("code").ok_or_else(|| anyhow!("Linear sent no code"))?;
-        token_request(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", &redirect_uri()),
-            ("client_id", &self.client_id),
-            ("code_verifier", &self.verifier),
-        ], &self.client_id, None)
+        let code = params
+            .get("code")
+            .ok_or_else(|| anyhow!("Linear sent no code"))?;
+        token_request(
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", &redirect_uri()),
+                ("client_id", &self.client_id),
+                ("code_verifier", &self.verifier),
+            ],
+            &self.client_id,
+            None,
+            true,
+        )
     }
 }
 
@@ -200,6 +209,7 @@ pub fn fresh(tokens: &Tokens) -> Result<Option<Tokens>> {
         ],
         &tokens.client_id,
         Some(refresh),
+        tokens.write_authorized,
     )
     .map(Some)
 }
@@ -211,7 +221,28 @@ pub fn revoke(tokens: &Tokens) {
     }
 }
 
-fn token_request(fields: &[(&str, &str)], client_id: &str, old_refresh: Option<&str>) -> Result<Tokens> {
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GrantedScopes {
+    Text(String),
+    List(Vec<String>),
+}
+
+impl GrantedScopes {
+    fn allows_write(&self) -> bool {
+        match self {
+            Self::Text(scopes) => scopes.split([',', ' ']).any(|scope| scope == "write"),
+            Self::List(scopes) => scopes.iter().any(|scope| scope == "write"),
+        }
+    }
+}
+
+fn token_request(
+    fields: &[(&str, &str)],
+    client_id: &str,
+    old_refresh: Option<&str>,
+    requested_write: bool,
+) -> Result<Tokens> {
     #[derive(Deserialize)]
     struct Answer {
         access_token: String,
@@ -219,6 +250,7 @@ fn token_request(fields: &[(&str, &str)], client_id: &str, old_refresh: Option<&
         refresh_token: Option<String>,
         #[serde(default)]
         expires_in: Option<i64>,
+        scope: Option<GrantedScopes>,
     }
     let (status, body) = post_form(TOKEN_URL, fields)?;
     if !(200..300).contains(&status) {
@@ -238,6 +270,10 @@ fn token_request(fields: &[(&str, &str)], client_id: &str, old_refresh: Option<&
         refresh_token: answer.refresh_token.or_else(|| old_refresh.map(str::to_string)),
         expires_at: answer.expires_in.map_or(0, |secs| now() + secs),
         client_id: client_id.to_string(),
+        write_authorized: answer
+            .scope
+            .as_ref()
+            .map_or(requested_write, GrantedScopes::allows_write),
     })
 }
 
@@ -377,10 +413,26 @@ mod tests {
             refresh_token: Some("r".into()),
             expires_at,
             client_id: "c".into(),
+            write_authorized: false,
         };
         assert!(tokens(1_000).needs_refresh(1_000 - 60));
         assert!(!tokens(100_000).needs_refresh(1_000));
         assert!(!tokens(0).needs_refresh(1_000));
+    }
+
+    #[test]
+    fn saved_read_only_tokens_require_consent_and_scope_formats_are_supported() {
+        let old: Tokens =
+            serde_json::from_str(r#"{"access_token":"old","client_id":"c"}"#).unwrap();
+        assert!(!old.write_authorized);
+        for scope in [r#""read write""#, r#""read,write""#, r#"["read","write"]"#] {
+            assert!(serde_json::from_str::<GrantedScopes>(scope)
+                .unwrap()
+                .allows_write());
+        }
+        assert!(!serde_json::from_str::<GrantedScopes>(r#""read""#)
+            .unwrap()
+            .allows_write());
     }
 
     #[test]

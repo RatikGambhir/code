@@ -21,6 +21,7 @@ use gpui_component::{
 };
 
 use super::{
+    edit::{Edit, IssueFields},
     model::{Selection, TasksModel, View},
     widgets,
 };
@@ -96,10 +97,11 @@ struct Composer {
 }
 
 pub struct TasksView {
-    model: Entity<TasksModel>,
+    pub(super) model: Entity<TasksModel>,
     filter: Entity<InputState>,
     key_input: Entity<InputState>,
     composer: Option<Composer>,
+    reconnecting_linear: bool,
     tab: IssueTab,
     collapsed: HashSet<StatusKind>,
     rows: Vec<Row>,
@@ -139,6 +141,7 @@ impl TasksView {
             filter,
             key_input,
             composer: None,
+            reconnecting_linear: false,
             tab: IssueTab::default(),
             collapsed: HashSet::new(),
             rows: Vec::new(),
@@ -466,6 +469,10 @@ impl TasksView {
         let connected = source == Source::Local || model.linear.has_key;
         let loading = model.linear.loading;
         let issues_view = !matches!(selection.view, View::Projects);
+        let linear_editable = source == Source::Linear
+            && model.linear.write_authorized
+            && model.linear.viewer.is_some()
+            && !model.linear.connecting;
 
         h_flex()
             .h(px(44.))
@@ -551,6 +558,18 @@ impl TasksView {
                         .small()
                         .tooltip("Open in Linear")
                         .on_click(move |_, _, cx| cx.open_url(&url)),
+                )
+            })
+            .when(linear_editable && issues_view, |el| {
+                el.child(
+                    Button::new("tasks-linear-new")
+                        .icon(IconName::Plus)
+                        .label("New issue")
+                        .primary()
+                        .small()
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.start_linear_create(window, cx)),
+                        ),
                 )
             })
             .when(source == Source::Local, |el| {
@@ -667,7 +686,7 @@ impl TasksView {
             .into_any_element()
     }
 
-    fn render_connect(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_connect(&self, upgrading: bool, cx: &mut Context<Self>) -> AnyElement {
         let t = tokens(cx).clone();
         let linear = &self.model.read(cx).linear;
         if !linear.key_checked {
@@ -689,7 +708,16 @@ impl TasksView {
                 h_flex()
                     .gap(px(8.))
                     .child(icon("list-todo").size(px(16.)).text_color(t.accent_text))
-                    .child(div().text_size(TEXT_TITLE).font_weight(FontWeight::SEMIBOLD).child("Connect Linear")),
+                    .child(
+                        div()
+                            .text_size(TEXT_TITLE)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(if upgrading {
+                                "Enable Linear editing"
+                            } else {
+                                "Connect Linear"
+                            }),
+                    ),
             );
         if waiting {
             return centered(
@@ -717,8 +745,7 @@ impl TasksView {
         }
         centered(
             card.child(div().text_size(TEXT_BODY).text_color(t.fg_muted).child(
-                    "Pull your Linear projects and issues into this view. The sign-in is kept in your \
-                     macOS Keychain and only sent to Linear.",
+                    "Sign in to view and edit your Linear issues. If you use a personal API key, give it write access for the teams you want to edit.",
                 ))
                 .when(browser, |el| {
                     el.child(
@@ -763,6 +790,16 @@ impl TasksView {
                                 .on_click(|_, _, cx| cx.open_url(LINEAR_KEYS_URL)),
                         ),
                 )
+                .when(upgrading, |el| {
+                    el.child(Button::new("tasks-return-to-linear")
+                        .label("Back to issues")
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.reconnecting_linear = false;
+                            cx.notify();
+                        })))
+                })
                 .into_any_element(),
         )
     }
@@ -842,6 +879,9 @@ impl TasksView {
             .map(|p| (p.id.clone(), p.name.clone()))
             .collect();
         let editable = source == Source::Local;
+        let linear = &self.model.read(cx).linear;
+        let linear_editable =
+            source == Source::Linear && linear.write_authorized && !linear.connecting;
         let id = issue.id.clone();
         let handle = self.model.clone();
 
@@ -869,7 +909,22 @@ impl TasksView {
                 .into_any_element()
         };
 
-        let status = if editable {
+        let status = if linear_editable {
+            let title = format!("Change status · {}", issue.identifier);
+            let edit = Edit::Issue {
+                id: id.clone(),
+                fields: IssueFields::Status,
+            };
+            Button::new("detail-linear-status")
+                .icon(widgets::status_icon(&issue.status, px(14.), &t))
+                .label(issue.status.name.clone())
+                .ghost()
+                .xsmall()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_linear_edit(title.clone(), edit.clone(), window, cx)
+                }))
+                .into_any_element()
+        } else if editable {
             let (handle, id) = (handle.clone(), id.clone());
             Button::new("detail-status")
                 .icon(widgets::status_icon(&issue.status, px(14.), &t))
@@ -970,16 +1025,31 @@ impl TasksView {
                 None => text("No project".into()),
             }
         };
-        let assignee = h_flex()
-            .gap(px(6.))
-            .child(widgets::avatar(issue.assignee.as_deref(), 18., &t))
-            .child(text(
-                issue
-                    .assignee
-                    .clone()
-                    .unwrap_or_else(|| "Unassigned".into()),
-            ))
-            .into_any_element();
+        let assignee_name = issue
+            .assignee
+            .clone()
+            .unwrap_or_else(|| "Unassigned".into());
+        let assignee = if linear_editable {
+            let title = format!("Change assignee · {}", issue.identifier);
+            let edit = Edit::Issue {
+                id: id.clone(),
+                fields: IssueFields::Assignee,
+            };
+            Button::new("detail-linear-assignee")
+                .label(assignee_name)
+                .ghost()
+                .xsmall()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_linear_edit(title.clone(), edit.clone(), window, cx)
+                }))
+                .into_any_element()
+        } else {
+            h_flex()
+                .gap(px(6.))
+                .child(widgets::avatar(issue.assignee.as_deref(), 18., &t))
+                .child(text(assignee_name))
+                .into_any_element()
+        };
         let labels = if issue.labels.is_empty() {
             div()
                 .text_size(TEXT_BODY)
@@ -1022,6 +1092,18 @@ impl TasksView {
                             .text_color(t.fg_subtle)
                             .child(issue.identifier.clone()),
                     )
+                    .when(linear_editable, |el| {
+                        el.child(self.linear_edit_button(
+                            "detail-linear-edit",
+                            "Edit issue",
+                            issue,
+                            Edit::Issue {
+                                id: id.clone(),
+                                fields: IssueFields::All,
+                            },
+                            cx,
+                        ))
+                    })
                     .when_some(url, |el, url| {
                         el.child(
                             Button::new("detail-open")
@@ -1097,6 +1179,30 @@ impl TasksView {
                                     .text_color(t.fg_muted)
                                     .child(issue.description.clone())
                                     .into_any_element()
+                            })
+                            .when(linear_editable, |el| {
+                                el.child(
+                                    h_flex()
+                                        .flex_wrap()
+                                        .gap(px(6.))
+                                        .child(self.linear_edit_button(
+                                            "detail-linear-labels",
+                                            "Manage labels",
+                                            issue,
+                                            Edit::Labels { id: id.clone() },
+                                            cx,
+                                        ))
+                                        .child(self.linear_edit_button(
+                                            "detail-linear-archive",
+                                            "Archive issue",
+                                            issue,
+                                            Edit::Archive { id: id.clone() },
+                                            cx,
+                                        )),
+                                )
+                            })
+                            .when(source == Source::Linear, |el| {
+                                el.child(self.render_linear_comments(issue, cx))
                             })
                             .when(editable, |el| {
                                 el.child(
@@ -1352,6 +1458,13 @@ impl Render for TasksView {
         let model = self.model.read(cx);
         let selection = model.selection.clone();
         let needs_key = selection.source == Source::Linear && !model.linear.has_key;
+        let needs_upgrade = selection.source == Source::Linear
+            && model.linear.has_key
+            && !model.linear.write_authorized;
+        if model.linear.write_authorized {
+            self.reconnecting_linear = false;
+        }
+        let upgrading = needs_upgrade && self.reconnecting_linear;
         let projects_view = selection.view == View::Projects;
         let summary = match &selection.view {
             View::Project(id) => model.project(selection.source, id).cloned(),
@@ -1372,8 +1485,8 @@ impl Render for TasksView {
             .clone()
             .filter(|_| selection.source == Source::Local);
 
-        let list = if needs_key {
-            self.render_connect(cx)
+        let list = if needs_key || upgrading {
+            self.render_connect(upgrading, cx)
         } else {
             let composer = self.composer.as_ref().map(|c| self.render_composer(c, cx));
             let body = if self.rows.is_empty() {
@@ -1419,12 +1532,37 @@ impl Render for TasksView {
             .bg(t.surface)
             .text_color(t.fg)
             .child(header)
+            .when(needs_upgrade && !upgrading, |el| {
+                el.child(
+                    h_flex()
+                        .px(px(16.))
+                        .py(px(6.))
+                        .gap(px(10.))
+                        .border_b_1()
+                        .border_color(t.border)
+                        .child(
+                            div()
+                                .text_size(TEXT_SMALL)
+                                .text_color(t.fg_muted)
+                                .child("Reconnect Linear to assign and edit issues."),
+                        )
+                        .child(
+                            Button::new("tasks-upgrade-linear")
+                                .label("Enable editing")
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.reconnecting_linear = true;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .child(
                 h_flex()
                     .flex_1()
                     .min_h_0()
                     .child(list)
-                    .when_some(detail, |el, (issue, source)| {
+                    .when_some(detail.filter(|_| !upgrading), |el, (issue, source)| {
                         el.child(self.render_detail(&issue, source, cx))
                     }),
             )

@@ -4,8 +4,8 @@
 use std::collections::HashSet;
 
 use cockpit_github::{
-    api::StateFilter, auth, Comment, Entry, EntryKind, FileContent, Issue, Job, PullRequest, Repo,
-    Run, Workflow,
+    api::StateFilter, auth, write::RunAction, Comment, Entry, EntryKind, FileContent, Issue, Job,
+    PullRequest, PullStatus, Repo, Run, Workflow,
 };
 use gpui::{
     div, prelude::*, px, AnyElement, App, Context, Entity, FocusHandle, Focusable, FontWeight,
@@ -23,6 +23,7 @@ use gpui_component::{
 };
 
 use super::{
+    edit::{Edit, Target},
     model::{AuthState, Detail, GitHubModel, IssueDetail, Load, PullDetail, RepoState, RepoTab},
     widgets,
 };
@@ -42,7 +43,7 @@ const EXPANDED_FILES: usize = 12;
 const READING_WIDTH: f32 = 1012.;
 
 pub struct GitHubView {
-    model: Entity<GitHubModel>,
+    pub(super) model: Entity<GitHubModel>,
     token_input: Entity<InputState>,
     /// The open file, in a read-only editor: (repo@ref:path, editor).
     file_view: Option<(String, Entity<EditorView>)>,
@@ -487,7 +488,49 @@ impl GitHubView {
             .px(px(16.))
             .gap(px(10.))
             .child(branch_button)
-            .child(h_flex().min_w_0().flex_wrap().gap(px(4.)).text_size(TEXT_BODY).children(crumbs));
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .flex_wrap()
+                    .gap(px(4.))
+                    .text_size(TEXT_BODY)
+                    .children(crumbs),
+            )
+            .when(!repo.repo.archived && !repo.git_ref.is_empty(), |el| {
+                let mut actions = vec![(
+                    "New branch",
+                    Edit::Branch {
+                        from: repo.git_ref.clone(),
+                    },
+                )];
+                if let Some(file) = &repo.file {
+                    if file.content.ready().is_some() {
+                        actions.push((
+                            "Delete file",
+                            Edit::DeleteFile {
+                                branch: repo.git_ref.clone(),
+                                path: file.path.clone(),
+                            },
+                        ));
+                    }
+                } else {
+                    let path = if repo.path.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}/", repo.path)
+                    };
+                    actions.push((
+                        "New file",
+                        Edit::File {
+                            branch: repo.git_ref.clone(),
+                            path,
+                            new: true,
+                        },
+                    ));
+                }
+                el.child(self.edit_menu("gh-code-actions", "Code actions", actions, cx))
+            });
 
         let body = match &repo.file {
             Some(file) => self.render_file(repo, &file.path, &file.content, cx),
@@ -641,9 +684,42 @@ impl GitHubView {
                             .border_b_1()
                             .border_color(t.border)
                             .bg(t.raised)
-                            .child(Icon::new(IconName::File).size(px(14.)).text_color(t.fg_subtle))
-                            .child(div().flex_1().min_w_0().truncate().text_size(TEXT_BODY).child(path.to_string()))
-                            .when_some(detail, |el, d| el.child(div().text_size(TEXT_SMALL).text_color(t.fg_subtle).child(d)))
+                            .child(
+                                Icon::new(IconName::File)
+                                    .size(px(14.))
+                                    .text_color(t.fg_subtle),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(TEXT_BODY)
+                                    .child(path.to_string()),
+                            )
+                            .when_some(detail, |el, d| {
+                                el.child(
+                                    div().text_size(TEXT_SMALL).text_color(t.fg_subtle).child(d),
+                                )
+                            })
+                            .when(
+                                matches!(content, Load::Ready(FileContent::Text(_)))
+                                    && !repo.repo.archived
+                                    && !repo.git_ref.is_empty(),
+                                |el| {
+                                    el.child(self.edit_button(
+                                        "gh-file-edit",
+                                        "Edit file",
+                                        Edit::File {
+                                            branch: repo.git_ref.clone(),
+                                            path: path.to_string(),
+                                            new: false,
+                                        },
+                                        false,
+                                        cx,
+                                    ))
+                                },
+                            )
                             .child(
                                 Button::new("gh-file-open")
                                     .icon(icon("external-link"))
@@ -668,7 +744,13 @@ impl GitHubView {
 
     // --- pull requests and issues ---------------------------------------------
 
-    fn render_filter_bar(&self, current: StateFilter, pulls: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_filter_bar(
+        &self,
+        repo: &RepoState,
+        current: StateFilter,
+        pulls: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = tokens(cx).clone();
         h_flex()
             .flex_none()
@@ -703,6 +785,25 @@ impl GitHubView {
                         })
                     }))
             }))
+            .child(div().flex_1())
+            .when(!repo.repo.archived, |el| {
+                let (label, action) = if pulls {
+                    (
+                        "New pull request",
+                        Edit::NewPull {
+                            head: if repo.git_ref == repo.repo.default_branch {
+                                String::new()
+                            } else {
+                                repo.git_ref.clone()
+                            },
+                            base: repo.repo.default_branch.clone(),
+                        },
+                    )
+                } else {
+                    ("New issue", Edit::NewIssue)
+                };
+                el.child(self.edit_button("gh-new-item", label, action, true, cx))
+            })
             .into_any_element()
     }
 
@@ -718,7 +819,7 @@ impl GitHubView {
             "gh-pulls",
             &self.scroll,
             reading_column()
-                .child(self.render_filter_bar(repo.pull_filter, true, cx))
+                .child(self.render_filter_bar(repo, repo.pull_filter, true, cx))
                 .child(list)
                 .into_any_element(),
         )
@@ -816,21 +917,195 @@ impl GitHubView {
             window,
             cx,
         );
-        let comments = self.render_comments(&detail.comments, repo.full_name(), window, cx);
+        let target = Target::Pull(Some(number));
+        let comments = self.render_comments(&detail.comments, repo, number, target, window, cx);
         let files = self.render_pull_files(repo, number, detail, cx);
+        let actions = (!repo.repo.archived).then(|| self.pull_actions(pull, target, cx));
+        let reviews = match &detail.reviews {
+            Load::Ready(reviews) => reviews
+                .iter()
+                .map(|review| {
+                    v_flex()
+                        .gap(px(6.))
+                        .child(muted_text(
+                            &format!(
+                                "{} · {}",
+                                review.user,
+                                match review.state.as_str() {
+                                    "APPROVED" => "Approved",
+                                    "CHANGES_REQUESTED" => "Changes requested",
+                                    "DISMISSED" => "Dismissed",
+                                    "PENDING" => "Pending",
+                                    _ => "Reviewed",
+                                }
+                            ),
+                            &t,
+                        ))
+                        .when_some(
+                            review
+                                .body
+                                .as_deref()
+                                .filter(|body| !body.trim().is_empty()),
+                            |el, body| {
+                                el.child(Self::markdown(
+                                    format!("gh-review-{}-{}", repo.full_name(), review.id),
+                                    body,
+                                    window,
+                                    cx,
+                                ))
+                            },
+                        )
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>(),
+            Load::Failed(err) => vec![error_text(err, &t)],
+            _ => vec![],
+        };
         detail_shell(
             back,
             v_flex()
                 .gap(px(18.))
                 .child(header)
+                .children(actions)
                 .child(div().h(px(1.)).bg(t.border))
                 .child(body)
                 .children(comments)
-                .child(section_title(&format!("Files changed · {}", detail.files.len()), &t))
+                .when(!repo.repo.archived, |el| {
+                    el.child(self.edit_button(
+                        "gh-pull-comment",
+                        "Add comment",
+                        Edit::Comment {
+                            target,
+                            number,
+                            comment: None,
+                        },
+                        false,
+                        cx,
+                    ))
+                })
+                .when(!reviews.is_empty(), |el| {
+                    el.child(section_title("Reviews", &t)).children(reviews)
+                })
+                .child(section_title(
+                    &format!("Files changed · {}", detail.files.len()),
+                    &t,
+                ))
                 .child(files)
                 .into_any_element(),
             &self.scroll,
         )
+    }
+
+    fn pull_actions(
+        &self,
+        pull: &PullRequest,
+        target: Target,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let number = pull.number;
+        let status = pull.status();
+        let mut actions = vec![
+            ("Edit title and description", Edit::Pull(pull.clone())),
+            (
+                "Manage assignees, labels and milestone",
+                Edit::Metadata {
+                    target,
+                    number,
+                    assignees: pull.assignees.clone(),
+                    labels: pull.labels.iter().map(|l| l.name.clone()).collect(),
+                    milestone: pull.milestone.clone(),
+                },
+            ),
+        ];
+        if matches!(status, PullStatus::Open | PullStatus::Draft) {
+            actions.extend([
+                (
+                    "Close pull request",
+                    Edit::PullState {
+                        number,
+                        close: true,
+                    },
+                ),
+                (
+                    "Request review",
+                    Edit::Reviewers {
+                        number,
+                        remove: false,
+                    },
+                ),
+            ]);
+            if !pull.requested_reviewers.is_empty() || !pull.requested_teams.is_empty() {
+                actions.push((
+                    "Remove review requests",
+                    Edit::Reviewers {
+                        number,
+                        remove: true,
+                    },
+                ));
+            }
+            if !pull.node_id.is_empty() {
+                actions.push((
+                    if pull.draft {
+                        "Mark ready for review"
+                    } else {
+                        "Convert to draft"
+                    },
+                    Edit::PullDraft {
+                        number,
+                        node: pull.node_id.clone(),
+                        draft: !pull.draft,
+                    },
+                ));
+            }
+        }
+        if status == PullStatus::Closed {
+            actions.push((
+                "Reopen pull request",
+                Edit::PullState {
+                    number,
+                    close: false,
+                },
+            ));
+        }
+        let author = self
+            .model
+            .read(cx)
+            .viewer()
+            .is_some_and(|viewer| viewer.login.eq_ignore_ascii_case(&pull.user));
+        h_flex()
+            .flex_wrap()
+            .gap(px(8.))
+            .child(self.edit_menu("gh-pr-actions", "Pull request actions", actions, cx))
+            .when(
+                matches!(status, PullStatus::Open | PullStatus::Draft),
+                |el| {
+                    el.child(self.edit_button(
+                        "gh-pr-review",
+                        "Review",
+                        Edit::Review {
+                            number,
+                            sha: pull.head.sha.clone(),
+                            author,
+                        },
+                        false,
+                        cx,
+                    ))
+                },
+            )
+            .when(status == PullStatus::Open, |el| {
+                el.child(self.edit_button(
+                    "gh-pr-merge",
+                    "Merge",
+                    Edit::Merge {
+                        number,
+                        sha: pull.head.sha.clone(),
+                        base: pull.base.name.clone(),
+                    },
+                    true,
+                    cx,
+                ))
+            })
+            .into_any_element()
     }
 
     fn render_pull_files(&self, repo: &RepoState, number: u64, detail: &PullDetail, cx: &mut Context<Self>) -> AnyElement {
@@ -918,7 +1193,7 @@ impl GitHubView {
             "gh-issues",
             &self.scroll,
             reading_column()
-                .child(self.render_filter_bar(repo.issue_filter, false, cx))
+                .child(self.render_filter_bar(repo, repo.issue_filter, false, cx))
                 .child(list)
                 .into_any_element(),
         )
@@ -1000,24 +1275,125 @@ impl GitHubView {
                 el.child(div().text_size(TEXT_SMALL).text_color(t.fg_subtle).child(format!("Assigned to {}", issue.assignees.join(", "))))
             });
         let body = conversation_item(&issue.user, issue.created_at, issue.body.as_deref(), format!("gh-issue-body-{}-{number}", repo.full_name()), window, cx);
-        let comments = self.render_comments(&detail.comments, repo.full_name(), window, cx);
+        let target = Target::Issue(Some(number));
+        let comments = self.render_comments(&detail.comments, repo, number, target, window, cx);
+        let actions = (!repo.repo.archived).then(|| {
+            h_flex()
+                .flex_wrap()
+                .gap(px(8.))
+                .child(self.edit_button(
+                    "gh-issue-edit",
+                    "Edit issue",
+                    Edit::Issue(issue.clone()),
+                    false,
+                    cx,
+                ))
+                .child(self.edit_menu(
+                    "gh-issue-actions",
+                    "Issue actions",
+                    vec![
+                        (
+                            "Manage assignees, labels and milestone",
+                            Edit::Metadata {
+                                target,
+                                number,
+                                assignees: issue.assignees.clone(),
+                                labels: issue.labels.iter().map(|l| l.name.clone()).collect(),
+                                milestone: issue.milestone.clone(),
+                            },
+                        ),
+                        (
+                            if open { "Close issue" } else { "Reopen issue" },
+                            Edit::IssueState {
+                                number,
+                                close: open,
+                            },
+                        ),
+                    ],
+                    cx,
+                ))
+        });
         detail_shell(
             back,
             v_flex()
                 .gap(px(18.))
                 .child(header)
+                .children(actions)
                 .child(div().h(px(1.)).bg(t.border))
                 .child(body)
                 .children(comments)
+                .when(!repo.repo.archived, |el| {
+                    el.child(self.edit_button(
+                        "gh-issue-comment",
+                        "Add comment",
+                        Edit::Comment {
+                            target,
+                            number,
+                            comment: None,
+                        },
+                        false,
+                        cx,
+                    ))
+                })
                 .into_any_element(),
             &self.scroll,
         )
     }
 
-    fn render_comments(&self, comments: &[Comment], repo: &str, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_comments(
+        &self,
+        comments: &[Comment],
+        repo: &RepoState,
+        number: u64,
+        target: Target,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let login = self.model.read(cx).viewer().map(|v| v.login.clone());
         comments
             .iter()
-            .map(|c| conversation_item(&c.user, c.created_at, c.body.as_deref(), format!("gh-comment-{repo}-{}", c.id), window, cx))
+            .map(|comment| {
+                let own = !repo.repo.archived
+                    && login
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&comment.user));
+                v_flex()
+                    .gap(px(4.))
+                    .child(conversation_item(
+                        &comment.user,
+                        comment.created_at,
+                        comment.body.as_deref(),
+                        format!("gh-comment-{}-{}", repo.full_name(), comment.id),
+                        window,
+                        cx,
+                    ))
+                    .when(own, |el| {
+                        el.child(h_flex().justify_end().child(self.edit_menu(
+                            ("gh-comment-actions", comment.id),
+                            "Comment actions",
+                            vec![
+                                (
+                                    "Edit comment",
+                                    Edit::Comment {
+                                        target,
+                                        number,
+                                        comment: Some(comment.clone()),
+                                    },
+                                ),
+                                (
+                                    "Delete comment",
+                                    Edit::DeleteComment {
+                                        target,
+                                        number,
+                                        id: comment.id,
+                                    },
+                                ),
+                            ],
+                            cx,
+                        )))
+                    })
+                    .into_any_element()
+            })
             .collect()
     }
 
@@ -1065,19 +1441,50 @@ impl GitHubView {
                             .children(side),
                     ),
             )
-            .child(div().flex_1().min_w_0().h_full().child(scroll_area(
-                "gh-runs",
-                &self.scroll,
-                v_flex().px(px(16.)).pb(px(24.)).child(
-                    h_flex().h(px(44.)).text_size(TEXT_BODY).font_weight(FontWeight::MEDIUM).child(
-                        selected
-                            .and_then(|id| names.get(&id).cloned())
-                            .unwrap_or_else(|| "All workflow runs".to_string()),
-                    ),
-                )
-                .child(runs)
-                .into_any_element(),
-            )))
+            .child(
+                div().flex_1().min_w_0().h_full().child(scroll_area(
+                    "gh-runs",
+                    &self.scroll,
+                    v_flex()
+                        .px(px(16.))
+                        .pb(px(24.))
+                        .child(
+                            h_flex()
+                                .h(px(44.))
+                                .gap(px(8.))
+                                .text_size(TEXT_BODY)
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(
+                                    selected
+                                        .and_then(|id| names.get(&id).cloned())
+                                        .unwrap_or_else(|| "All workflow runs".to_string()),
+                                )
+                                .child(div().flex_1())
+                                .when_some(
+                                    workflows.iter().find(|w| {
+                                        selected == Some(w.id)
+                                            && w.state == "active"
+                                            && !repo.repo.archived
+                                    }),
+                                    |el, workflow| {
+                                        el.child(self.edit_button(
+                                            "gh-dispatch-workflow",
+                                            "Run workflow",
+                                            Edit::Workflow {
+                                                id: workflow.id,
+                                                name: workflow.name.clone(),
+                                                git_ref: repo.git_ref.clone(),
+                                            },
+                                            true,
+                                            cx,
+                                        ))
+                                    },
+                                ),
+                        )
+                        .child(runs)
+                        .into_any_element(),
+                )),
+            )
             .into_any_element()
     }
 
@@ -1119,7 +1526,13 @@ impl GitHubView {
             .into_any_element()
     }
 
-    fn render_run_detail(&self, run: &Run, jobs: &Load<Vec<Job>>, cx: &mut Context<Self>) -> AnyElement {
+    fn render_run_detail(
+        &self,
+        repo: &RepoState,
+        run: &Run,
+        jobs: &Load<Vec<Job>>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = tokens(cx).clone();
         let back = back_button("Runs", cx);
         let state = run.state();
@@ -1160,6 +1573,36 @@ impl GitHubView {
             v_flex()
                 .gap(px(18.))
                 .child(header)
+                .when(!repo.repo.archived, |el| {
+                    let actions = if run.status == "completed" {
+                        let mut actions = vec![(
+                            "Rerun workflow",
+                            Edit::Run {
+                                run: run.clone(),
+                                action: RunAction::Rerun,
+                            },
+                        )];
+                        if run.conclusion.as_deref() == Some("failure") {
+                            actions.push((
+                                "Rerun failed jobs",
+                                Edit::Run {
+                                    run: run.clone(),
+                                    action: RunAction::RerunFailedJobs,
+                                },
+                            ));
+                        }
+                        actions
+                    } else {
+                        vec![(
+                            "Cancel run",
+                            Edit::Run {
+                                run: run.clone(),
+                                action: RunAction::Cancel,
+                            },
+                        )]
+                    };
+                    el.child(self.edit_menu("gh-run-actions", "Run actions", actions, cx))
+                })
                 .child(div().h(px(1.)).bg(t.border))
                 .child(section_title("Jobs", &t))
                 .child(jobs_view)
@@ -1187,9 +1630,15 @@ impl Render for GitHubView {
             self.render_sign_in(cx)
         } else if let Some(repo) = repo {
             let body = match (&repo.tab, &repo.detail) {
-                (RepoTab::Pulls, Detail::Pull(number, detail)) => self.render_pull_detail(&repo, *number, detail, window, cx),
-                (RepoTab::Issues, Detail::Issue(number, detail)) => self.render_issue_detail(&repo, *number, detail, window, cx),
-                (RepoTab::Actions, Detail::Run(run, jobs)) => self.render_run_detail(run, jobs, cx),
+                (RepoTab::Pulls, Detail::Pull(number, detail)) => {
+                    self.render_pull_detail(&repo, *number, detail, window, cx)
+                }
+                (RepoTab::Issues, Detail::Issue(number, detail)) => {
+                    self.render_issue_detail(&repo, *number, detail, window, cx)
+                }
+                (RepoTab::Actions, Detail::Run(run, jobs)) => {
+                    self.render_run_detail(&repo, run, jobs, cx)
+                }
                 (RepoTab::Code, _) => self.render_code(&repo, window, cx),
                 (RepoTab::Pulls, _) => self.render_pulls(&repo, cx),
                 (RepoTab::Issues, _) => self.render_issues(&repo, cx),

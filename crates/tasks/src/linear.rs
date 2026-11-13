@@ -1,4 +1,4 @@
-//! A read-only pull from Linear's GraphQL API. Calls take the
+//! Linear's GraphQL API. Calls take the
 //! `Authorization` header value: a personal API key, or `Bearer <token>`
 //! from the browser sign-in.
 //!
@@ -21,17 +21,18 @@ const PAGE: usize = 100;
 /// The most recently updated issues kept.
 pub const MAX_ISSUES: usize = 500;
 
+pub mod write;
+
 const ISSUE_FIELDS: &str = "
-fragment IssuePage on IssueConnection {
-  pageInfo { hasNextPage endCursor }
-  nodes {
     id identifier title description url priority createdAt updatedAt
     state { name type color }
     assignee { id name }
     project { id }
-    labels(first: 5) { nodes { name color } }
-  }
-}";
+    labels(first: 5) { nodes { name color } }";
+
+fn issue_page_fragment() -> String {
+    format!("fragment IssuePage on IssueConnection {{ pageInfo {{ hasNextPage endCursor }} nodes {{ {ISSUE_FIELDS} }} }}")
+}
 
 /// The signed-in Linear user.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -72,6 +73,7 @@ pub fn verify(authorization: &str) -> Result<Viewer> {
 
 /// Projects and recent issues the sign-in can see.
 pub fn fetch(authorization: &str) -> Result<LinearBoard> {
+    let fragment = issue_page_fragment();
     let first = format!(
         "query Board($first: Int!) {{
   viewer {{ id name organization {{ name }} }}
@@ -79,7 +81,7 @@ pub fn fetch(authorization: &str) -> Result<LinearBoard> {
     nodes {{ id name description color url progress targetDate lead {{ name }} status {{ name type }} }}
   }}
   issues(first: $first, orderBy: updatedAt) {{ ...IssuePage }}
-}}{ISSUE_FIELDS}"
+}}{fragment}"
     );
     let data: FirstPage = request(authorization, &first, json!({ "first": PAGE }))?;
     let viewer = data.viewer;
@@ -106,7 +108,7 @@ pub fn fetch(authorization: &str) -> Result<LinearBoard> {
             break;
         };
         let more = format!(
-            "query More($first: Int!, $after: String) {{ issues(first: $first, after: $after, orderBy: updatedAt) {{ ...IssuePage }} }}{ISSUE_FIELDS}"
+            "query More($first: Int!, $after: String) {{ issues(first: $first, after: $after, orderBy: updatedAt) {{ ...IssuePage }} }}{fragment}"
         );
         let data: MorePage = request(authorization, &more, json!({ "first": PAGE, "after": after }))?;
         page = data.issues;

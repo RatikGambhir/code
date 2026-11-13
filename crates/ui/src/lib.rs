@@ -15,6 +15,7 @@ pub mod lsp;
 pub mod notebook;
 pub mod palette;
 pub mod pane;
+mod remote_form;
 pub mod search_panel;
 pub mod source_control;
 pub mod state;

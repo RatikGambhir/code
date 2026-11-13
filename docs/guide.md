@@ -146,16 +146,19 @@ beside the list.
   issues with New issue or **+** on a status group, and set status,
   priority and project in the details pane.
 - **Linear** shows your projects, the issues assigned to you, and your 500
-  most recently updated issues, read-only. Choose **Connect Linear**, then
-  either **Sign in with Linear** in your browser, or paste a personal API
-  key (Linear → Settings → Security & access). The sign-in is kept in the
-  macOS Keychain. **Open in Linear** jumps to an item, and **Pull from
-  Linear** refreshes.
+  most recently updated issues. Choose **Connect Linear** and sign in or
+  paste a personal API key with write access for your teams. For an existing
+  browser connection, choose **Enable editing** and authorize write access.
+  Hangar keeps the sign-in in the macOS Keychain.
+- In **All issues**, **My issues**, or a project, use **New issue** to
+  create a Linear issue. Open an issue and click its status or assignee to
+  change it. **Edit issue** also lets you update its title, description,
+  priority, project, and due date. The details pane has actions for labels,
+  archiving, and comments.
 
 ## GitHub
 
-The GitHub button in the left rail opens your repositories. Everything is
-read-only.
+Open **GitHub** in the left rail and select a repository.
 
 **Signing in**, three ways:
 
@@ -163,23 +166,31 @@ read-only.
   opens github.com in your browser, and finishes when you approve.
 - **Use my GitHub CLI login**, if `gh` is installed and signed in.
 - **Paste a personal access token** with the `repo` and `read:org`
-  scopes. **Create a token on GitHub** opens the right page.
+  scopes. Add `workflow` to edit workflow files. For a fine-grained token,
+  grant write access to the relevant
+  repository permissions, such as **Issues**, **Pull requests**,
+  **Contents**, and **Actions**. Editing workflow files also requires
+  **Workflows** permission. **Create a token on GitHub** opens the token page.
 
 The token is kept in the macOS Keychain. Sign out from the sidebar.
 
-**Browsing.** The sidebar lists repositories you own, collaborate on, or
-can see through an organization, most recently pushed first, with a
-filter. Open one to see:
+The repository view has four tabs. GitHub applies your account and token
+permissions and any branch protection rules when you save.
 
-- **Code**: folders and files on any branch. Files over 2 MB, and binary
-  files, aren't shown inline.
-- **Pull requests**: open, closed or all, each with its description,
-  comments, and changed files with their diffs (up to 100 files).
-- **Issues**: open, closed or all, with comments.
-- **Actions**: workflows, their recent runs, and each run's jobs, with a
-  link to the logs on GitHub.
+- **Code** shows folders and files by branch. Use **Code actions** to
+  create a branch, create a file, or delete the open file. Open a text
+  file and choose **Edit file** to
+  commit your changes to the selected branch. Hangar displays text files
+  up to 2 MB.
+- **Pull requests** lets you create and edit pull requests, manage
+  assignees, labels, milestones, and review requests, submit a review,
+  change draft status, close or reopen a pull request, and merge.
+- **Issues** lets you create, edit, close, reopen, and comment on issues.
+  **Issue actions** includes assignees, labels, and milestones.
+- **Actions** lets you dispatch a workflow that supports manual runs.
+  Open a run to cancel it or rerun it. Logs open on GitHub.
 
-**Open on GitHub** is on every page.
+**Open on GitHub** is available throughout the repository view.
 
 ## Run and debug
 
@@ -275,8 +286,6 @@ Hangar is at v0.1. Things that don't work yet:
   commands typed in the panel, and showing subagent steps (only the
   subagent's result appears). "Approve for session" keeps Claude's
   suggested rule for this session only, never in your Claude Code settings.
-- **GitHub and Linear** are read-only: no commenting, reviewing, merging
-  or editing issues.
 - **Diffs** open as read-only tabs; there's no side-by-side diff view yet.
 - **Browser.** Chromium's own context menus, file pickers and print
   dialogs aren't wired into the embedded view.

@@ -29,6 +29,13 @@ impl std::fmt::Debug for Credential {
 }
 
 impl Credential {
+    pub fn allows_writes(&self) -> bool {
+        match self {
+            Self::ApiKey(_) => true,
+            Self::OAuth(tokens) => tokens.write_authorized,
+        }
+    }
+
     /// The `Authorization` header value: personal keys go in as they are,
     /// OAuth tokens as bearer tokens.
     pub fn header(&self) -> String {

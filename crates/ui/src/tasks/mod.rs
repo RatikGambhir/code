@@ -1,6 +1,7 @@
 //! Tasks: a Linear-style view of projects and issues, for this workspace's
 //! own board and for what is pulled from Linear.
 
+mod edit;
 mod model;
 mod sidebar;
 mod view;
